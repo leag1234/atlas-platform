@@ -1,9 +1,10 @@
-"""The routing call under a slow provider: retry on a second profile, then a safe fallback.
+"""The routing call under a slow provider: hedged calls, then the local classifier.
 
 Staging -93 (2026-11-16): the routing call on the fast profile got no first byte
 within its 8 s bound; the lexical fallback then answered an English request for
-an illustrated Word how-to in the chat, with no file. The replies below are the
-gateway's /agent/complete shape as recorded on the staging gateway that day.
+an illustrated Word how-to in the chat, with no file. Staging 2026-11-23: 13 of
+631 turns had no decision in 8 s. The replies below are the gateway's
+/agent/complete shape as recorded on the staging gateway on 2026-11-16.
 """
 
 import asyncio
@@ -72,7 +73,8 @@ def request(text: str) -> ChatRequest:
 
 
 class Recorded:
-    """A gateway that replies per profile: a recorded reply, a delay, or an error."""
+    """A gateway that replies per text role (else per profile): a recorded reply,
+    a delay, or an error."""
 
     def __init__(self, **plan: tuple[float, Any]) -> None:
         self.plan = plan
@@ -81,10 +83,10 @@ class Recorded:
         self.started = time.monotonic()
 
     async def __call__(self, payload: dict[str, Any], seconds: float) -> dict[str, Any]:
-        profile = payload["profile"]
-        self.asked.append((profile, time.monotonic() - self.started, seconds))
+        name = payload.get("text_role") or payload["profile"]
+        self.asked.append((name, time.monotonic() - self.started, seconds))
         self.payloads.append(payload)
-        delay, outcome = self.plan[profile]
+        delay, outcome = self.plan[name]
         await asyncio.sleep(delay)
         if isinstance(outcome, Exception):
             raise outcome
@@ -93,10 +95,16 @@ class Recorded:
 
 
 @contextmanager
-def router(bound: str, minimum: float | None = None) -> Iterator[None]:
+def router(
+    bound: str, minimum: float | None = None, hedge_ms: str = "900"
+) -> Iterator[None]:
     with patch.dict(
         os.environ,
-        {"ATLAS_MODEL_ROUTER": "1", "ATLAS_MODEL_ROUTER_TIMEOUT": bound},
+        {
+            "ATLAS_MODEL_ROUTER": "1",
+            "ATLAS_MODEL_ROUTER_TIMEOUT": bound,
+            "ATLAS_MODEL_ROUTER_HEDGE_MS": hedge_ms,
+        },
     ):
         os.environ.pop("ATLAS_MODEL_ROUTER_PROFILE", None)
         if minimum is None:
@@ -124,6 +132,40 @@ class ProfileTests(unittest.TestCase):
         self.assertEqual(routing["public_profiles"][FIRST], "fast")
         self.assertNotEqual(FIRST, SECOND)
 
+    def test_attempts_ask_two_providers_at_once_then_hedge(self) -> None:
+        self.assertEqual(
+            request_router.attempts(),
+            (
+                (FIRST, "router", False),
+                (FIRST, "router_alt", True),
+                (FIRST, "router", False),
+            ),
+        )
+        self.assertEqual(
+            request_router.payload("hello", [], FIRST, 2)["text_role"], "router"
+        )
+        self.assertNotIn(
+            "text_role", request_router.payload("hello", [], SECOND, 2, "profile")
+        )
+        routing = yaml.safe_load(
+            Path("services/model-gateway/routing.yaml").read_text()
+        )
+        prices = yaml.safe_load(
+            Path("services/model-gateway/pricing.yaml").read_text()
+        )["models"]
+        serverless = routing["serverless"]
+        models = {serverless[role]["model"] for role in ("router", "router_alt")}
+        self.assertEqual(len(models), 2)
+        self.assertNotIn(serverless["fast"]["model"], models)
+        self.assertTrue(models <= set(prices))
+        # Two providers: the default one and a declared preset.
+        self.assertNotIn("provider", serverless["router"])
+        self.assertEqual(serverless["router_alt"]["provider"], "mistral")
+
+    def test_owned_inference_makes_one_call(self) -> None:
+        with patch("packages.privacy.owned_only", return_value=True):
+            self.assertEqual(request_router.attempts(), ((FIRST, "router", False),))
+
     def test_payload_turns_reasoning_off_and_makes_one_attempt(self) -> None:
         payload = request_router.payload("hello", [], SECOND, 3.5)
         self.assertEqual(payload["profile"], SECOND)
@@ -140,27 +182,37 @@ class ProfileTests(unittest.TestCase):
         sys.path.insert(0, "services/model-gateway")
         from agent_provider import AgentRequest
 
-        for name in request_router.profiles():
-            AgentRequest.model_validate(request_router.payload("hello", [], name, 4))
+        for name, role, _ in request_router.attempts():
+            request = AgentRequest.model_validate(
+                request_router.payload("hello", [], name, 4, role)
+            )
+            self.assertEqual(request.text_role, role)
 
 
 class RetryTests(unittest.IsolatedAsyncioTestCase):
-    async def test_a_quick_first_answer_makes_one_call(self) -> None:
-        gateway = Recorded(**{FIRST: (0.05, RECORDED_FILE), SECOND: (0, RECORDED_FILE)})
+    async def test_two_providers_are_asked_at_once_and_the_first_wins(self) -> None:
+        gateway = Recorded(
+            router=(0.3, RECORDED_ANSWER), router_alt=(0.05, RECORDED_FILE)
+        )
         with router("2"):
+            started = time.monotonic()
             routed, _, cost, reason = await request_router.classify(
                 "x", [], complete=gateway
             )
         self.assertEqual(routed, Decision(kind="file", file_format="docx"))
         self.assertEqual(reason, "")
-        self.assertEqual([name for name, _, _ in gateway.asked], [FIRST])
+        self.assertEqual(
+            [name for name, _, _ in gateway.asked], ["router", "router_alt"]
+        )
+        self.assertLess(gateway.asked[1][1] - gateway.asked[0][1], 0.05)
+        self.assertLess(time.monotonic() - started, 0.25)
         self.assertEqual(cost, Decimal("0.0008876"))
 
-    async def test_timeout_then_success_on_the_second_profile(self) -> None:
+    async def test_late_calls_are_hedged_on_the_first_role(self) -> None:
         gateway = Recorded(
-            **{FIRST: (30, RECORDED_ANSWER), SECOND: (0.1, RECORDED_FILE)}
+            router=(0.6, RECORDED_FILE), router_alt=(30, RECORDED_ANSWER)
         )
-        with router("2"):
+        with router("3", hedge_ms="400"):
             started = time.monotonic()
             routed, milliseconds, _, reason = await request_router.classify(
                 "x", [], complete=gateway
@@ -168,59 +220,54 @@ class RetryTests(unittest.IsolatedAsyncioTestCase):
             elapsed = time.monotonic() - started
         self.assertEqual(routed, Decision(kind="file", file_format="docx"))
         self.assertEqual(reason, "")
-        (first, at_first, bound), (second, at_second, left) = gateway.asked
-        self.assertEqual((first, second), (FIRST, SECOND))
-        # The second profile is asked at half the bound, with the time left.
-        self.assertAlmostEqual(at_second - at_first, 1.0, delta=0.2)
-        self.assertAlmostEqual(bound, 2.0, delta=0.05)
-        self.assertAlmostEqual(left, 1.0, delta=0.2)
-        self.assertLess(elapsed, 1.6)
-        self.assertLess(milliseconds, 1600)
+        names = [name for name, _, _ in gateway.asked]
+        self.assertEqual(names, ["router", "router_alt", "router"])
+        at = [moment for _, moment, _ in gateway.asked]
+        # The hedge is sent one delay after the first pair, with the time left.
+        self.assertAlmostEqual(at[2] - at[0], 0.4, delta=0.15)
+        self.assertAlmostEqual(gateway.asked[0][2], 3.0, delta=0.05)
+        self.assertAlmostEqual(gateway.asked[2][2], 2.6, delta=0.15)
+        # The first call wins at 0.6 s, before the hedge would.
+        self.assertLess(elapsed, 0.9)
+        self.assertLess(milliseconds, 900)
 
-    async def test_a_late_first_answer_still_wins(self) -> None:
+    async def test_quick_failures_send_the_next_call_at_once(self) -> None:
         gateway = Recorded(
-            **{FIRST: (1.2, RECORDED_FILE), SECOND: (30, RECORDED_ANSWER)}
-        )
-        with router("2"):
-            routed, _, _, _ = await request_router.classify("x", [], complete=gateway)
-        self.assertEqual(routed, Decision(kind="file", file_format="docx"))
-        self.assertEqual(len(gateway.asked), 2)
-
-    async def test_a_quick_failure_asks_the_second_profile_at_once(self) -> None:
-        gateway = Recorded(
-            **{
-                FIRST: (0, RuntimeError("gateway_unavailable")),
-                SECOND: (0.05, RECORDED_FILE),
-            }
+            router=(0, RuntimeError("gateway_unavailable")),
+            router_alt=(0, RuntimeError("gateway_unavailable")),
         )
         with router("4"):
             started = time.monotonic()
-            routed, _, _, _ = await request_router.classify("x", [], complete=gateway)
-        self.assertEqual(routed, Decision(kind="file", file_format="docx"))
+            routed, _, _, reason = await request_router.classify(
+                "x", [], complete=gateway
+            )
+        self.assertIsNone(routed)
+        self.assertEqual(reason.count("+"), 2)
         self.assertLess(time.monotonic() - started, 0.5)
+        self.assertEqual(len(gateway.asked), 3)
 
-    async def test_two_timeouts_stay_within_the_bound(self) -> None:
-        gateway = Recorded(**{FIRST: (30, RECORDED_FILE), SECOND: (30, RECORDED_FILE)})
+    async def test_three_timeouts_stay_within_the_bound(self) -> None:
+        gateway = Recorded(router=(30, RECORDED_FILE), router_alt=(30, RECORDED_FILE))
         with router("2"):
             started = time.monotonic()
             routed, _, _, reason = await request_router.classify(
                 "x", [], complete=gateway
             )
         self.assertIsNone(routed)
-        self.assertEqual(reason, "timeout+timeout")
+        self.assertEqual(reason, "timeout+timeout+timeout")
         self.assertLess(time.monotonic() - started, 2.3)
 
 
 class FallbackTests(unittest.IsolatedAsyncioTestCase):
-    async def test_two_timeouts_keep_the_requested_file_in_five_languages(self) -> None:
+    async def test_timeouts_keep_the_requested_file_in_five_languages(self) -> None:
         for language, (text, extension) in DELIVERABLES.items():
             with self.subTest(language=language):
                 gateway = Recorded(
-                    **{FIRST: (30, RECORDED_FILE), SECOND: (30, RECORDED_FILE)}
+                    router=(30, RECORDED_FILE), router_alt=(30, RECORDED_FILE)
                 )
                 req = request(text)
                 with (
-                    router("0.5", minimum=0.1),
+                    router("0.5", minimum=0.1, hedge_ms="100"),
                     patch.object(request_router, "_gateway", gateway),
                     self.assertLogs(
                         "services.orchestrator.request_router", "WARNING"
@@ -228,45 +275,47 @@ class FallbackTests(unittest.IsolatedAsyncioTestCase):
                 ):
                     routed = await request_router.route(req)
                     self.assertEqual(request_router.decision(req), routed)
-                self.assertEqual(
-                    routed,
-                    Decision.model_validate({"kind": "file", "file_format": extension}),
-                )
-                self.assertTrue(routed is not None and routed.work)
-                self.assertEqual(len(gateway.asked), 2)
+                self.assertIsNotNone(routed)
+                assert routed is not None
+                self.assertEqual((routed.kind, routed.file_format), ("file", extension))
+                self.assertTrue(routed.work)
+                self.assertEqual(len(gateway.asked), 3)
                 line = logs.output[0]
-                self.assertIn("kind=file source=code rule=deliverable", line)
+                self.assertIn("kind=file source=local", line)
                 self.assertIn(f"format={extension}", line)
-                self.assertIn("fallback=timeout+timeout", line)
-                self.assertIn("attempts=2", line)
+                self.assertIn("fallback=timeout+timeout+timeout", line)
+                self.assertIn("attempts=3", line)
                 self.assertEqual(req.__dict__[COST_KEY], Decimal(0))
                 # Never the user's text.
                 self.assertNotIn(text.split()[-1], line)
 
-    async def test_two_timeouts_leave_other_turns_to_the_lexical_gates(self) -> None:
-        for text in (
-            "what's a good name for a grey cat?",
-            "écris un petit mot pour remercier ma voisine",
-            "résume https://example.org/rapport.pdf",
-            "connecte-toi à mon serveur en ssh et convertis le csv",
+    async def test_timeouts_leave_other_turns_to_the_local_classifier(self) -> None:
+        for text, kind in (
+            ("what's a good name for a grey cat?", "answer"),
+            ("écris un petit mot pour remercier ma voisine", "answer"),
+            ("résume https://example.org/rapport.pdf", "answer"),
+            ("connecte-toi à mon serveur en ssh et convertis le csv", "remote"),
+            ("fé moi un jeu de mémoire avec des cartes", "app"),
+            ("lance le script stp", "run"),
         ):
             with self.subTest(text=text):
                 gateway = Recorded(
-                    **{FIRST: (30, RECORDED_FILE), SECOND: (30, RECORDED_FILE)}
+                    router=(30, RECORDED_FILE), router_alt=(30, RECORDED_FILE)
                 )
                 with (
-                    router("0.5", minimum=0.1),
+                    router("0.5", minimum=0.1, hedge_ms="100"),
                     patch.object(request_router, "_gateway", gateway),
                     self.assertLogs(
                         "services.orchestrator.request_router", "WARNING"
                     ) as logs,
                 ):
-                    self.assertIsNone(await request_router.route(request(text)))
-                self.assertIn("kind=none source=lexical", logs.output[0])
+                    routed = await request_router.route(request(text))
+                self.assertEqual(routed.kind if routed else None, kind)
+                self.assertIn("source=local", logs.output[0])
 
     async def test_a_model_decision_is_never_replaced(self) -> None:
         gateway = Recorded(
-            **{FIRST: (0, RECORDED_ANSWER), SECOND: (0, RECORDED_ANSWER)}
+            router=(0, RECORDED_ANSWER), router_alt=(0.2, RECORDED_ANSWER)
         )
         req = request("What is the difference between a PDF and a Word file?")
         with (
@@ -276,7 +325,7 @@ class FallbackTests(unittest.IsolatedAsyncioTestCase):
         ):
             self.assertEqual(await request_router.route(req), Decision(kind="answer"))
         self.assertIn("source=model", logs.output[0])
-        self.assertIn("attempts=1", logs.output[0])
+        self.assertIn("attempts=2", logs.output[0])
 
 
 class NamedFormatTests(unittest.TestCase):

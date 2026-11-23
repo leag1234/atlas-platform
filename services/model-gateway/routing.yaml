@@ -56,6 +56,29 @@ serverless:
     fallback: text
     capabilities:
       deepseek-v4-flash-0731: {context: 256000, tools: true, vision: false}
+  # The routing decision of a plain chat turn (services/orchestrator/request_router.py,
+  # text_role "router" on a profile call): one short JSON call, reasoning off. Measured
+  # 2026-11-23 on 151 synthetic cases, provider direct, 4 in flight: this model p50 0.60 s,
+  # p99 1.44 s, max 1.61 s, 98.7 % kinds right; the fast role's model p50 0.74 s, p99 6.9 s
+  # (staging journal the same day: p90 4.6 s, 13 of 631 turns without a decision in 8 s).
+  router:
+    env: ROUTER_MODEL
+    model: qwen3.6-35b-a3b
+    fallback: fast
+    capabilities:
+      qwen3.6-35b-a3b: {context: 262144, tools: false, vision: false, reasoning: false}
+  # The same decision asked at the same time from a second provider, first valid answer
+  # wins: in the slow window of 2026-11-23 13:30 (Scaleway models p50 1.4 s, 4 of 151 over
+  # 5 s) this model answered p50 0.48 s, p99 1.59 s, 98 % kinds right, one new connection
+  # per call. Open weights (Apache 2.0). Source: https://docs.mistral.ai/models/ministral-3-8b-25-12,
+  # read 2026-11-23. Without the provider's key the call fails at once and the others decide.
+  router_alt:
+    provider: mistral
+    env: ROUTER_ALT_MODEL
+    model: ministral-8b-2512
+    fallback: fast
+    capabilities:
+      ministral-8b-2512: {context: 262144, tools: false, vision: false, reasoning: false}
   embedding:
     env: EMBEDDING_SERVERLESS_MODEL
     model: qwen3-embedding-8b

@@ -8,13 +8,17 @@ ATLAS_MODEL_ROUTER=1 (default off), one short call to the fast profile decides
 what the turn asks for, once per plain chat turn, and every gate reads that
 decision first.
 
-The call is bounded (ATLAS_MODEL_ROUTER_TIMEOUT) and runs with reasoning off.
-When the first profile has not answered by half the bound, or failed sooner, a
-second declared profile is asked as well and the first valid decision wins: on
-staging -93 (2026-11-16) one routing call in sixteen got no first byte within
-8 s from its provider. When both fail, a request that names a file format is
-still routed to the file path (deliver_fallback); any other turn has no
-decision and the lexical gates decide exactly as before.
+The call runs with reasoning off on the gateway's two router roles, small
+models on two providers chosen for their latency, both asked at once, and is
+hedged (Dean and Barroso, "The Tail at Scale", CACM 2013): when no decision has
+come by ATLAS_MODEL_ROUTER_HEDGE_MS, the first role is asked again (another
+replica), and the first valid decision wins; a failed call starts the next one
+at once. Staging 2026-11-23: the fast profile alone had p90 4.6 s and 13 of 631
+turns without a decision in 8 s, and one provider's models slowed down together
+(p50 0.6 s at 12:30, 1.4 s at 13:30), which only a second provider absorbs.
+Everything stays within ATLAS_MODEL_ROUTER_TIMEOUT. When no call decides, a local classifier trained on
+synthetic examples decides (router_local.py), not the word patterns of the
+older gates; those decide only if the classifier itself is unavailable.
 
 A second rule comes with it: a capability that is absent falls back to the
 capability that can deliver. A drawing with image generation off is drawn as
@@ -393,20 +397,48 @@ def profiles() -> tuple[str, ...]:
 
 
 def timeout() -> float:
-    """The bound of the whole routing decision, both attempts included."""
+    """The bound of the whole routing decision, every attempt included."""
     try:
-        value = float(os.environ.get("ATLAS_MODEL_ROUTER_TIMEOUT", "4"))
+        value = float(os.environ.get("ATLAS_MODEL_ROUTER_TIMEOUT", "2"))
     except ValueError:
-        return 4.0
+        return 2.0
     return min(max(value, 0.5), 10.0)
 
 
-# Share of the bound after which the second profile is asked as well. Staging
-# 2026-11-16 (107 calls on the fast profile): median 0.9 s, 90th percentile
-# 4.3 s, and 6 calls without any first byte at the 8 s bound.
-HEDGE_SHARE = 0.5
-# A second attempt with less time than this left is not started.
-MIN_ATTEMPT_SECONDS = 0.5
+def hedge() -> float:
+    """Seconds without a decision after which the next call is sent as well.
+
+    Measured 2026-11-23 on the router roles' models (151 synthetic cases, 3 or
+    4 in flight, provider direct): p90 0.75 to 1.06 s in a normal window.
+    """
+    try:
+        value = float(os.environ.get("ATLAS_MODEL_ROUTER_HEDGE_MS", "900")) / 1000
+    except ValueError:
+        return 0.9
+    return min(max(value, 0.1), 5.0)
+
+
+# Each attempt: (profile, gateway text role, sent with the previous one). The
+# two router roles at once, on two providers, then the first role again after
+# hedge(). The profile names the caller's profile for the gateway; the role
+# picks the model.
+Attempt = tuple[str, str, bool]
+
+
+def attempts() -> tuple[Attempt, ...]:
+    first = profiles()[0]
+    if privacy.owned_only():
+        # Owned inference only: one call on the owned server, no hedge.
+        return ((first, "router", False),)
+    return (
+        (first, "router", False),
+        (first, "router_alt", True),
+        (first, "router", False),
+    )
+
+
+# An attempt with less time than this left is not started.
+MIN_ATTEMPT_SECONDS = 0.3
 
 
 Complete = Callable[[dict[str, Any], float], Awaitable[dict[str, Any]]]
@@ -429,7 +461,9 @@ def payload(
     history: Sequence[Mapping[str, object]],
     profile_name: str | None = None,
     seconds: float | None = None,
+    text_role: str = "router",
 ) -> dict[str, Any]:
+    extra: dict[str, Any] = {} if text_role == "profile" else {"text_role": text_role}
     return dict(
         messages=messages(text, history),
         tools=[],
@@ -446,6 +480,7 @@ def payload(
         reasoning_ceiling="none",
         reasoning_disabled=True,
         single_attempt=True,
+        **extra,
     )
 
 
@@ -455,13 +490,14 @@ async def _attempt(
     name: str,
     seconds: float,
     complete: Complete | None,
+    text_role: str = "router",
 ) -> tuple[Decision | None, Decimal, str]:
     """One bounded call on one profile: (decision or None, cost, failure reason)."""
     cost = Decimal(0)
     try:
         async with asyncio.timeout(seconds):
             result = await (complete or _gateway)(
-                payload(text, history, name, seconds), seconds
+                payload(text, history, name, seconds, text_role), seconds
             )
         try:
             cost = Decimal(str(result.get("cost_eur") or 0))
@@ -491,50 +527,57 @@ async def _classify(
     history: Sequence[Mapping[str, object]],
     complete: Complete | None,
 ) -> tuple[Decision | None, float, Decimal, str, int]:
-    """The decision of at most two profiles within one bound, with the attempt count.
+    """The first valid decision of hedged calls within one bound, with the call count.
 
-    The first profile is asked at once. When it has not answered by HEDGE_SHARE
-    of the bound, or failed sooner, the second profile is asked with the time
-    left while the first keeps running; the first valid decision wins and the
-    other call is cancelled.
+    The first call is sent at once, with those marked to go with it. Each next
+    one is sent when no decision has come hedge() seconds after the previous
+    one was sent, or at once when every call sent so far has failed; it gets
+    the time left of the bound. The first valid decision wins and the other
+    calls are cancelled.
     """
     started = time.monotonic()
     bound = timeout()
-    waiting = list(profiles())
+    step = hedge()
+    waiting = list(attempts())
     cost = Decimal(0)
     reasons: list[str] = []
     pending: set[asyncio.Task[tuple[Decision | None, Decimal, str]]] = set()
-    attempts = 0
+    sent = 0
+    last_sent = 0.0
 
     def elapsed() -> float:
         return time.monotonic() - started
 
     def start() -> None:
-        nonlocal attempts
-        name = waiting.pop(0)
-        attempts += 1
-        pending.add(
-            asyncio.create_task(
-                _attempt(text, history, name, bound - elapsed(), complete)
+        nonlocal sent, last_sent
+        while True:
+            name, role, _ = waiting.pop(0)
+            sent += 1
+            pending.add(
+                asyncio.create_task(
+                    _attempt(text, history, name, bound - elapsed(), complete, role)
+                )
             )
-        )
+            if not waiting or not waiting[0][2]:
+                break
+        last_sent = elapsed()
 
     start()
     try:
         while pending:
-            hedge = max(0.0, bound * HEDGE_SHARE - elapsed()) if waiting else None
+            wait = max(0.0, last_sent + step - elapsed()) if waiting else None
             done, still = await asyncio.wait(
-                pending, timeout=hedge, return_when=asyncio.FIRST_COMPLETED
+                pending, timeout=wait, return_when=asyncio.FIRST_COMPLETED
             )
             pending = set(still)
             for task in done:
                 routed, spent, reason = task.result()
                 cost += spent
                 if routed is not None:
-                    return routed, elapsed() * 1000, cost, "", attempts
+                    return routed, elapsed() * 1000, cost, "", sent
                 reasons.append(reason)
-            if waiting:
-                # The first call is late or failed: ask the next profile.
+            if waiting and (not pending or elapsed() >= last_sent + step):
+                # Every call failed, or the last one is late: send the next.
                 if bound - elapsed() >= MIN_ATTEMPT_SECONDS:
                     start()
                 else:
@@ -544,7 +587,7 @@ async def _classify(
             task.cancel()
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
-    return None, elapsed() * 1000, cost, "+".join(reasons) or "timeout", attempts
+    return None, elapsed() * 1000, cost, "+".join(reasons) or "timeout", sent
 
 
 async def classify(
@@ -736,20 +779,41 @@ async def route(request: ChatRequest) -> Decision | None:
         {"role": message.role, "content": message.text}
         for message in request.conversation_messages[:-1]
     ]
+    from services.orchestrator import router_local
+
+    # Trained while the calls run (about half a second, once per process).
+    router_local.warm()
     routed, milliseconds, cost, reason, attempts = await _classify(
         request.user_text, history, None
     )
+    source = "model"
+    if routed is None:
+        routed = await asyncio.to_thread(local_decision, request.user_text, history)
+        source = "local"
     settled, rule = _settle(request.user_text, routed)
     if routed is None:
         settled = deliver_fallback(request.user_text)
         rule = "deliverable" if settled is not None else ""
         source = "code" if settled is not None else "lexical"
-    else:
-        source = "settle" if rule else "model"
+    elif rule and source == "model":
+        source = "settle"
     request.__dict__[DECISION_KEY] = settled
     request.__dict__[COST_KEY] = cost
     _log(settled, source, rule, milliseconds, cost, reason, attempts)
     return settled
+
+
+def local_decision(
+    text: str, history: Sequence[Mapping[str, object]]
+) -> Decision | None:
+    """The local classifier's decision, or None when it cannot decide here."""
+    from services.orchestrator import router_local
+
+    try:
+        return Decision.model_validate(router_local.decide(text, history))
+    except Exception:  # noqa: BLE001 - a missing example file leaves the gates
+        log.exception("request_router local classifier unavailable")
+        return None
 
 
 def _log(
@@ -766,9 +830,11 @@ def _log(
     WARNING so that it reaches the service journal, which keeps WARNING and
     above: without it a wrong routing could not be told from a router timeout.
     source is "model" (the model decided), "settle" (a code rule changed the
-    model decision, named by rule), "code" (no profile decided and the request
-    names a file format: rule "deliverable") or "lexical" (no decision: the
-    lexical gates decide, fallback says why). attempts counts the profiles asked.
+    model decision, named by rule), "local" (no call decided in time: the local
+    classifier did, a code rule may still have changed it, fallback says why),
+    "code" (nor the classifier, and the request names a file format: rule
+    "deliverable") or "lexical" (no decision: the lexical gates decide).
+    attempts counts the calls sent.
     """
     log.warning(
         "request_router kind=%s source=%s rule=%s format=%s follow_up=%s "

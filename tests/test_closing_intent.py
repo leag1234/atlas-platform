@@ -161,11 +161,11 @@ class RoutingLogTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("source=model", line)
         self.assertIn("rule=none", line)
 
-    async def test_no_decision_is_logged_as_lexical(self) -> None:
+    async def test_no_model_decision_is_logged_as_local(self) -> None:
         gateway = AsyncMock(side_effect=TimeoutError)
         routed, line = await self._route("parfait, ajoute un timer", gateway)
-        self.assertIsNone(routed)
-        for field in ("kind=none", "source=lexical", "fallback=timeout"):
+        self.assertIsNotNone(routed)
+        for field in ("source=local", "fallback=timeout"):
             self.assertIn(field, line)
 
 
