@@ -10,7 +10,7 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 
 from . import emoji
-from .cells import shown
+from .cells import checkbox, shown
 from .glyphs import drawable
 from .schema import Content, Section
 from .spacing import bound
@@ -56,6 +56,12 @@ SUBHEADING_PT = 15.0
 OPENING_PT = 2 * 16 + 8.0
 # The space above a section's heading on a report page.
 SECTION_GAP = 10.0
+# The running footer (Content.footer): its type size and baseline from the
+# foot of the page, inside the bottom margin; nothing of the body is drawn
+# under FOOTER_ZONE (the smallest margin is 30 pt).
+FOOTER_PT = 9.0
+FOOTER_BASELINE = 16.0
+FOOTER_ZONE = 26.0
 
 
 def lead_in(text: str) -> bool:
@@ -116,6 +122,8 @@ class Block:
     height: float = 0
     table: bool = False
     bullet: bool = False
+    # A point to tick (cells.checkbox): the box drawn in place of the bullet.
+    check: str = ""
     # Table rows only: line spacing and the horizontal padding of a cell.
     leading: float = 15
     pad: float = 6
@@ -237,6 +245,10 @@ def table_type(columns: int) -> tuple[float, float, float, float]:
 def text_block(
     text: str, size: float = 12, *, bullet: bool = False, body: float = BODY_WIDTH
 ) -> Block:
+    box, rest = checkbox(text)
+    if box:
+        # A box to tick is drawn as a shape: the face has no box character.
+        text, bullet = rest, True
     lines = wrap(text, body - (16 if bullet else 0), size)
     return Block(
         lines=(lines,),
@@ -244,6 +256,7 @@ def text_block(
         height=len(lines) * size * 1.35 + 8,
         bullet=bullet,
         width=body,
+        check=box,
     )
 
 
@@ -335,8 +348,11 @@ def pages(
     """
     g = geometry
     font()
-    for text in content.texts():
-        if not all(drawable(token) for token in emoji.tokens(text)):
+    # A box to tick is drawn as a shape (cells.checkbox); the running footer
+    # is drawn in the face like the body.
+    footer = (shown(content.footer),) if content.footer else ()
+    for text in (*content.texts(), *footer):
+        if not all(drawable(token) for token in emoji.tokens(checkbox(text)[1])):
             raise ValueError("unsupported_font_character")
     result: list[tuple[Placed, ...]] = []
     current: list[Placed] = []

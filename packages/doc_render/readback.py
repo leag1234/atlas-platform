@@ -29,6 +29,8 @@ import unicodedata
 import zipfile
 from typing import Any
 
+from .cells import BOXES
+
 # The bytes a stored deliverable may have (terminal_client publishes at most 16 MiB).
 MAX_BYTES = 16 * 1024 * 1024
 # A workbook is read up to this many cells, a PDF up to this many pages.
@@ -41,6 +43,10 @@ SUFFIXES = frozenset({".docx", ".pptx", ".xlsx", ".pdf", *TEXT_SUFFIXES})
 PICTURE = "[picture]"
 # The line of publish_document's Markdown that starts a new page.
 PAGE_BREAK = "\\newpage"
+# layout.FOOTER_ZONE: a PDF line drawn under it is the running footer.
+FOOTER_ZONE = 26.0
+# The line that gives the running footer of every page (schema.Content.footer).
+FOOTER = "\\footer"
 CHART = "[chart]"
 
 
@@ -112,11 +118,17 @@ class Readback:
     text: str | None = None
     # The title stands alone on a title page (schema.Content.cover).
     cover: bool = False
+    # The running footer of every page (schema.Content.footer).
+    footer: str = ""
 
     def blocks(self) -> list[str]:
         if self.text is not None:
             return self.text.splitlines()
-        return [self.title, *(line for s in self.sections for line in s.blocks())]
+        return [
+            self.title,
+            *(line for s in self.sections for line in s.blocks()),
+            *([self.footer] if self.footer else []),
+        ]
 
 
 def _one_line(text: str) -> str:
@@ -238,6 +250,11 @@ def _docx(raw: bytes) -> Readback:
             section.add("picture", None)
     if not section.empty() or section.heading:
         result.sections.append(section)
+    page = document.sections[0]
+    if not page.footer.is_linked_to_previous:
+        result.footer = _one_line(
+            " ".join(_runs(paragraph) for paragraph in page.footer.paragraphs)
+        )
     return result
 
 
@@ -304,6 +321,10 @@ def _themed(shapes: list[Any], section: Section, result: Readback) -> None:
             section.add("picture", None)
             table = None
             continue
+        if role == "footer" and shape.has_text_frame and shape.text_frame.text.strip():
+            # The deck title, unless a running footer was asked (deck.py).
+            result.footer = result.footer or _one_line(shape.text_frame.text)
+            continue
         if role in FRAME_ROLES or not (
             shape.has_text_frame and shape.text_frame.text.strip()
         ):
@@ -328,7 +349,10 @@ def _themed(shapes: list[Any], section: Section, result: Readback) -> None:
         elif role == "list":
             for paragraph in frame.paragraphs:
                 if paragraph.text.strip():
-                    bulleted = bool(paragraph._p.xpath("./a:pPr/a:buChar"))
+                    # A point to tick shows its box instead of a bullet.
+                    bulleted = bool(
+                        paragraph._p.xpath("./a:pPr/a:buChar")
+                    ) or paragraph.text.lstrip().startswith(BOXES)
                     section.add(
                         "bullet" if bulleted else "paragraph",
                         _one_line(paragraph.text),
@@ -432,6 +456,8 @@ def _pptx(raw: bytes) -> Readback:
             current = section
     if not result.title and result.sections:
         result.title = result.sections[0].heading
+    if result.footer == result.title:
+        result.footer = ""
     return result
 
 
@@ -704,6 +730,12 @@ def _table_size(size: float) -> bool:
 def _pdf(raw: bytes) -> Readback:
     title, lines = _pdf_lines(raw)
     result = Readback(".pdf", title=title)
+    # The running footer is drawn under the body, in the bottom margin
+    # (renderer.build_pdf): read apart, never as a page's last paragraph.
+    footers = [line for line in lines if line.y < FOOTER_ZONE]
+    if footers:
+        result.footer = footers[0].text
+        lines = [line for line in lines if line.y >= FOOTER_ZONE]
     started = _started(raw)
     margin = min((line.x for line in lines), default=0.0)
     section = Section(unit=1)
@@ -893,6 +925,7 @@ def editable(document: Readback) -> dict[str, Any]:
                 section_markdown(section, document.title if index == 0 else "")
                 for index, section in enumerate(document.sections)
             ]
+            + ([FOOTER + " " + document.footer] if document.footer else [])
         ),
     }
 

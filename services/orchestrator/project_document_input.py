@@ -137,6 +137,9 @@ def explained(model: type[BaseModel], root: str = "") -> Iterator[None]:
 
 # A line alone that starts a new page (readback.PAGE_BREAK is the first).
 PAGE_BREAKS = frozenset({"\\newpage", "\\pagebreak"})
+# A line "\\footer text" gives the running footer of every page
+# (schema.Content.footer), wherever it is written.
+FOOTER = re.compile(r"\\footer\b[:\s]*(.*)")
 # The order a section writes its blocks in (schema.Section): a block of an
 # earlier kind after a later one goes on in a continuation.
 RANK = {"paragraphs": 0, "bullets": 1, "tables": 2, "images": 3}
@@ -164,6 +167,7 @@ def markdown(text: str, title: str, *, grouped: bool = True) -> Content:
     paragraph: list[str] = []
     lines = text.splitlines()
     cover = broken = False
+    footer: str | None = None
     depths = [
         len(found[1])
         for number, line in enumerate(lines)
@@ -243,7 +247,11 @@ def markdown(text: str, title: str, *, grouped: bool = True) -> Content:
             raise ValueError("Unsupported Markdown image or fenced block")
         heading = re.fullmatch(r"#{1,6}\s+(.+)", line)
         bullet = re.fullmatch(r"(?:[-+*]|\d+[.)])\s+(.+)", line)
-        if line in PAGE_BREAKS:
+        running = FOOTER.fullmatch(line)
+        if running:
+            flush()
+            footer = running[1].strip() or None
+        elif line in PAGE_BREAKS:
             # A new page, asked for: before any text, the title has a page
             # of its own; otherwise the next section starts a new page.
             flush()
@@ -345,7 +353,9 @@ def markdown(text: str, title: str, *, grouped: bool = True) -> Content:
     if carried and kept:
         kept[-1]["paragraphs"].extend(carried)
     with explained(Content, "content"):
-        return Content.model_validate(dict(title=title, sections=kept, cover=cover))
+        return Content.model_validate(
+            dict(title=title, sections=kept, cover=cover, footer=footer)
+        )
 
 
 def opening_heading(text: str | None) -> str:

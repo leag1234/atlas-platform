@@ -130,14 +130,40 @@ def plain(text: str) -> str:
     return "".join(span.text for span in spans(text))
 
 
+# A point written "[ ] text" (or "[x] text", Markdown task-list syntax) is a
+# box to tick: every format shows the box, never the brackets. A checklist
+# asked "with boxes to tick" was printed as round bullets (staging -184): the
+# content had no way to say it.
+BOX = "\u2610"
+TICKED = "\u2611"
+BOXES = (BOX, TICKED, "\u2612")
+_CHECKBOX = re.compile(r"\[([ xX])\][ \t]+(?=\S)")
+
+
+def checkbox(text: str) -> tuple[str, str]:
+    """(box, rest) of a displayed text that starts with a box, else ("", text)."""
+    for box in BOXES:
+        if text.startswith(box):
+            return box, text[len(box) :].lstrip()
+    return "", text
+
+
+def boxed(text: str) -> str:
+    """The text with a leading "[ ] " or "[x] " written as its box."""
+    found = _CHECKBOX.match(text)
+    if found is None:
+        return text
+    return (BOX if found[1] == " " else TICKED) + " " + text[found.end() :]
+
+
 def prose(text: str) -> tuple[Span, ...]:
     """A title, a heading, a paragraph or a bullet, read as a cell is.
 
     "[the report](https://example.org/r)" reads "the report
     (https://example.org/r)": outside a workbook cell nothing else would keep
-    the address.
+    the address. A leading "[ ] " is a box to tick (boxed).
     """
-    return spans(text, True)
+    return spans(boxed(text), True)
 
 
 def shown(text: str) -> str:
