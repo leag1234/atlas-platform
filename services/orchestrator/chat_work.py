@@ -31,6 +31,9 @@ SCRATCH_PROJECT_HIDDEN = True
 # Kept from the chat deadline for Work's cleanup and for the explanation of a
 # stopped turn to be written and streamed before the chat stream is cut.
 CHAT_ANSWER_SECONDS = 25.0
+# A Work run the model service stopped is run once more when the turn still
+# has this much time for Work; otherwise the stop is said with its reason.
+PROVIDER_RETRY_SECONDS = 90.0
 
 
 def work_time_limit() -> float | None:
@@ -45,6 +48,26 @@ def work_time_limit() -> float | None:
 
     left = remaining()
     return None if left is None else max(0.0, left - CHAT_ANSWER_SECONDS)
+
+
+# Said to the chat that answers a turn whose Work run stopped. The model
+# behind the chat sees only its own tools: on staging (-187) it answered
+# "no tools to create or send files are available in this session" for a
+# file the service delivers. In the person's language by the chat's own rule.
+WORK_STOPPED = (
+    "\n\nThis turn was first given to the assistant's Work mode, which makes "
+    "real files and runs code; that run stopped before it finished. Answer "
+    "with the requested content itself, complete. Say in one short sentence "
+    "that the file or run could not be finished this time and that the person "
+    "can ask again to retry. Never say that you have no tools, that tools are "
+    "missing in this session, or that you cannot create, send or attach files "
+    "or run code: the assistant can, this run did not finish."
+)
+
+
+def work_stopped_instruction(request: Any) -> str:
+    """The system text of a chat answer after a stopped Work run, else empty."""
+    return WORK_STOPPED if request.__dict__.get("work_stopped") else ""
 
 
 def chat_work_enabled() -> bool:
@@ -629,6 +652,24 @@ async def _escalate(request: ChatRequest, item: Interaction) -> bool:
         scoped.__dict__["machine_setup_pending"] = True
     before = (item.state, list(item.erreurs), item.reponse)
     failure = ""
+    # The model service's own code and status when it stopped the run (a
+    # GatewayError), for the answer that names it.
+    provider: tuple[str, int] | None = None
+    carried = 0.0
+
+    def retry_on_provider(attempt: int, code: str) -> bool:
+        """A run the model service stopped, with nothing delivered, is run once
+        more while the turn has time for it (never after a usage limit)."""
+        from services.orchestrator.code_mode import PROVIDER_LIMIT_CODES
+
+        left = work_time_limit()
+        return (
+            attempt == 0
+            and code not in PROVIDER_LIMIT_CODES
+            and "/deliverables/" not in item.reponse
+            and (left is None or left >= PROVIDER_RETRY_SECONDS)
+        )
+
     for attempt in range(2):
         try:
             await process_work(
@@ -646,10 +687,45 @@ async def _escalate(request: ChatRequest, item: Interaction) -> bool:
                 turn_request_id=None if attempt == 0 else str(uuid4()),
             )
             failure = ""
+            provider = None
+            stopped_by_service = item.state != "done" and "provider_error" in [
+                str(error) for error in item.erreurs[len(before[1]) :]
+            ]
+            if stopped_by_service and retry_on_provider(attempt, "provider_error"):
+                # Staging -187: a run stopped by the model service fell back to
+                # the chat alone, which said it had no tools to make the file.
+                logger.warning(
+                    "chat_work_retry conversation=%s error=provider_error",
+                    chat_conversation_id or "unknown",
+                )
+                carried += float(item.cout_eur or 0)
+                item.state, item.erreurs, item.reponse = (
+                    before[0],
+                    list(before[1]),
+                    before[2],
+                )
+                item.work_failure = {}
+                continue
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - any Work failure falls back to the chat
             failure = type(exc).__name__
+            from services.orchestrator.model import GatewayError
+
+            if isinstance(exc, GatewayError):
+                provider = (str(exc.code), int(exc.status or 0))
+                if (
+                    item.state == before[0]
+                    and not item.reponse
+                    and retry_on_provider(attempt, provider[0])
+                ):
+                    logger.warning(
+                        "chat_work_retry conversation=%s error=%s",
+                        chat_conversation_id or "unknown",
+                        provider[0],
+                    )
+                    carried += float(item.cout_eur or 0)
+                    continue
             if isinstance(exc, TimeoutError) and not isinstance(
                 exc, aiohttp.ClientError
             ):
@@ -678,8 +754,17 @@ async def _escalate(request: ChatRequest, item: Interaction) -> bool:
                 await asyncio.sleep(2)
                 continue
         break
+    if carried:
+        # The cost of the run stopped before this one stays in the turn's.
+        item.cout_eur = float(item.cout_eur or 0) + carried
     if failure or item.state != "done":
         reply = None if failure else work_failure_reply(item, scoped.lang)
+        if provider is not None:
+            # Stopped by the model service: said with its code and status, a
+            # usage limit as a limit (D5), never handed to the chat alone.
+            from services.orchestrator.code_mode import provider_failure_reply
+
+            reply = provider_failure_reply(scoped.lang, *provider)
         stopped = (item.state, ",".join(str(error) for error in item.erreurs)[:120])
 
         def incomplete(outcome: str) -> None:
@@ -739,6 +824,9 @@ async def _escalate(request: ChatRequest, item: Interaction) -> bool:
         # behind it. The person never gets a raw failure for a turn the chat can answer.
         item.state, item.erreurs, item.reponse = before[0], before[1], before[2]
         item.work_failure = {}
+        # The chat answering alone is told that the run stopped: on staging it
+        # said instead that it had no tools to create files (-187).
+        request.__dict__["work_stopped"] = True
         incomplete("chat_answers")
         return False
     item.task_type = "work"

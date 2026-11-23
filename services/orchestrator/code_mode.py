@@ -187,6 +187,8 @@ WORK_FAILURE = {
         "machine_minutes": "the monthly command time of this machine is used up",
         "approval_failed": "a command you approved could not be started",
         "other": "the work stopped before finishing",
+        "provider": "the AI model service returned an error{detail}; the request is fine and can be sent again as it is for another try",
+        "limit": "a usage limit of the AI model service was reached{detail}; this is a limit, not an outage, and the work can be tried again later",
     },
     "fr": {
         "template": "Le travail n'a pas abouti : {reason}.",
@@ -200,6 +202,8 @@ WORK_FAILURE = {
         "machine_minutes": "le temps de commande mensuel de cette machine est épuisé",
         "approval_failed": "une commande que vous avez autorisée n'a pas pu démarrer",
         "other": "le travail s'est arrêté avant la fin",
+        "provider": "le service de modèles d'IA a renvoyé une erreur{detail} ; la demande n'est pas en cause et peut être renvoyée telle quelle pour un nouvel essai",
+        "limit": "une limite d'utilisation du service de modèles d'IA a été atteinte{detail} ; c'est une limite, pas une panne, et le travail pourra être relancé plus tard",
     },
     "de": {
         "template": "Die Arbeit wurde nicht abgeschlossen: {reason}.",
@@ -213,6 +217,8 @@ WORK_FAILURE = {
         "machine_minutes": "die monatliche Befehlszeit dieser Maschine ist aufgebraucht",
         "approval_failed": "ein von Ihnen erlaubter Befehl konnte nicht gestartet werden",
         "other": "die Arbeit wurde vor dem Abschluss beendet",
+        "provider": "der KI-Modelldienst hat einen Fehler zurückgegeben{detail}; an der Anfrage liegt es nicht, sie kann unverändert erneut gesendet werden",
+        "limit": "ein Nutzungslimit des KI-Modelldienstes wurde erreicht{detail}; das ist ein Limit, keine Störung, und die Arbeit kann später erneut versucht werden",
     },
     "es": {
         "template": "El trabajo no se completó: {reason}.",
@@ -226,6 +232,8 @@ WORK_FAILURE = {
         "machine_minutes": "se agotó el tiempo mensual de comandos de esta máquina",
         "approval_failed": "un comando que usted autorizó no se pudo iniciar",
         "other": "el trabajo se detuvo antes de terminar",
+        "provider": "el servicio de modelos de IA devolvió un error{detail}; la solicitud no es la causa y se puede enviar de nuevo tal cual para otro intento",
+        "limit": "se alcanzó un límite de uso del servicio de modelos de IA{detail}; es un límite, no una avería, y el trabajo se puede intentar de nuevo más tarde",
     },
     "it": {
         "template": "Il lavoro non è stato completato: {reason}.",
@@ -239,8 +247,43 @@ WORK_FAILURE = {
         "machine_minutes": "il tempo mensile dei comandi di questa macchina è esaurito",
         "approval_failed": "un comando che hai autorizzato non è stato avviato",
         "other": "il lavoro si è interrotto prima della fine",
+        "provider": "il servizio dei modelli di IA ha restituito un errore{detail}; la richiesta non è la causa e può essere inviata di nuovo così com'è per un altro tentativo",
+        "limit": "è stato raggiunto un limite di utilizzo del servizio dei modelli di IA{detail}; è un limite, non un guasto, e il lavoro potrà essere ritentato più tardi",
     },
 }
+# A Work turn the model service stopped is said as such, with what failed
+# (D5: a usage limit is a limit, never an outage). On staging -187 a stopped
+# run fell back to the chat alone, which answered that it had no tools to
+# create files and rendered a placeholder file from its answer.
+PROVIDER_LIMIT_CODES = frozenset(
+    {
+        "provider_quota",
+        "quota_exceeded",
+        "spending_limit",
+        "rate_limit",
+        "provider_limit",
+        "cost_budget",
+        "budget",
+    }
+)
+
+
+def provider_detail(code: str, status: int = 0) -> str:
+    """The code and status the service gave, as " (provider_error, HTTP 502)"."""
+    if not code:
+        return ""
+    return f" ({code}" + (f", HTTP {status}" if status else "") + ")"
+
+
+def provider_failure_reply(lang: str, code: str, status: int = 0) -> str:
+    """The answer of a Work turn the model service stopped, named."""
+    words = addressing.addressed_table(WORK_FAILURE.get(lang, WORK_FAILURE["en"]), lang)
+    kind = "limit" if code in PROVIDER_LIMIT_CODES else "provider"
+    return str(words["template"]).format(
+        reason=str(words[kind]).format(detail=provider_detail(code, status))
+    )
+
+
 # Kept from a Work turn's time limit when the loop stops on time: the files
 # are saved and the stopped turn explained before the turn's own timeout.
 WORK_CLOSING_SECONDS = 30.0
@@ -297,7 +340,8 @@ def work_failure_category(reason: str, *, tool_failure: bool) -> str | None:
             return MACHINE_LIMITS[reason]
         return "tests_failed" if reason == "tests_not_verified" else "tool_error"
     if reason == "provider_error":
-        return None
+        # Said, never handed to the chat alone (provider_failure_reply).
+        return "provider"
     if reason == "wall_clock":
         return "time_limit"
     if reason in STEP_LIMITS:
@@ -324,7 +368,11 @@ def stopped_work_reply(item: Interaction, lang: str) -> str:
         if reason in words and reason != "template"
         else work_failure_category(reason, tool_failure=False) or "other"
     )
-    return str(words["template"]).format(reason=words.get(category, words["other"]))
+    return str(words["template"]).format(
+        reason=str(words.get(category, words["other"])).format(
+            detail=provider_detail(reason) if category == "provider" else ""
+        )
+    )
 
 
 def work_failure_reply(item: Interaction, lang: str) -> str | None:
@@ -333,7 +381,11 @@ def work_failure_reply(item: Interaction, lang: str) -> str | None:
     if item.state != "failed" or failure.get("category") not in WORK_FAILURE["en"]:
         return None
     words = addressing.addressed_table(WORK_FAILURE.get(lang, WORK_FAILURE["en"]), lang)
-    message = str(words["template"]).format(reason=words[failure["category"]])
+    message = str(words["template"]).format(
+        reason=str(words[failure["category"]]).format(
+            detail=str(failure.get("detail", ""))
+        )
+    )
     return "\n\n".join(
         p
         for p in (
@@ -1466,6 +1518,9 @@ async def process_work(
                     # A stopped loop's text is a diagnostic, not the model's answer.
                     item.work_failure = dict(
                         category=category,
+                        detail=provider_detail(reason)
+                        if category == "provider"
+                        else "",
                         answer=item.reponse
                         if result.state == "done"
                         else complete_answer(

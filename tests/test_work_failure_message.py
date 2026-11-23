@@ -85,7 +85,8 @@ class CategoryTests(unittest.TestCase):
             ("loop_detected", False, "step_limit"),
             ("cost", False, "budget"),
             ("stopped", False, "other"),
-            ("provider_error", False, None),
+            # Said with its reason, never handed to the chat alone.
+            ("provider_error", False, "provider"),
         ):
             with self.subTest(reason=reason):
                 self.assertEqual(
@@ -330,7 +331,9 @@ class LoopFailureTests(unittest.IsolatedAsyncioTestCase):
                     ),
                 )
 
-        self.assertIsNone(work_failure_category("provider_error", tool_failure=False))
+        self.assertEqual(
+            work_failure_category("provider_error", tool_failure=False), "provider"
+        )
 
     async def test_cost_budget_gateway_failure_stays_public_in_non_code_mode(
         self,
