@@ -12,6 +12,9 @@ staging battery, so that people spend their time on the cases that matter. Nothi
 - Never real user conversations, never `/opt/atlas-src/private/`, never `BRAIN/`:
   `adapters.guard()` refuses those paths before anything is read.
 - Requests are sent with `store: false`.
+- Exception decided by the owner on 2026-11-23: the staging-only live judge
+  (`tools/eval/live_judge`) grades every finished staging answer at the Standard privacy
+  level, never production and never Atlas Privacy or Strict conversations.
 
 ## Design
 

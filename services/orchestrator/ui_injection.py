@@ -59,6 +59,10 @@ def inject_atlas_ui(
     tags = ATLAS_UI_TAGS
     if os.environ.get("ATLAS_ARTIFACT_OPEN_IN_TAB") == "1":
         tags = b'<meta name="atlas-artifact-open-in-tab" content="1">' + tags
+    # Staging-only quality rating under each answer (tools/eval/live_judge): only the staging
+    # overlay sets this flag; production.env and common.env never may (tested).
+    if os.environ.get("ATLAS_LIVE_QUALITY_JUDGE") == "1":
+        tags = b'<meta name="atlas-live-quality" content="1">' + tags
     if code_mode and not stable:
         tags = b'<meta name="atlas-code-mode" content="1">' + tags
     if stable:
