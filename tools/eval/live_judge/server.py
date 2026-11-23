@@ -33,10 +33,20 @@ PUBLIC_STATES = ("scored", "pending", "budget", "failed", "skipped_privacy")
 class Auth:
     """Open WebUI session token -> user id, verified by Open WebUI, cached briefly."""
 
-    def __init__(self, chat_ui_url: str) -> None:
-        self.url = chat_ui_url.rstrip("/") + "/api/v1/auths/"
+    def __init__(self, base_url: Callable[[], str]) -> None:
+        self.base_url = base_url
+        self._base: tuple[float, str] = (0.0, "")
         self._cache: dict[str, tuple[float, str]] = {}
         self._lock = threading.Lock()
+
+    def url(self, fresh: bool = False) -> str:
+        with self._lock:
+            stamp, base = self._base
+        if fresh or not base or time.time() - stamp > 300:
+            base = self.base_url()
+            with self._lock:
+                self._base = (time.time(), base)
+        return base.rstrip("/") + "/api/v1/auths/" if base else ""
 
     def user(self, token: str) -> str | None:
         if not token or len(token) > 8192 or any(c in token for c in "\r\n"):
@@ -46,14 +56,23 @@ class Auth:
             hit = self._cache.get(digest)
             if hit and time.time() - hit[0] < TOKEN_TTL:
                 return hit[1]
-        req = urllib.request.Request(
-            self.url, headers={"Authorization": "Bearer " + token}
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                data = json.loads(resp.read(65536))
-        except (urllib.error.URLError, TimeoutError, ValueError, ConnectionError):
-            return None
+        data = None
+        # The container address changes when the interface restarts: one fresh lookup.
+        for fresh in (False, True):
+            url = self.url(fresh)
+            if not url:
+                continue
+            req = urllib.request.Request(
+                url, headers={"Authorization": "Bearer " + token}
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    data = json.loads(resp.read(65536))
+                break
+            except urllib.error.HTTPError:
+                return None
+            except (urllib.error.URLError, TimeoutError, ValueError, ConnectionError):
+                continue
         user = data.get("id") if isinstance(data, dict) else None
         if not isinstance(user, str) or not user.strip() or len(user) > 200:
             return None
@@ -168,12 +187,12 @@ def handler(
 def serve(
     scores: store.Store,
     webui_db: Any,
-    chat_ui_url: str,
+    webui_url: Callable[[], str],
     port: int,
     epoch: Callable[[], float],
 ) -> ThreadingHTTPServer:
     httpd = ThreadingHTTPServer(
-        ("127.0.0.1", port), handler(scores, webui_db, Auth(chat_ui_url), epoch)
+        ("127.0.0.1", port), handler(scores, webui_db, Auth(webui_url), epoch)
     )
     httpd.daemon_threads = True
     return httpd

@@ -170,6 +170,8 @@ class LiveJudgeTest(unittest.TestCase):
             summary_dir=self.root / "quality" / "summary",
             ledger_path=self.root / "ledger.jsonl",
             chat_ui_url="http://127.0.0.1:9",
+            webui_container="atlas-chat-ui-test",
+            webui_port=9,
             port=0,
             daily_cap_eur=daily,
             month_cap_eur=150.0,
@@ -503,7 +505,9 @@ class LiveJudgeTest(unittest.TestCase):
 
         httpd = ThreadingHTTPServer(
             ("127.0.0.1", 0),
-            server.handler(eng.store, self.cfg().webui_db, FakeAuth(""), lambda: 0.0),
+            server.handler(
+                eng.store, self.cfg().webui_db, FakeAuth(lambda: ""), lambda: 0.0
+            ),
         )
         threading.Thread(target=httpd.serve_forever, daemon=True).start()
 
@@ -530,6 +534,33 @@ class LiveJudgeTest(unittest.TestCase):
         finally:
             httpd.shutdown()
             httpd.server_close()
+
+    def test_session_check_finds_the_interface_again(self) -> None:
+        class FakeWebui(BaseHTTPRequestHandler):
+            def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+                return
+
+            def do_GET(self) -> None:  # noqa: N802
+                good = self.headers.get("Authorization") == "Bearer good"
+                raw = json.dumps({"id": "u-reader"}).encode()
+                self.send_response(200 if good else 401)
+                self.send_header("Content-Length", str(len(raw) if good else 0))
+                self.end_headers()
+                if good:
+                    self.wfile.write(raw)
+
+        webui = ThreadingHTTPServer(("127.0.0.1", 0), FakeWebui)
+        threading.Thread(target=webui.serve_forever, daemon=True).start()
+        addresses = iter(
+            ["http://127.0.0.1:9", f"http://127.0.0.1:{webui.server_address[1]}"]
+        )
+        try:
+            auth = server.Auth(lambda: next(addresses))
+            self.assertEqual(auth.user("good"), "u-reader")
+            self.assertIsNone(auth.user("bad"))
+        finally:
+            webui.shutdown()
+            webui.server_close()
 
     def test_summaries_by_day_and_version(self) -> None:
         eng = self.engine()

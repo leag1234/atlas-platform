@@ -48,7 +48,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
     httpd = server.serve(
         scores,
         cfg.webui_db,
-        cfg.chat_ui_url,
+        lambda: engine.webui_url(cfg),
         cfg.port,
         lambda: float(scores.get_meta("judge_epoch") or time.time()),
     )

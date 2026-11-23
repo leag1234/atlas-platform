@@ -41,6 +41,8 @@ class Config:
     summary_dir: Path
     ledger_path: Path
     chat_ui_url: str
+    webui_container: str
+    webui_port: int
     port: int
     daily_cap_eur: float
     month_cap_eur: float
@@ -84,7 +86,11 @@ class Config:
             ledger_path=Path(
                 env.get("ATLAS_LIVE_JUDGE_LEDGER") or FRONTIER_HOME / "ledger.jsonl"
             ),
-            chat_ui_url=AtlasPorts(base).url("chat_ui"),
+            # The loopback port of the interface is its relay, which refuses requests
+            # without the proxy secret; sessions are checked on the container itself.
+            chat_ui_url=env.get("ATLAS_LIVE_JUDGE_WEBUI_URL", ""),
+            webui_container=f"atlas-chat-ui-{base}",
+            webui_port=AtlasPorts(base).port("chat_ui"),
             port=int(env.get("ATLAS_LIVE_JUDGE_PORT") or PORT_OFFSET + base),
             daily_cap_eur=float(env.get("ATLAS_LIVE_JUDGE_DAILY_EUR") or 5.0),
             # The live judge stops for the month below the shared cap, so the offline
@@ -122,6 +128,29 @@ def load_key(path: Path) -> str:
                 value = value[1:-1]
             return value
     return ""
+
+
+def webui_url(cfg: Config) -> str:
+    """Address of the interface container on its Docker network (it changes on restart)."""
+    if cfg.chat_ui_url:
+        return cfg.chat_ui_url
+    try:
+        out = subprocess.run(
+            [
+                "docker",
+                "inspect",
+                "-f",
+                "{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}",
+                cfg.webui_container,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=True,
+        ).stdout.split()
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return f"http://{out[0]}:{cfg.webui_port}" if out else ""
 
 
 _version: tuple[float, str] = (0.0, "")
