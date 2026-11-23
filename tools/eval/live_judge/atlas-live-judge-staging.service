@@ -1,0 +1,38 @@
+# Live quality judge of the STAGING instance (tools/eval/live_judge). Development tooling:
+# it sends finished staging answers to the offline frontier judge's API and serves the
+# scores to the staging interface. Never install it for production: the program refuses
+# to start unless the instance opted in (ATLAS_LIVE_QUALITY_JUDGE=1, staging overlay only)
+# and differs from the production overlay.
+# Install: install -d -m 700 /var/lib/atlas-staging/quality
+#          cp tools/eval/live_judge/atlas-live-judge-staging.service /etc/systemd/system/
+#          systemctl daemon-reload && systemctl enable --now atlas-live-judge-staging
+[Unit]
+Description=Atlas staging live quality judge (dev tooling, staging only)
+After=network-online.target atlas-staging.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+UMask=0077
+WorkingDirectory=/opt/atlas-src/staging
+EnvironmentFile=/opt/atlas-src/staging.env
+# Only OPENAI_API_KEY is read from this file (engine.load_key); nothing else is exported.
+ExecStart=/opt/atlas-src/staging/.venv/bin/python -m tools.eval.live_judge serve --key-file /opt/atlas-src/secrets.env
+Restart=on-failure
+RestartSec=30
+MemoryMax=1G
+MemorySwapMax=0
+CPUQuota=100%
+OOMScoreAdjust=500
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=read-only
+ProtectSystem=strict
+ReadWritePaths=/var/lib/atlas-staging/quality /opt/atlas-src/eval/frontier-judge
+# Everything else is read-only. The Open WebUI database is opened read-only, but SQLite in
+# WAL mode needs its -shm file writable.
+ReadWritePaths=/var/lib/docker/volumes/atlas-chat-ui-200/_data
+
+[Install]
+WantedBy=multi-user.target

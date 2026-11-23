@@ -2217,3 +2217,107 @@ html.dark img[data-atlas-brand="model"] { content:url('/static/atlas/brand/svg/a
   const start = () => { setInterval(probe, 500); probe(); };
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", start, { once: true }); else start();
 })();
+
+// Live quality rating (staging only, tools/eval/live_judge): under each finished answer, the
+// score an evaluation model gave it, with its one-line reason on hover and its details on a
+// click. Only on a page that carries the atlas-live-quality marker (ui_injection.py, set by
+// ATLAS_LIVE_QUALITY_JUDGE, which only the staging overlay sets); otherwise nothing runs.
+// The rating is appended inside the answer's own container, as the plan card is.
+(() => {
+  "use strict";
+  if (document.querySelector('meta[name="atlas-live-quality"]')?.getAttribute("content") !== "1") return;
+  const TEXTS = {
+    en: { label: "Quality rating of my answer: ", paused: "Rating paused (budget)", failed: "Rating unavailable", privacy: "Not rated (privacy level)", worst: "Worst issue: ", classes: "Defect classes: " },
+    fr: { label: "Évaluation de la qualité de ma réponse : ", paused: "Évaluation suspendue (budget)", failed: "Évaluation indisponible", privacy: "Non évaluée (niveau de confidentialité)", worst: "Pire défaut : ", classes: "Classes de défaut : " },
+    de: { label: "Qualitätsbewertung meiner Antwort: ", paused: "Bewertung ausgesetzt (Budget)", failed: "Bewertung nicht verfügbar", privacy: "Nicht bewertet (Datenschutzstufe)", worst: "Größter Mangel: ", classes: "Fehlerklassen: " },
+    es: { label: "Evaluación de la calidad de mi respuesta: ", paused: "Evaluación suspendida (presupuesto)", failed: "Evaluación no disponible", privacy: "No evaluada (nivel de privacidad)", worst: "Peor defecto: ", classes: "Clases de defecto: " },
+    it: { label: "Valutazione della qualità della mia risposta: ", paused: "Valutazione sospesa (budget)", failed: "Valutazione non disponibile", privacy: "Non valutata (livello di privacy)", worst: "Difetto peggiore: ", classes: "Classi di difetto: " }
+  };
+  const texts = () => {
+    let locale = "";
+    try { locale = localStorage.getItem("locale") || ""; } catch { /* storage blocked: the page language */ }
+    return TEXTS[(locale || document.documentElement.lang || navigator.language || "en").toLowerCase().split("-")[0]] || TEXTS.en;
+  };
+  const chatId = () => (location.pathname.match(/^\/c\/([A-Za-z0-9:_-]{1,120})$/) || [])[1] || "";
+  // States the service will not change any more: no new request for them.
+  const SETTLED = new Set(["scored", "failed", "skipped_privacy", "budget", "none"]);
+  // An answer is asked about for at most this long after it is first seen (a stuck rating stops).
+  const WATCH_MS = 15 * 60 * 1000;
+  const POLL_MS = 5000;
+  const known = new Map(), seen = new Map();
+  let pausedUntil = 0, busy = false;
+  const hosts = () => [...document.querySelectorAll('[id^="message-"]')]
+    .map(message => [message.id.slice(8), message.querySelector('[id="response-content-container"]')])
+    .filter(([id, host]) => host && /^[A-Za-z0-9_-]{1,80}$/.test(id));
+  const node = (tag, className, text) => { const element = document.createElement(tag); if (className) element.className = className; if (text !== undefined) element.textContent = text; return element; };
+  const draw = (host, entry) => {
+    let box = [...host.children].find(child => child.classList.contains("atlas-quality"));
+    const words = texts();
+    let line = "";
+    if (entry.state === "scored") line = words.label + entry.score + "/10";
+    else if (entry.state === "pending") line = words.label + "…";
+    else if (entry.state === "budget") line = words.paused;
+    else if (entry.state === "failed") line = words.failed;
+    else if (entry.state === "skipped_privacy") line = words.privacy;
+    if (!line) { box?.remove(); return; }
+    const signature = [entry.state, line, entry.verdict || "", entry.worst || "", (entry.classes || []).join(",")].join("|");
+    if (box && box.dataset.signature === signature && host.lastElementChild === box) return;
+    box = box || node("div", "atlas-quality");
+    box.dataset.signature = signature;
+    box.dataset.state = entry.state;
+    if (entry.state === "scored") {
+      const button = node("button", "atlas-quality-score", line);
+      button.type = "button";
+      button.title = String(entry.verdict || "").slice(0, 300);
+      button.setAttribute("aria-expanded", "false");
+      const detail = node("div", "atlas-quality-detail");
+      detail.hidden = true;
+      detail.append(node("p", "", String(entry.verdict || "").slice(0, 300)));
+      if (entry.worst) detail.append(node("p", "", words.worst + String(entry.worst).slice(0, 400)));
+      if (entry.classes?.length) detail.append(node("p", "atlas-quality-classes", words.classes + entry.classes.slice(0, 19).join(", ")));
+      button.addEventListener("click", () => {
+        detail.hidden = !detail.hidden;
+        button.setAttribute("aria-expanded", String(!detail.hidden));
+      });
+      box.replaceChildren(button, detail);
+    } else {
+      box.replaceChildren(node("span", "atlas-quality-line", line));
+    }
+    host.append(box);
+  };
+  const render = () => {
+    for (const [id, host] of hosts()) {
+      if (!seen.has(id)) seen.set(id, Date.now());
+      const entry = known.get(id);
+      if (entry) draw(host, entry);
+    }
+  };
+  const poll = async () => {
+    if (busy || document.hidden || Date.now() < pausedUntil) return;
+    const chat = chatId();
+    if (!chat) return;
+    const ids = hosts().map(([id]) => id)
+      .filter(id => !SETTLED.has(known.get(id)?.state) && Date.now() - (seen.get(id) || Date.now()) < WATCH_MS)
+      .slice(-60);
+    if (!ids.length) return;
+    busy = true;
+    try {
+      const reply = await fetch("/api/atlas/quality/scores?chat=" + encodeURIComponent(chat) + "&ids=" + ids.map(encodeURIComponent).join(","), { credentials: "same-origin", cache: "no-store" });
+      // Not served here (or signed out): ask again a minute later, never in a loop.
+      if (!reply.ok) { pausedUntil = Date.now() + 60000; return; }
+      const data = await reply.json();
+      for (const [id, entry] of Object.entries(data?.messages || {})) {
+        if (entry && typeof entry.state === "string") known.set(id, entry);
+      }
+      render();
+    } catch { pausedUntil = Date.now() + 60000; } finally { busy = false; }
+  };
+  let scheduled = false;
+  const schedule = () => { if (!scheduled) { scheduled = true; requestAnimationFrame(() => { scheduled = false; render(); }); } };
+  const start = () => {
+    new MutationObserver(schedule).observe(document.body, { childList: true, subtree: true });
+    setInterval(poll, POLL_MS);
+    poll();
+  };
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", start, { once: true }); else start();
+})();
