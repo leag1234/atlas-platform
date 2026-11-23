@@ -1,0 +1,523 @@
+"""Local HTTP boundary for the CPU retrieval models (contracts/m2-gateway)."""
+
+import asyncio
+from collections.abc import Coroutine
+import contextvars
+import json
+import logging
+import select
+import socket
+from time import monotonic
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
+from typing import Any, TypeVar
+
+from gateway_cpu import CPUModels, EMBEDDING_REVISION
+from generation import Generator
+from packages.limits import LimitError, ProviderFailure, kept_cost
+from provider_retry import ProviderResponseError
+from packages.validation import describe_validation
+from pydantic import ValidationError
+from agent_provider import AgentProvider
+from vision import VisionProvider
+from packages.context_limit import ContextExceeded
+from packages.image_upload import UploadError
+from packages.configuration import MissingConfiguration
+from packages.ports import atlas_ports
+from packages.gpu_ownership import GPUDisabled
+from packages import privacy
+from packages.owned_server import HEADER as OWNED_HEADER, OwnedServerUnavailable
+
+import imagegen
+import image_lifecycle
+
+
+T = TypeVar("T")
+
+
+class ClientGone(Exception):
+    """The caller closed its connection before the answer was written."""
+
+
+# How often a call in progress checks that its caller is still connected.
+CLIENT_CHECK_SECONDS = 0.05
+
+
+def kept(error: BaseException) -> dict[str, str]:
+    """The cost a failed call kept, for its failure answer (empty when unknown)."""
+    spent = kept_cost(error)
+    return {} if spent is None else {"reserved_eur": str(spent)}
+
+
+def client_gone(connection: socket.socket) -> bool:
+    """True once the caller closed (or reset) its side of the connection.
+
+    A caller sends its whole request before reading the answer, so a readable
+    socket with nothing to read is the end of the connection. poll, unlike
+    select, has no limit on descriptor numbers.
+    """
+    try:
+        watch = select.poll()
+        watch.register(connection, select.POLLIN | select.POLLHUP | select.POLLERR)
+        events = watch.poll(0)
+        if not events:
+            return False
+        if any(mask & (select.POLLHUP | select.POLLERR) for _, mask in events):
+            return True
+        return not connection.recv(1, socket.MSG_PEEK)
+    except (BlockingIOError, InterruptedError):
+        return False
+    except OSError:
+        return True
+
+
+def client_left(path: str, started: float) -> None:
+    logging.getLogger(__name__).warning(
+        json.dumps(
+            {
+                "event": "gateway_client_gone",
+                "path": path,
+                "elapsed_seconds": round(monotonic() - started, 3),
+            }
+        )
+    )
+
+
+async def while_connected(
+    connection: socket.socket, work: Coroutine[Any, Any, T], path: str
+) -> T:
+    """Run work while the caller is connected; cancel it as soon as it leaves.
+
+    Cancelling closes every upstream provider stream opened by the work (each
+    is an ``async with`` request), so an abandoned call stops generating and
+    being billed instead of running to its end for nobody (2026-11-14: painter
+    drafts abandoned by the orchestrator kept streaming from the provider).
+    """
+    started = monotonic()
+    task = asyncio.ensure_future(work)
+    try:
+        while not task.done():
+            await asyncio.wait({task}, timeout=CLIENT_CHECK_SECONDS)
+            if not task.done() and client_gone(connection):
+                client_left(path, started)
+                raise ClientGone
+        return await task
+    finally:
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+def serve(
+    backend: CPUModels, port: int | None = None, host: str = "127.0.0.1"
+) -> HTTPServer:
+    port = atlas_ports().port("gateway") if port is None else port
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, format: str, *args: object) -> None:
+            pass  # Request bodies and URLs must not enter infrastructure logs.
+
+        def until_gone(self, work: Coroutine[Any, Any, T]) -> T:
+            """Run a provider call; a caller that leaves cancels it (ClientGone)."""
+            return asyncio.run(while_connected(self.connection, work, self.path))
+
+        def stream_response(self, request: object) -> None:
+            from stream_transport import StreamRequest
+
+            validated = StreamRequest.model_validate(request)
+            provider = AgentProvider()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.close_connection = True
+            self.connection.setblocking(False)
+
+            async def send(event: dict[str, object]) -> None:
+                await asyncio.get_running_loop().sock_sendall(
+                    self.connection, ("data: " + json.dumps(event) + "\n\n").encode()
+                )
+
+            async def relay() -> None:
+                from contextlib import aclosing
+
+                async def produce() -> None:
+                    async with aclosing(
+                        provider.stream(validated.model_dump())
+                    ) as events:
+                        async for event in events:
+                            await send(event)
+
+                started = monotonic()
+                try:
+                    await while_connected(self.connection, produce(), self.path)
+                except ClientGone:
+                    return
+                except (BrokenPipeError, ConnectionResetError):
+                    # Writing an event found the caller gone first.
+                    client_left(self.path, started)
+                    return
+
+            async def bounded_relay() -> None:
+                try:
+                    # A call still receiving output may run to progress_timeout;
+                    # the quality controller cuts a silent one before that.
+                    async with asyncio.timeout(
+                        max(validated.timeout, validated.progress_timeout or 0)
+                    ):
+                        await relay()
+                except (ValueError, RuntimeError, TimeoutError, OSError) as exc:
+                    known = {
+                        "cost_budget",
+                        "context_exceeded",
+                        "provider_error",
+                        "provider_usage_exceeds_reservation",
+                        "empty_content_after_retry",
+                        "incomplete_provider_answer",
+                        "unexpected_tool_history_answer",
+                    }
+                    reason = (
+                        "timeout"
+                        if isinstance(exc, TimeoutError)
+                        else str(exc)
+                        if str(exc) in known
+                        or isinstance(
+                            exc,
+                            (privacy.StrictPrivacyUnavailable, OwnedServerUnavailable),
+                        )
+                        else "invalid_or_unavailable"
+                    )
+                    logging.getLogger(__name__).warning(
+                        json.dumps(
+                            {
+                                "event": "gateway_stream_failure",
+                                "reason": reason,
+                            }
+                        )
+                    )
+                    async with asyncio.timeout(0.1):
+                        if isinstance(exc, privacy.StrictPrivacyUnavailable):
+                            await send(
+                                {
+                                    "error": exc.code,
+                                    "capability": exc.capability,
+                                }
+                            )
+                        elif isinstance(exc, OwnedServerUnavailable):
+                            # Starting, or a named refusal of the starter (D5).
+                            await send({"error": "owned_server", **exc.fields()})
+                        elif isinstance(exc, ProviderFailure):
+                            await send(
+                                {
+                                    "error": "provider_failure",
+                                    "message": exc.detail,
+                                    "retries": exc.retries,
+                                }
+                            )
+                        elif isinstance(exc, LimitError):
+                            await send(
+                                {
+                                    "error": "measured_limit",
+                                    "code": exc.code,
+                                    "measured": exc.measured,
+                                    "limit": exc.limit,
+                                    "unit": exc.unit,
+                                }
+                            )
+                        elif isinstance(exc, ContextExceeded):
+                            await send(
+                                {
+                                    "error": "context_exceeded",
+                                    "tokens": exc.tokens,
+                                    "limit": exc.limit,
+                                }
+                            )
+                        elif (
+                            isinstance(exc, ProviderResponseError)
+                            and exc.refusal_class == "credit"
+                        ):
+                            # D5: an exhausted provider account is a quota
+                            # refusal, never reported as a provider outage.
+                            await send(
+                                {
+                                    "error": "provider_quota",
+                                    "provider_status": exc.status,
+                                }
+                            )
+                        else:
+                            await send({"error": "provider_error"})
+
+            try:
+                asyncio.run(bounded_relay())
+            except (BrokenPipeError, ConnectionResetError):
+                return
+            except (ValueError, RuntimeError, TimeoutError, OSError):
+                return
+
+        def do_GET(self) -> None:
+            body = (
+                b'{"status":"ready"}'
+                if self.path == "/health"
+                else b'{"error":"not_found"}'
+            )
+            self.send_response(200 if self.path == "/health" else 404)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_POST(self) -> None:
+            # A fresh context per request: a privacy level never outlives it.
+            contextvars.Context().run(self.handle_post)
+
+        def handle_post(self) -> None:
+            started = monotonic()
+            request: object = {}
+            refused: str | None = None
+            owned: OwnedServerUnavailable | None = None
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                maximum = (
+                    32 * 1024 * 1024
+                    if self.path
+                    in {"/vision/complete", "/agent/complete", "/agent/stream"}
+                    else 800000
+                )
+                if not 0 < length <= maximum:
+                    raise UploadError("request_size_exceeded", length, maximum, "bytes")
+                self.connection.settimeout(30)
+                request = json.loads(self.rfile.read(length))
+                if not isinstance(request, dict):
+                    raise ValueError("invalid_input")
+                # The caller's privacy level holds for every provider call of this
+                # request (this thread serves only this request).
+                privacy.elevate(privacy.requested(self.headers, request))
+                response: dict[str, object]
+                if self.path == "/embeddings":
+                    if set(request) != {"texts", "kind"} or request["kind"] not in {
+                        "query",
+                        "document",
+                    }:
+                        raise ValueError("invalid_input")
+                    texts = request["texts"]
+                    if not isinstance(texts, list) or not all(
+                        isinstance(t, str) for t in texts
+                    ):
+                        raise ValueError("invalid_input")
+                    response = {
+                        "vectors": backend.embed(texts),
+                        "revision": EMBEDDING_REVISION,
+                    }
+                elif self.path == "/rerank":
+                    if set(request) != {"question", "passages"} or not isinstance(
+                        request["question"], str
+                    ):
+                        raise ValueError("invalid_input")
+                    passages = request["passages"]
+                    if not isinstance(passages, list) or any(
+                        not isinstance(p, dict)
+                        or set(p) != {"chunk_id", "text"}
+                        or not isinstance(p["text"], str)
+                        or not isinstance(p["chunk_id"], str)
+                        or len(p["chunk_id"]) != 64
+                        or any(c not in "0123456789abcdef" for c in p["chunk_id"])
+                        for p in passages
+                    ):
+                        raise ValueError("invalid_input")
+                    ids = [p["chunk_id"] for p in passages]
+                    if len(set(ids)) != len(ids):
+                        raise ValueError("invalid_input")
+                    scores = backend.rerank(
+                        request["question"], [p["text"] for p in passages]
+                    )
+                    response = {
+                        "scores": [
+                            {"chunk_id": key, "score": value}
+                            for key, value in zip(ids, scores, strict=True)
+                        ]
+                    }
+                elif self.path == "/agent/config":
+                    if set(request) - {"local_enabled"} or not isinstance(
+                        request.get("local_enabled", True), bool
+                    ):
+                        raise ValueError("invalid_input")
+                    response = AgentProvider().configuration(
+                        request.get("local_enabled", True)
+                    )
+                elif self.path == "/agent/stream":
+                    self.stream_response(request)
+                    return
+                elif self.path == "/images/ready":
+                    response = {"ready": image_lifecycle.ready()}
+                elif self.path == "/images/start":
+                    asyncio.run(
+                        image_lifecycle.ensure_worker(
+                            min(895, float(request.get("timeout", 895)))
+                        )
+                    )
+                    response = {"ready": True}
+                elif self.path == "/images/generate":
+                    response = asyncio.run(imagegen.complete(request))
+                elif self.path == "/vision/complete":
+                    response = self.until_gone(VisionProvider().complete(request))
+                elif self.path == "/agent/complete":
+                    response = self.until_gone(AgentProvider().complete(request))
+                elif self.path == "/answer":
+                    response = Generator()(request)
+                else:
+                    raise ValueError("invalid_input")
+                status = 200
+            except ClientGone:
+                # Nobody is left to answer; the provider call was cancelled.
+                return
+            except privacy.StrictPrivacyUnavailable as exc:
+                refused = exc.capability
+                status, response = (
+                    exc.status,
+                    {
+                        "code": exc.code,
+                        "capability": exc.capability,
+                        "message": exc.message,
+                    },
+                )
+            except MissingConfiguration as exc:
+                status, response = (
+                    503,
+                    {"code": "configuration_missing", "missing": list(exc.missing)},
+                )
+            except ValidationError as exc:
+                status, response = (
+                    400,
+                    {"code": "invalid_input", "message": describe_validation(exc)},
+                )
+            except (UploadError, LimitError) as exc:
+                status, response = (
+                    429
+                    if exc.unit.startswith("microEUR")
+                    else 400
+                    if exc.code == "invalid_cardinality"
+                    else 413,
+                    {
+                        "code": exc.code,
+                        "measured": exc.measured,
+                        "limit": exc.limit,
+                        "unit": exc.unit,
+                        "message": str(exc),
+                    },
+                )
+            except ContextExceeded as exc:
+                # context_exceeded reports measured tokens against the model limit.
+                status, response = (
+                    413,
+                    {
+                        "code": "context_exceeded",
+                        "tokens": exc.tokens,
+                        "limit": exc.limit,
+                    },
+                )
+            except ValueError as exc:
+                reason = str(exc)
+                code = (
+                    "context_exceeded"
+                    if reason == "context_exceeded"
+                    else "provider_error"
+                    if reason.startswith("invalid_provider_")
+                    else "invalid_citation"
+                    if reason == "invalid_citation"
+                    else "invalid_input"
+                )
+                status, response = (
+                    {
+                        "context_exceeded": 413,
+                        "provider_error": 502,
+                        "invalid_citation": 502,
+                        "invalid_input": 400,
+                    }[code],
+                    {"code": code},
+                )
+            except TypeError:
+                status, response = 400, {"code": "invalid_input"}
+            except TimeoutError as exc:
+                value = (
+                    request.get("timeout", 120) if isinstance(request, dict) else 120
+                )
+                limit = (
+                    float(value)
+                    if isinstance(value, (int, float)) and 0 < value <= 900
+                    else 120.0
+                )
+                status, response = (
+                    504,
+                    {
+                        "code": "timeout",
+                        "elapsed_seconds": round(monotonic() - started, 3),
+                        "limit_seconds": limit,
+                    }
+                    | kept(exc),
+                )
+            except ProviderResponseError as exc:
+                status, response = (
+                    (402, {"code": "provider_quota", "provider_status": exc.status})
+                    if exc.refusal_class == "credit"
+                    else (429, {"code": "provider_quota"})
+                    if exc.status == 429
+                    else (502, {"code": "provider_error"})
+                )
+            except ProviderFailure as exc:
+                status, response = (
+                    502,
+                    {
+                        "code": "provider_failure",
+                        "message": exc.detail,
+                        "retries": exc.retries,
+                    }
+                    | kept(exc),
+                )
+            except OwnedServerUnavailable as exc:
+                owned = exc
+                status, response = (
+                    exc.status,
+                    exc.fields() | {"message": exc.message},
+                )
+            except imagegen.ImageWorkerFailure as exc:
+                status, response = (
+                    exc.status,
+                    {"code": exc.code, "reserved_eur": float(exc.reserved)},
+                )
+            except GPUDisabled as exc:
+                status, response = (
+                    503,
+                    {"code": "image_unavailable", "message": str(exc)},
+                )
+            except image_lifecycle.ImageWorkerStartFailure as exc:
+                status, response = exc.status or 502, {"code": "provider_error"}
+            except RuntimeError as exc:
+                if (
+                    self.path in {"/vision/complete", "/images/generate"}
+                    and str(exc) == "cost_budget"
+                ):
+                    status, response = (
+                        429 if self.path == "/images/generate" else 504,
+                        {"code": "cost_budget"},
+                    )
+                else:
+                    status, response = 502, {"code": "provider_error"}
+            body = json.dumps(response).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            if refused is not None:
+                self.send_header(privacy.REFUSAL_HEADER, refused)
+            if owned is not None:
+                self.send_header(OWNED_HEADER, owned.code)
+                if owned.retry_after is not None:
+                    self.send_header("Retry-After", str(owned.retry_after))
+            self.end_headers()
+            self.wfile.write(body)
+
+    return ThreadingHTTPServer((host, port), Handler)
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    with serve(CPUModels()) as server:
+        server.serve_forever()

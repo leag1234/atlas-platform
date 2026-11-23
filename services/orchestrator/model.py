@@ -1,0 +1,885 @@
+"""Model-independent client; provider selection and prices belong to the gateway."""
+
+from services.orchestrator import computation_claims
+from services.orchestrator.image_errors import read_error, decode_error
+from packages.profiles import accepted_profile, chat_seconds
+from packages import context_usage
+from packages.limits import LimitError
+from packages.provider_calls import mark_started
+from packages import owned_server, privacy
+from packages.image_response import IMAGE_RESPONSE_BODY_LIMIT
+
+import json
+from collections.abc import Awaitable, Callable
+from packages.tool_history import final_messages
+import re
+from decimal import Decimal
+from pathlib import Path
+from time import monotonic
+from typing import Literal
+
+import aiohttp
+from pydantic import BaseModel, ConfigDict, Field
+
+from services.orchestrator.loop import (
+    Call,
+    GatewayError,
+    Message,
+    OwnedServerAnswer,
+    Reservation,
+    StrictPrivacyRefusal,
+    Turn,
+)
+
+__all__ = ["GatewayError"]
+
+from services.orchestrator.closing import STEP_LIMIT_CODE, closing_requested
+from services.orchestrator import time_cut
+from services.orchestrator.tools import declarations
+from services.orchestrator.stream_client import (
+    Sink,
+    provider_credit_detail,
+    receive,
+)
+from services.orchestrator.narration import (
+    NarrationFilter,
+    TurnHold,
+    clean_answer,
+    unfinished_announcement,
+)
+
+
+class Configuration(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    input_eur_per_mtok: Decimal = Field(ge=0, allow_inf_nan=False)
+    output_eur_per_mtok: Decimal = Field(ge=0, allow_inf_nan=False)
+    max_tokens: int = Field(gt=0, le=2048)
+    gateway_reserves_quality: bool = False
+    # First-attempt output room the gateway may add for configured reasoning.
+    reasoning_output_tokens: int = Field(default=0, ge=0, le=12000)
+    profile_reasoning_output_tokens: dict[str, int] = Field(default_factory=dict)
+
+
+class WireCall(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    id: str = Field(min_length=1, max_length=200)
+    name: str = Field(min_length=1, max_length=80)
+    # Memory guard only: max_tokens bounds a call's arguments.
+    arguments: str = Field(max_length=1048576)
+
+
+class WireUsage(BaseModel):
+    prompt_tokens: int = Field(ge=0, strict=True)
+    completion_tokens: int = Field(ge=0, le=48000, strict=True)
+
+
+class Observation(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    # "owned": a server Atlas controls (strict privacy), see docs/08-plateforme-api.md.
+    provider: Literal["local", "escalade", "owned"]
+    route: Literal["simple", "complexe"]
+    task_type: Literal["text", "code", "vision"] | None = None
+    fallback: bool = False
+
+
+class WireTurn(BaseModel):
+    provider_retries: int = Field(default=0, ge=0, le=1)
+    provider_model: str = Field(default="", max_length=200)
+    observation: Observation | None = None
+    usage: WireUsage
+    model_config = ConfigDict(extra="forbid", strict=True)
+    cost_eur: Decimal | None = Field(
+        default=None, ge=0, le=Decimal("0.30"), allow_inf_nan=False, strict=False
+    )
+    reasoning: str = Field(default="", max_length=256000)
+    retry_completion_tokens: int = Field(default=0, ge=0, le=36000, strict=True)
+    trace_tokens: int = Field(default=0, ge=0)
+    answer_tokens: int = Field(default=0, ge=0)
+    token_split_estimated: bool = False
+    reasoning_retried: bool = False
+    reasoning_effort: Literal["none", "low", "medium", "high"] = "none"
+    text: str = Field(max_length=128000)
+    calls: list[WireCall] = Field(max_length=10)
+
+
+# Gateway endpoints that never call a model provider (configuration and health).
+FREE_PATHS = ("/agent/config", "/images/ready")
+
+
+# Gateway answers that refuse a call before any provider output: bad request,
+# provider account exhausted (402), refused access, size or context limit (413),
+# budget or rate refusal (429), provider not configured or unavailable (503).
+# A provider failure (502) or a timeout (504) may follow partial output: its cost
+# stays unknown.
+REFUSED_BEFORE_OUTPUT = frozenset({400, 401, 402, 403, 404, 409, 413, 422, 429, 503})
+
+
+def refused_before_output(exc: BaseException) -> bool:
+    """True for a gateway answer that refused a call before any provider output."""
+    if isinstance(exc, (StrictPrivacyRefusal, OwnedServerAnswer)):
+        return True
+    return isinstance(exc, GatewayError) and exc.status in REFUSED_BEFORE_OUTPUT
+
+
+# The longest single call the gateway accepts without a file or attachments is
+# the chat limit of the endpoint that answers it (packages/profiles.chat_seconds).
+
+# The gateway's own failure codes, kept on a GatewayCallError.
+_FAILURE_CODE = re.compile(r"[a-z][a-z_]{0,47}")
+
+
+class GatewayCallError(RuntimeError):
+    """A gateway answer other than 200 that no named refusal above covers.
+
+    Still "gateway_error" for every caller that reads the message (the turn
+    paths report it as before); it keeps what the gateway said: its failure code
+    (timeout, provider_error, invalid_input...), the HTTP status and, when the
+    gateway reports it, the cost it kept for the failed call (a call cut in
+    flight keeps its reservation). A check that logs its failures reads them
+    (source_faithfulness: failed:timeout instead of failed:RuntimeError).
+    """
+
+    def __init__(self, code: str, status: int, cost_eur: Decimal | None = None):
+        super().__init__("gateway_error")
+        self.code, self.status, self.cost_eur = code, status, cost_eur
+
+
+def reserved_cost(error: object) -> Decimal | None:
+    """The cost a gateway failure body reports for the failed call, or None."""
+    if not isinstance(error, dict):
+        return None
+    value = error.get("reserved_eur")
+    if not isinstance(value, (str, int, float)) or isinstance(value, bool):
+        return None
+    try:
+        cost = Decimal(str(value))
+    except ArithmeticError:
+        return None
+    return cost if cost.is_finite() and 0 <= cost <= 10 else None
+
+
+def failure_of(status: int, error: object) -> GatewayCallError:
+    """The GatewayCallError of a gateway failure body (any JSON, or none)."""
+    code = error.get("code") if isinstance(error, dict) else None
+    if not isinstance(code, str) or not _FAILURE_CODE.fullmatch(code):
+        code = "timeout" if status == 504 else f"http_{status}"
+    return GatewayCallError(code, status, reserved_cost(error))
+
+
+class GatewayModel:
+    def __init__(self, url: str, configuration: Configuration) -> None:
+        self.url, self.configuration = url.rstrip("/"), configuration
+        self.tools = declarations()
+        self.required_file_tool: str | None = None
+        # The call may use no tool: the gateway answers with the Work tools'
+        # context but sends the provider none (a streamed document, Work only).
+        self.answer_only = False
+        self.required_file_formats: tuple[str, ...] = ()
+        self.prefix: list[Message] = []
+        self.prompt_tokens = 0
+        self.input_tokens = 0
+        self.output_tokens = 0
+        self.observations: list[Observation] = []
+        self.local_enabled = True
+        self.privacy = "standard"
+        # Monotonic end of the caller's own time (a Work turn's wall clock). A
+        # call still receiving output may run past its timeout up to it; the
+        # gateway still cuts a silent call.
+        self.progress_deadline: float | None = None
+        self.observing = False
+        self.generation_ms = 0.0
+        self.sink: Sink | None = None
+        # Chat: a turn's text is kept off the stream until the turn is known
+        # to be the answer, after a tool result or from the first turn on.
+        self.note_hold: Literal["off", "after_tool", "turn"] = "off"
+        self.reasoning_effort = "none"
+        self.reasoning_ceiling: Literal["none", "low", "medium", "high"] | None = None
+        self.stream_turn = 0
+        self.profile: str | None = None
+        self.max_tokens = configuration.max_tokens
+        self.provider_model = ""
+        self.spent = Decimal(0)
+        self.delivery_reserve = Decimal(0)
+        self.has_attachments = False
+        self.provider_retries = 0
+        self.produces_files = False
+        self.reasoning = ""
+        self.trace_tokens = 0
+        self.answer_tokens = 0
+        self.token_split_estimated = False
+        self.reasoning_retried = False
+        # Highest reasoning effort the gateway actually used for a delivered turn.
+        self.reasoning_used = "none"
+        self.cost_ceiling: Decimal | None = None
+        # Profile calls only: the bounded sampling temperature the gateway
+        # passes on (None keeps the provider at temperature 0).
+        self.sampling_temperature: float | None = None
+        self.context_samples: list[dict[str, object]] = []
+        from services.orchestrator.session_context import SessionContext
+
+        self.session_context: SessionContext | None = None
+        self.dispatch_hook: Callable[[str, Message], Awaitable[None]] | None = None
+
+    def configure_quality(
+        self,
+        profile: str,
+        max_tokens: int,
+        *,
+        has_attachments: bool = False,
+        produces_files: bool = False,
+    ) -> None:
+        if not accepted_profile(profile):
+            raise ValueError("invalid_profile")
+        self.profile, self.max_tokens = profile, max_tokens
+        self.has_attachments = has_attachments
+        self.produces_files = produces_files
+        self.reasoning_effort = "none"
+
+    @property
+    def reasoning_room(self) -> int:
+        """Reasoning widening the gateway may apply to this turn's first attempt."""
+        if not self.profile or self.reasoning_retried:
+            return 0
+        return self.configuration.profile_reasoning_output_tokens.get(
+            self.profile, self.configuration.reasoning_output_tokens
+        )
+
+    @property
+    def allowance(self) -> Decimal:
+        if self.cost_ceiling is not None:
+            return max(
+                Decimal(0), self.cost_ceiling - self.spent - self.delivery_reserve
+            )
+        return max(
+            Decimal(0),
+            Decimal(
+                "0.30"
+                if (self.has_attachments or self.produces_files)
+                and self.profile is not None
+                else "0.10"
+                if self.profile is not None
+                else "0.05"
+            )
+            - self.spent
+            - self.delivery_reserve,
+        )
+
+    @staticmethod
+    async def post(url: str, payload: Message, timeout: float) -> Message:
+        """A gateway call; a strict call that finds the on-demand owned server
+        starting waits for it and is made again (owned_wait.py)."""
+        from services.orchestrator import owned_wait
+
+        return await owned_wait.call(lambda: GatewayModel.send(url, payload, timeout))
+
+    @staticmethod
+    async def send(url: str, payload: Message, timeout: float) -> Message:
+        calls = None
+        if not url.endswith(FREE_PATHS):
+            # Conservative: any other gateway or retrieval call may reach a provider.
+            calls = mark_started()
+        try:
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=timeout), trust_env=False
+            ) as session:
+                async with session.post(
+                    url, json=payload, allow_redirects=False, headers=privacy.headers()
+                ) as response:
+                    if capability := response.headers.get(privacy.REFUSAL_HEADER):
+                        # Strict privacy: no owned target; named, never an outage.
+                        raise StrictPrivacyRefusal(capability[:64])
+                    if response.headers.get(owned_server.HEADER) and (
+                        answer := owned_server.parse(
+                            json.loads(await response.content.read(2048))
+                        )
+                    ):
+                        # The owned server is starting, or its starter refused (D5).
+                        raise OwnedServerAnswer(answer)
+                    if response.status != 200 and url.endswith(
+                        ("/images/generate", "/images/start", "/images/ready")
+                    ):
+                        image_code, detail, measurements = decode_error(
+                            response.status, await read_error(response)
+                        )
+                        raise GatewayError(
+                            image_code,
+                            response.status,
+                            detail,
+                            measurements=measurements,
+                        )
+                    if response.status == 402:
+                        error = json.loads(await response.content.read(512))
+                        if (
+                            isinstance(error, dict)
+                            and error.get("code") == "provider_quota"
+                        ):
+                            # D5: an exhausted provider account is not an outage.
+                            raise GatewayError(
+                                "provider_quota",
+                                402,
+                                provider_credit_detail(error.get("provider_status")),
+                            )
+                        raise RuntimeError("gateway_error")
+                    if response.status in (413, 429):
+                        error = json.loads(await response.content.read(512))
+                        if (
+                            isinstance(error, dict)
+                            and error.get("code") == "cost_budget"
+                            and error.get("unit") == "microEUR"
+                            and all(
+                                type(error.get(k)) is int and error[k] >= 0
+                                for k in ("measured", "limit")
+                            )
+                        ):
+                            raise GatewayError(
+                                "cost_budget",
+                                429,
+                                f"Cost reservation: {error['measured']} microEUR, remaining limit {error['limit']} microEUR; request ceiling "
+                                + (
+                                    "0.30"
+                                    if payload.get("has_attachments")
+                                    or payload.get("produces_files")
+                                    else "0.10"
+                                    if payload.get("profile")
+                                    else "0.05"
+                                )
+                                + " EUR",
+                            )
+                        if response.status == 429:
+                            if (
+                                isinstance(error, dict)
+                                and error.get("unit") in ("microEUR", "microEUR/hour")
+                                and all(
+                                    type(error.get(k)) is int and error[k] >= 0
+                                    for k in ("measured", "limit")
+                                )
+                            ):
+                                raise GatewayError(
+                                    "cost_budget",
+                                    429,
+                                    f"Reservation {error['measured']} {error['unit']}; limit {error['limit']} {error['unit']}",
+                                )
+                            raise GatewayError("provider_error", 429)
+                        if (
+                            isinstance(error, dict)
+                            and all(
+                                type(error.get(k)) is int and error[k] >= 0
+                                for k in ("measured", "limit")
+                            )
+                            and error.get("unit") == "bytes"
+                        ):
+                            raise GatewayError(
+                                "request_size_exceeded",
+                                413,
+                                f"Gateway limit: {error['measured']} {error.get('unit', 'bytes')}, limit {error['limit']} {error.get('unit', 'bytes')}",
+                            )
+                        if isinstance(error, dict) and all(
+                            type(error.get(k)) is int and error[k] >= 0
+                            for k in ("tokens", "limit")
+                        ):
+                            raise GatewayError(
+                                "context_exceeded",
+                                413,
+                                f"Conversation: {error['tokens']} tokens, limit {error['limit']} tokens",
+                            )
+                        raise GatewayError("request_size_exceeded", 413)
+                    failed: object = None
+                    if response.status == 502:
+                        error = failed = json.loads(await response.content.read(1024))
+                        if (
+                            isinstance(error, dict)
+                            and error.get("code") == "provider_failure"
+                        ):
+                            reserved = reserved_cost(error)
+                            raise GatewayError(
+                                "provider_error",
+                                502,
+                                str(error.get("message", "provider_error")),
+                                retries=int(error.get("retries", 0)),
+                                measurements=None
+                                if reserved is None
+                                else {"reserved_eur": reserved},
+                            )
+                    if response.status != 200:
+                        if url.endswith(
+                            ("/vision/complete", "/images/generate", "/images/start")
+                        ):
+                            error = json.loads(await response.content.read(512))
+                            codes = {
+                                "cost_budget": 429,
+                                "configuration_missing": 503,
+                                "timeout": 504,
+                                "context_exceeded": 413,
+                                "invalid_input": 400,
+                                "provider_error": 502,
+                            }
+                            code = (
+                                error.get("code") if isinstance(error, dict) else None
+                            )
+                            if code in codes:
+                                detail = ""
+                                if code == "context_exceeded" and all(
+                                    type(error.get(k)) is int
+                                    for k in ("tokens", "limit")
+                                ):
+                                    detail = f"context_exceeded: {error['tokens']} tokens, limit {error['limit']} tokens"
+                                if code == "timeout" and all(
+                                    type(error.get(k)) in (int, float)
+                                    and 0 <= error[k] <= 1000000
+                                    for k in ("elapsed_seconds", "limit_seconds")
+                                ):
+                                    detail = f"Timeout: {error['elapsed_seconds']:.3f} seconds elapsed, limit {error['limit_seconds']:.3f} seconds"
+                                if code == "configuration_missing":
+                                    missing = error.get("missing")
+                                    if isinstance(missing, list) and all(
+                                        isinstance(name, str)
+                                        and re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", name)
+                                        for name in missing
+                                    ):
+                                        detail = (
+                                            "Missing required environment variables: "
+                                            + ", ".join(missing)
+                                        )
+                                # Keep the transport status: image startup retries only
+                                # provider-side 5xx responses, not setup refusals that
+                                # happen to use the same status family.
+                                raise GatewayError(code, response.status, detail)
+                            raise RuntimeError("gateway_error")
+                        if response.status != 502:
+                            try:
+                                failed = json.loads(await response.content.read(1024))
+                            except ValueError:
+                                failed = None
+                        # The gateway's code and the cost it kept (a timeout keeps
+                        # the call's reservation), still "gateway_error" for callers.
+                        raise failure_of(response.status, failed)
+                    maximum = (
+                        IMAGE_RESPONSE_BODY_LIMIT
+                        if url.endswith("/images/generate")
+                        else 800000
+                    )
+                    data = bytearray()
+                    async for piece in response.content.iter_chunked(16384):
+                        data.extend(piece)
+                        if len(data) > maximum:
+                            raise LimitError(
+                                (
+                                    "image_response_limit"
+                                    if url.endswith("/images/generate")
+                                    else "gateway_response_limit"
+                                ),
+                                len(data),
+                                maximum,
+                                "bytes",
+                            )
+            value: object = json.loads(data)
+            if not isinstance(value, dict):
+                raise ValueError("gateway_response_invalid")
+            if calls is not None:
+                # The call came back whole: its cost is the one the gateway measured.
+                calls.answered(value.get("cost_eur"))
+            return value
+        except GatewayError as exc:
+            if calls is not None and refused_before_output(exc):
+                # The gateway refused the call before any provider output: the
+                # call consumed nothing (a refusal is never billed as an answer).
+                calls.answered()
+            raise
+        except aiohttp.ClientError:
+            if url.endswith(("/images/generate", "/images/start", "/images/ready")):
+                raise GatewayError("provider_error", 502) from None
+            raise RuntimeError("gateway_unavailable") from None
+
+    @classmethod
+    async def connect(cls, url: str, local_enabled: bool = True) -> "GatewayModel":
+        config = await cls.post(
+            url.rstrip("/") + "/agent/config", {"local_enabled": local_enabled}, 5
+        )
+        return cls(url, Configuration.model_validate(config))
+
+    def observe(self, messages: list[Message], prompt_tokens: int) -> None:
+        self.prefix = json.loads(json.dumps(messages))
+        self.prompt_tokens = prompt_tokens
+
+    def estimate(self, messages: list[Message]) -> Reservation:
+        incoming = (
+            max(
+                len(
+                    json.dumps(
+                        {
+                            "messages": value,
+                            "tools": self.available_tools(messages)
+                            if self.profile
+                            else self.tools,
+                        },
+                        ensure_ascii=False,
+                    ).encode()
+                )
+                for value in (messages, final_messages(messages))
+                if self.profile or value == messages
+            )
+            + 256
+        )
+        # Profile recovery retains the full input bound on unknown usage. A
+        # previously measured prefix cannot shrink that possible reservation.
+        if (
+            not self.profile
+            and self.prefix
+            and messages[: len(self.prefix)] == self.prefix
+        ):
+            incoming = (
+                self.prompt_tokens
+                + len(
+                    json.dumps(
+                        messages[len(self.prefix) :], ensure_ascii=False
+                    ).encode()
+                )
+                + 256
+            )
+        if self.profile:
+            # Hold the remaining allowance; the gateway reserves each actual attempt.
+            primary_cost = (
+                incoming * self.configuration.input_eur_per_mtok
+                + (self.max_tokens + self.reasoning_room)
+                * self.configuration.output_eur_per_mtok
+            ) / 1_000_000
+            return Reservation(
+                incoming * 2 + self.max_tokens + self.reasoning_room + 3000,
+                self.allowance
+                if self.configuration.gateway_reserves_quality
+                else max(primary_cost, self.allowance),
+            )
+        outgoing = self.configuration.max_tokens
+        cost = (
+            incoming * self.configuration.input_eur_per_mtok
+            + outgoing * self.configuration.output_eur_per_mtok
+        ) / 1_000_000
+        return Reservation(incoming + outgoing, cost)
+
+    @property
+    def strict(self) -> bool:
+        """Owned targets only, for this client or for the request it runs in (Strict,
+        or Enhanced while the pseudonymiser is not installed)."""
+        return self.privacy == "strict" or privacy.owned_only()
+
+    def available_tools(self, messages: list[Message]) -> list[dict[str, object]]:
+        # A search limit closed the research of this turn: the call that
+        # follows writes the answer, so it streams as the answer too.
+        if closing_requested(messages):
+            return []
+        if any(
+            message.get("role") == "tool"
+            and isinstance(message.get("content"), str)
+            and f'"error": "{STEP_LIMIT_CODE}"' in str(message["content"])
+            for message in messages
+        ):
+            return []
+        completed = {m.get("tool_call_id") for m in messages if m.get("role") == "tool"}
+        counts: dict[str, int] = {}
+        for message in messages:
+            calls = message.get("tool_calls")
+            if not isinstance(calls, list):
+                continue
+            for call in calls:
+                if not isinstance(call, dict) or call.get("id") not in completed:
+                    continue
+                function = call.get("function")
+                if isinstance(function, dict) and isinstance(function.get("name"), str):
+                    name = function["name"]
+                    counts[name] = counts.get(name, 0) + 1
+        if sum(counts.values()) >= 10:
+            return []
+        if any(
+            message.get("role") == "tool"
+            and isinstance(message.get("content"), str)
+            and '"terminal_operation_failed"' in str(message["content"])
+            for message in messages
+        ):
+            return []
+        searches = counts.get("web_search", 0) + counts.get("web_images", 0)
+        ceilings = {"web_search": 3, "web_images": 3, "web_fetch": 8}
+        available = []
+        for tool in privacy.allowed_tools(self.tools):
+            function = tool.get("function")
+            if isinstance(function, dict):
+                name = str(function.get("name"))
+                used = (
+                    searches
+                    if name in {"web_search", "web_images"}
+                    else counts.get(name, 0)
+                )
+                if used < ceilings.get(name, 10):
+                    remaining = min(
+                        10 - sum(counts.values()),
+                        ceilings.get(name, 10) - used,
+                    )
+                    available.append(
+                        {
+                            **tool,
+                            "function": {
+                                **function,
+                                "description": str(function.get("description", ""))
+                                + Path("prompts/tool-quota.txt")
+                                .read_text()
+                                .format(remaining=remaining),
+                            },
+                        }
+                    )
+        return available
+
+    async def prepare_context(self, messages: list[Message]) -> None:
+        if self.session_context is not None:
+            await self.session_context.prepare(
+                messages, self.available_tools(messages), self.profile
+            )
+
+    async def complete(self, messages: list[Message], timeout: float) -> Turn:
+        payload: Message = {
+            "messages": messages,
+            "tools": self.available_tools(messages),
+            "timeout": timeout,
+        }
+        if self.answer_only and payload["tools"]:
+            payload["tool_choice"] = "none"
+        elif self.required_file_tool and payload["tools"]:
+            payload["tool_choice"] = {
+                "type": "function",
+                "function": {"name": self.required_file_tool},
+            }
+        if self.profile:
+            payload.update(
+                profile=self.profile,
+                max_tokens=self.max_tokens,
+                reasoning_effort=self.reasoning_effort,
+                budget_eur=str(self.allowance),
+            )
+            if self.reasoning_retried:
+                payload["reasoning_disabled"] = True
+            if self.reasoning_ceiling is not None:
+                payload["reasoning_ceiling"] = self.reasoning_ceiling
+            if self.sampling_temperature is not None:
+                payload["sampling_temperature"] = self.sampling_temperature
+        if self.strict:
+            payload["privacy"] = "strict"
+        if self.produces_files:
+            payload["produces_files"] = True
+        if self.has_attachments:
+            payload["has_attachments"] = True
+        if not (self.profile and (self.produces_files or self.has_attachments)):
+            # The gateway refuses a call above 120 s unless it writes a file or reads
+            # attachments (AgentRequest). A turn can carry a longer deadline than the
+            # route that answers it (a picture turn answered as text, staging -43:
+            # timeout_budget 299949 ms; limit 120000 ms, the turn failed in 1 s); such
+            # a call keeps the chat call limit instead of being refused.
+            payload["timeout"] = min(timeout, chat_seconds(self.strict))
+        # The transport waits as long as the gateway may keep a call that is
+        # still receiving output (strict privacy has no stall watch: unchanged).
+        transport = timeout
+        if (
+            self.profile
+            and not self.strict
+            and self.progress_deadline is not None
+            and (progress := min(86400.0, self.progress_deadline - monotonic()))
+            > timeout
+        ):
+            payload["progress_timeout"] = progress
+            transport = progress
+        if self.observing:
+            payload.update(local_enabled=self.local_enabled, observe=True)
+        context = (
+            await self.session_context.prepare(messages, payload["tools"], self.profile)
+            if self.session_context is not None
+            else context_usage.measure(messages, payload["tools"], self.profile)
+        )
+        self.context_samples.append(context)
+        if (capture := context_usage.samples.get()) is not None:
+            capture.append(context)
+        reserved = self.estimate(messages)
+        started = monotonic()
+        if self.dispatch_hook:
+            await self.dispatch_hook("intent", payload)
+        hold: TurnHold | None = None
+        try:
+            from services.orchestrator.stream_client import metadata_only_context
+
+            if self.sink is None or metadata_only_context.get():
+                wire = await self.post(self.url + "/agent/complete", payload, transport)
+            else:
+                payload["reasoning_effort"] = self.reasoning_effort
+                self.stream_turn += 1
+                # What this call writes, for a turn cut by its time limit
+                # (time_cut.py): the person then reads it, held or not.
+                draft = time_cut.current.get()
+                if draft is not None:
+                    draft.begin()
+                await self.sink(
+                    {
+                        "turn": self.stream_turn,
+                        "phase": "generating",
+                        "reserved_eur": str(self.estimate(messages).cost),
+                        "max_output_tokens": self.max_tokens,
+                    }
+                )
+                parser = NarrationFilter()
+                sink = self.sink
+                # Whether this turn is the answer or a step before a tool call
+                # is only known when it ends, and streamed text cannot be taken
+                # back: the turn's text is held until then. With no tool
+                # offered the turn can only be the answer and streams live, as
+                # does a first turn nobody expects to use a tool (first token).
+                if payload["tools"] and (
+                    self.note_hold == "turn"
+                    or self.note_hold == "after_tool"
+                    and any(message.get("role") == "tool" for message in messages)
+                ):
+                    hold = TurnHold(sink)
+                answer: Sink = hold if hold is not None else sink
+
+                async def filtered(event: dict[str, object]) -> None:
+                    delta = event.get("delta")
+                    if isinstance(delta, dict) and isinstance(
+                        delta.get("content"), str
+                    ):
+                        count = len(parser.removed)
+                        text = parser.feed(delta["content"])
+                        if len(parser.removed) > count:
+                            await sink(
+                                {"phase": "narration", "sentences": len(parser.removed)}
+                            )
+                        if text:
+                            if draft is not None:
+                                draft.add(text)
+                            await answer({"delta": {**delta, "content": text}})
+                    else:
+                        await sink(event)
+
+                from services.orchestrator import owned_wait
+
+                # A strict call that finds the owned server starting waits for it,
+                # with its status on the turn's stream, and is made again: the
+                # refusal comes before any answer text.
+                wire = await owned_wait.call(
+                    lambda: receive(
+                        self.url + "/agent/stream", payload, transport, filtered
+                    ),
+                    sink,
+                )
+                tail = parser.finish()
+                if tail:
+                    if draft is not None:
+                        draft.add(tail)
+                    await answer({"delta": {"content": tail}})
+                if draft is not None:
+                    # A call that asks for a tool wrote a working note.
+                    draft.end(tool_call=bool(wire.get("calls")))
+            result = WireTurn.model_validate(wire)
+            # What the model asked to run backs its claims of a deed (C2).
+            computation_claims.record(call.name for call in result.calls)
+            context["provider_input_tokens"] = result.usage.prompt_tokens
+            if self.session_context is not None:
+                self.session_context.observe(result.usage.prompt_tokens)
+            if self.dispatch_hook:
+                await self.dispatch_hook("acknowledged", wire)
+            self.provider_retries += result.provider_retries
+            if result.text:
+                cleaned = clean_answer(result.text, allow_empty=True)
+                # The loop needs the original one-line announcement to spend its
+                # single bounded recovery turn instead of treating it as a provider
+                # failure. Mixed narration remains removed before delivery.
+                if cleaned.strip() or not unfinished_announcement(result.text):
+                    result.text = cleaned
+            if (
+                not self.profile
+                and result.usage.completion_tokens > self.configuration.max_tokens
+            ):
+                raise LimitError(
+                    "output_budget",
+                    result.usage.completion_tokens,
+                    self.configuration.max_tokens,
+                    "tokens",
+                )
+            retry_tokens = result.retry_completion_tokens
+            # A widened reasoning attempt that ends empty is followed by the
+            # bounded recovery: both fit the limit (and the reservation).
+            output_limit = self.max_tokens + self.reasoning_room + 3000
+            if retry_tokens > min(result.usage.completion_tokens, 3 * output_limit):
+                raise ValueError("invalid_retry_usage")
+            if (
+                self.profile
+                and result.usage.completion_tokens - retry_tokens > output_limit
+            ):
+                raise LimitError(
+                    "output_budget",
+                    result.usage.completion_tokens,
+                    output_limit,
+                    "tokens including recovery",
+                )
+            if hold is not None:
+                if result.calls:
+                    hold.drop()
+                else:
+                    await hold.release()
+            if self.sink is not None:
+                await self.sink(
+                    {
+                        "turn": self.stream_turn,
+                        "phase": "intermediate" if result.calls else "final",
+                        "tools": [c.name for c in result.calls],
+                    }
+                )
+        except BaseException:
+            if self.dispatch_hook:
+                await self.dispatch_hook("unknown", {})
+            raise
+        finally:
+            self.generation_ms += (monotonic() - started) * 1000
+        if self.observing and result.observation is None:
+            raise ValueError("missing_observation")
+        if result.observation is not None:
+            self.observations.append(result.observation)
+        self.input_tokens += result.usage.prompt_tokens
+        self.output_tokens += result.usage.completion_tokens
+        usage = result.usage
+        self.observe(messages, usage.prompt_tokens)
+        cost = (
+            usage.prompt_tokens * self.configuration.input_eur_per_mtok
+            + usage.completion_tokens * self.configuration.output_eur_per_mtok
+        ) / 1_000_000
+        if self.profile:
+            if result.cost_eur is None or result.cost_eur > reserved.cost:
+                raise ValueError("invalid_profile_cost")
+            self.provider_model = result.provider_model
+            cost = result.cost_eur
+            self.spent += cost
+            self.reasoning += result.reasoning
+            self.trace_tokens += result.trace_tokens
+            self.answer_tokens += result.answer_tokens
+            self.token_split_estimated |= result.token_split_estimated
+            self.reasoning_retried |= result.reasoning_retried
+            self.reasoning_used = max(
+                self.reasoning_used,
+                result.reasoning_effort,
+                key=("none", "low", "medium", "high").index,
+            )
+            if result.reasoning_retried:
+                # Recovery can request tools; its following turn must finish
+                # without restarting the reasoning that already failed.
+                self.reasoning_effort = "none"
+                self.max_tokens = 3000
+        if not self.profile and result.cost_eur is not None:
+            if result.cost_eur > reserved.cost:
+                raise ValueError("invalid_provider_cost")
+            cost = result.cost_eur
+        if (
+            not self.profile
+            and result.cost_eur is None
+            and result.observation is not None
+            and result.observation.fallback
+        ):
+            # The primary may have been billed without returning usage. Retain the full reservation.
+            cost = reserved.cost
+        return Turn(
+            result.text,
+            tuple(Call(c.id, c.name, c.arguments) for c in result.calls),
+            Reservation(usage.prompt_tokens + usage.completion_tokens, cost),
+        )

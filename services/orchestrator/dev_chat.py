@@ -1,0 +1,495 @@
+"""Chat input normalization and output assembly; tools are never executed here."""
+
+from packages.limits import LimitError
+
+import json
+import logging
+import time
+from typing import Any, Literal
+from pydantic import Field, model_validator
+from packages.dev_request import (
+    MAX_TOOLS,
+    Call,
+    Request,
+    ResponseFormat,
+    Sampling,
+    Strict,
+    Tool,
+)
+from packages.dev_format import validate_json
+
+
+class StreamOptions(Strict):
+    include_usage: bool = False
+
+
+class ChatInput(Request):
+    model: Literal["atlas-code"]
+    n: int = Field(default=1, ge=1, le=1, exclude=True)
+    stream: bool = False
+    stream_options: StreamOptions = StreamOptions()
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize(cls, value: Any) -> Any:
+        value = json.loads(json.dumps(value, allow_nan=False))
+        if not isinstance(value, dict):
+            raise ValueError("invalid_input")
+        if "max_completion_tokens" in value:
+            maximum = value.pop("max_completion_tokens")
+            if "max_tokens" in value and value["max_tokens"] != maximum:
+                raise ValueError("conflicting_maximum")
+            value["max_tokens"] = maximum
+        for message in value.get("messages", []):
+            if message.get("role") == "developer":
+                message["role"] = "system"
+            content = message.get("content")
+            if isinstance(content, list):
+                if any(
+                    set(p) != {"type", "text"}
+                    or p["type"] != "text"
+                    or not isinstance(p["text"], str)
+                    for p in content
+                ):
+                    raise ValueError(
+                        "unsupported content: only text parts are accepted here"
+                    )
+                message["content"] = "\n".join(p["text"] for p in content)
+        return value
+
+
+class RawMessage(Strict):
+    """Provider-compatible message content, including vision content parts."""
+
+    role: Literal["system", "user", "assistant", "tool", "developer"]
+    content: Any = None
+    tool_calls: list[Call] = Field(default_factory=list, max_length=MAX_TOOLS)
+    tool_call_id: str | None = None
+    name: str | None = Field(default=None, max_length=64)
+
+
+class RawChatInput(Sampling):
+    """Raw gateway request: retain OpenAI content parts instead of normalizing them."""
+
+    n: int = Field(default=1, ge=1, le=8)
+    logprobs: bool = False
+    top_logprobs: int | None = Field(default=None, ge=0, le=20)
+
+    @model_validator(mode="before")
+    @classmethod
+    def completion_tokens(cls, value: Any) -> Any:
+        # max_completion_tokens is the current OpenAI name of max_tokens.
+        if isinstance(value, dict) and "max_completion_tokens" in value:
+            value = dict(value)
+            maximum = value.pop("max_completion_tokens")
+            if "max_tokens" in value and value["max_tokens"] != maximum:
+                raise ValueError("conflicting_maximum")
+            value["max_tokens"] = maximum
+        return value
+
+    model: str = Field(pattern=r"^raw/.+$")
+    messages: list[RawMessage] = Field(min_length=1, max_length=4096)
+    tools: list[Tool] = Field(default_factory=list, max_length=MAX_TOOLS)
+    response_format: ResponseFormat = Field(
+        default_factory=lambda: ResponseFormat(type="text")
+    )
+    max_tokens: int = Field(default=4096, ge=1, le=32768)
+    temperature: float = Field(default=0, ge=0, le=2)
+    stream: bool = False
+    stream_options: StreamOptions = StreamOptions()
+    tool_choice: str | dict[str, Any] = "auto"
+    parallel_tool_calls: bool = True
+    reasoning_effort: Literal["none", "low", "medium", "high"] = "none"
+
+    @property
+    def validate_output(self) -> bool:
+        # Public routed models validate like the developer route: a requested
+        # JSON format (or tool_choice="none") is checked against the schema.
+        return self.response_format.type != "text" or self.tool_choice == "none"
+
+
+class Choice:
+    """One answer of a completion; n > 1 asks the provider for several."""
+
+    def __init__(self) -> None:
+        self.text = ""
+        self.calls: dict[int, dict[str, Any]] = {}
+        # Provider index -> Atlas index, for providers that reuse index 0.
+        self.call_slots: dict[int, int] = {}
+        self.reason: str | None = None
+        # The requested stop sequence that ended the text, when the provider says
+        # which (vLLM's stop_reason; some providers do not report it).
+        self.stop_sequence: str | None = None
+        # The model's reasoning text when the provider returns it (Responses reasoning).
+        self.reasoning = ""
+        self.logprobs: list[Any] = []
+        self.thinking_closed = False
+
+
+def answer_tokens(st: "Choice", tokens: list[Any]) -> list[Any]:
+    """Log probabilities of the visible answer only, as the OpenAI API returns them.
+
+    Some routed models also return their reasoning tokens up to a closing think tag, and
+    control tokens such as <|user|>; neither is part of the answer text.
+    """
+    kept: list[Any] = []
+    for token in tokens:
+        text = str(token.get("token", "")) if isinstance(token, dict) else ""
+        if "</think>" in text:
+            # Everything before the end of reasoning was not answer text.
+            st.logprobs.clear()
+            kept.clear()
+            st.thinking_closed = True
+            continue
+        if text.startswith("<|") and text.endswith("|>"):
+            continue
+        kept.append(token)
+    return kept
+
+
+def url_citations(text: str, sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """OpenAI url_citation annotations for the retrieved urls that the answer quotes."""
+    found: list[dict[str, Any]] = []
+    for source in sources:
+        url = str(source.get("url", ""))
+        start = text.find(url) if url else -1
+        if start >= 0 and all(a["url_citation"]["url"] != url for a in found):
+            found.append(
+                {
+                    "type": "url_citation",
+                    "url_citation": {
+                        "url": url,
+                        "title": str(source.get("title", "")),
+                        "start_index": start,
+                        "end_index": start + len(url),
+                    },
+                }
+            )
+    return sorted(found, key=lambda a: a["url_citation"]["start_index"])
+
+
+class Output:
+    def __init__(
+        self,
+        request_id: str,
+        request: Request | RawChatInput,
+        model: str = "atlas-code",
+    ) -> None:
+        self.base = {
+            "id": "chatcmpl-" + request_id,
+            "model": model,
+            "created": int(time.time()),
+        }
+        self.request = request
+        self.choices: dict[int, Choice] = {0: Choice()}
+        # Results of hosted searches, cited when the answer quotes their url.
+        self.citations: list[dict[str, Any]] = []
+        self.usage: dict[str, Any] | None = None
+        self.served_by: str | None = None
+        self.privacy: str | None = None
+        # The model the caller asked for, the fallback that replaced it (C15) and
+        # the charge of the call in micro-euros: reported, never silent.
+        self.requested_model = model
+        self.substitution: dict[str, Any] | None = None
+        self.cost_micro_eur: int | None = None
+
+    def substitute(self, substitution: dict[str, Any]) -> None:
+        """Another target answers: ``model`` names it from the first chunk on."""
+        self.substitution = {
+            key: substitution[key]
+            for key in ("from", "reason", "provider_status")
+            if substitution.get(key) is not None
+        }
+        if substitution.get("served"):
+            self.base["model"] = str(substitution["served"])
+
+    def atlas(self) -> dict[str, Any] | None:
+        """Requested and served model, substitution and cost; None before an answer."""
+        if not self.served_by:
+            return None
+        return {
+            "requested_model": self.requested_model,
+            "served_model": self.served_by,
+            "substitution": self.substitution,
+            "cost_micro_eur": self.cost_micro_eur,
+        }
+
+    def headers(self) -> dict[str, str]:
+        """Response headers of a non-streamed answer (C15)."""
+        values = {"X-Atlas-Requested-Model": self.requested_model}
+        if self.served_by:
+            values["X-Atlas-Served-By"] = self.served_by
+        if self.substitution:
+            values["X-Atlas-Substitution"] = "; ".join(
+                f"{key}={self.substitution[key]}"
+                for key in ("reason", "from", "provider_status")
+                if key in self.substitution
+            )
+        if self.cost_micro_eur is not None:
+            values["X-Atlas-Cost-Micro-EUR"] = str(self.cost_micro_eur)
+        return values
+
+    # The first choice keeps the single-answer interface used by every route.
+    @property
+    def text(self) -> str:
+        return self.choices[0].text
+
+    @text.setter
+    def text(self, value: str) -> None:
+        self.choices[0].text = value
+
+    @property
+    def calls(self) -> dict[int, dict[str, Any]]:
+        return self.choices[0].calls
+
+    @calls.setter
+    def calls(self, value: dict[int, dict[str, Any]]) -> None:
+        self.choices[0].calls = value
+
+    @property
+    def reason(self) -> str | None:
+        return self.choices[0].reason
+
+    @reason.setter
+    def reason(self, value: str | None) -> None:
+        self.choices[0].reason = value
+
+    @property
+    def stop_sequence(self) -> str | None:
+        return self.choices[0].stop_sequence
+
+    def wanted(self) -> int:
+        return getattr(self.request, "n", 1)
+
+    def feed(self, frame: dict[str, Any]) -> dict[str, Any]:
+        if frame.get("substitution") and self.substitution is None:
+            self.substitute(frame["substitution"])
+        chunk: dict[str, Any] = dict(
+            self.base, object="chat.completion.chunk", choices=[]
+        )
+        if "usage" in frame:
+            self.usage = frame["usage"]
+            assert self.usage is not None
+            self.usage["total_tokens"] = (
+                self.usage["prompt_tokens"] + self.usage["completion_tokens"]
+            )
+            chunk["usage"] = self.usage
+            if isinstance(frame.get("cost_micro_eur"), int):
+                self.cost_micro_eur = frame["cost_micro_eur"]
+            if frame.get("served_by"):
+                self.served_by = str(frame["served_by"])
+                chunk["served_by"] = self.served_by
+            if frame.get("privacy"):
+                self.privacy = str(frame["privacy"])
+                chunk["privacy"] = self.privacy
+        for choice in frame["choices"]:
+            position = choice.get("index", 0)
+            if type(position) is not int or not 0 <= position < self.wanted():
+                raise ValueError("invalid_choice_index")
+            st = self.choices.setdefault(position, Choice())
+            delta = choice["delta"]
+            clean: dict[str, Any] = {}
+            if "role" in delta:
+                if delta["role"] != "assistant":
+                    raise ValueError("invalid_role")
+                clean["role"] = "assistant"
+            content = delta.get("content")
+            if content is not None:
+                if not isinstance(content, str):
+                    raise ValueError("invalid_content")
+                st.text += content
+                clean["content"] = content
+            reasoning = delta.get("reasoning_content")
+            if reasoning:
+                if not isinstance(reasoning, str):
+                    raise ValueError("invalid_reasoning")
+                st.reasoning += reasoning
+                if len(st.reasoning) > 262144:
+                    raise LimitError(
+                        "content_limit", len(st.reasoning), 262144, "characters"
+                    )
+                clean["reasoning_content"] = reasoning
+            changes = []
+            for call in delta.get("tool_calls") or []:
+                index = call["index"]
+                if type(index) is not int or not 0 <= index < 64:
+                    raise ValueError("invalid_call_index")
+                # Some providers stream every complete call at index 0 with a new
+                # id: a new id on a slot already holding another call opens a call.
+                slot = st.call_slots.get(index, index)
+                new_id = call.get("id")
+                if (
+                    isinstance(new_id, str)
+                    and new_id
+                    and slot in st.calls
+                    and st.calls[slot]["id"]
+                    and new_id != st.calls[slot]["id"]
+                ):
+                    slot = len(st.calls)
+                st.call_slots[index] = slot
+                index = slot
+                if index > len(st.calls) or index >= 64:
+                    raise ValueError("invalid_call_index")
+                target = st.calls.setdefault(
+                    index,
+                    {
+                        "id": "",
+                        "type": "function",
+                        "function": {"name": "", "arguments": ""},
+                    },
+                )
+                update: dict[str, Any] = {
+                    "index": index,
+                    "type": "function",
+                    "function": {},
+                }
+                for source, destination, field in (
+                    (call, target, "id"),
+                    (call["function"], target["function"], "name"),
+                ):
+                    value = source.get(field)
+                    # Continuation chunks may repeat the id or name as "": no change.
+                    if value is not None and value != "":
+                        if (
+                            not isinstance(value, str)
+                            or len(value) > 200
+                            or (destination[field] and value != destination[field])
+                        ):
+                            raise ValueError("unstable_call_identity")
+                        destination[field] = value
+                        (update if field == "id" else update["function"])[field] = value
+                arguments = call["function"].get("arguments", "")
+                if not isinstance(arguments, str):
+                    raise ValueError("invalid_arguments")
+                target["function"]["arguments"] += arguments
+                update["function"]["arguments"] = arguments
+                if len(target["function"]["arguments"]) > 65536:
+                    raise LimitError(
+                        "arguments_limit",
+                        len(target["function"]["arguments"]),
+                        65536,
+                        "characters",
+                    )
+                changes.append(update)
+            if changes:
+                clean["tool_calls"] = changes
+            if len(st.text) > 131072:
+                raise LimitError("content_limit", len(st.text), 131072, "characters")
+            reason = choice["finish_reason"]
+            if reason is not None:
+                st.reason = "tool_calls" if st.calls and reason == "stop" else reason
+                matched = choice.get("stop_reason")
+                requested = getattr(self.request, "stop", None)
+                stops = [requested] if isinstance(requested, str) else requested or []
+                if (
+                    st.reason == "stop"
+                    and isinstance(matched, str)
+                    and matched in stops
+                ):
+                    st.stop_sequence = matched
+                ids = [c["id"] for c in st.calls.values()]
+                if len(set(ids)) != len(ids) or any(not i for i in ids):
+                    raise ValueError("invalid_call_id")
+                if reason != "length":
+                    choice_mode = self.request.tool_choice
+                    if (
+                        (choice_mode == "none" and st.calls)
+                        or (choice_mode == "required" and not st.calls)
+                        or (not self.request.parallel_tool_calls and len(st.calls) > 1)
+                    ):
+                        raise ValueError("tool_choice_violated")
+                    if isinstance(choice_mode, dict) and (
+                        not st.calls
+                        or any(
+                            c["function"]["name"] != choice_mode["function"]["name"]
+                            for c in st.calls.values()
+                        )
+                    ):
+                        raise ValueError("tool_choice_violated")
+                    if bool(st.calls) != (st.reason == "tool_calls"):
+                        raise ValueError("inconsistent_finish")
+                    declared = {t.function.name for t in self.request.tools}
+                    for c in st.calls.values():
+                        if not isinstance(json.loads(c["function"]["arguments"]), dict):
+                            raise ValueError("invalid_tool_call")
+                        if c["function"]["name"] not in declared:
+                            # Like the OpenAI API, pass a call to an undeclared tool through:
+                            # the client answers that the tool is unknown and the model
+                            # corrects itself. Rejecting the whole answer stopped agent
+                            # sessions (incident 2026-11-09, model calling apply_patch).
+                            logging.getLogger(__name__).warning(
+                                "devapi_undeclared_tool_call name=%s declared=%s",
+                                c["function"]["name"][:64],
+                                ",".join(sorted(declared))[:256],
+                            )
+                        json.dumps(
+                            json.loads(c["function"]["arguments"]), allow_nan=False
+                        )
+            entry: dict[str, Any] = {
+                "index": position,
+                "delta": clean,
+                "finish_reason": st.reason,
+            }
+            if getattr(self.request, "logprobs", False):
+                content_logprobs = answer_tokens(
+                    st, (choice.get("logprobs") or {}).get("content") or []
+                )
+                st.logprobs.extend(content_logprobs)
+                entry["logprobs"] = {"content": content_logprobs}
+            chunk["choices"].append(entry)
+        return chunk
+
+    def validation_error(self) -> str | None:
+        fmt = self.request.response_format
+        for st in self.choices.values():
+            if st.reason == "length":
+                # Cut by the caller's max_tokens: returned as written, with its
+                # finish_reason. A corrected attempt would be cut the same way.
+                continue
+            if fmt.type != "text":
+                problem = validate_json(
+                    st.text, fmt.json_schema.schema_ if fmt.json_schema else None
+                )
+                if problem is not None:
+                    return problem
+            elif self.request.tool_choice == "none" and not st.text.strip():
+                return "empty_text"
+        return None
+
+    def result(self) -> dict[str, Any]:
+        if (
+            any(st.reason is None for st in self.choices.values())
+            or len(self.choices) != self.wanted()
+            or self.usage is None
+        ):
+            raise ValueError("incomplete_response")
+        choices = []
+        for position in sorted(self.choices):
+            st = self.choices[position]
+            message: dict[str, Any] = {"role": "assistant", "content": st.text or None}
+            annotations = url_citations(st.text, self.citations)
+            if annotations:
+                message["annotations"] = annotations
+            if st.calls:
+                message["tool_calls"] = list(st.calls.values())
+            entry: dict[str, Any] = {
+                "index": position,
+                "message": message,
+                "finish_reason": st.reason,
+            }
+            if getattr(self.request, "logprobs", False):
+                entry["logprobs"] = {"content": st.logprobs}
+            choices.append(entry)
+        result = dict(
+            self.base,
+            object="chat.completion",
+            usage=self.usage,
+            choices=choices,
+        )
+        if self.served_by:
+            result["served_by"] = self.served_by
+        if self.privacy:
+            result["privacy"] = self.privacy
+        if (atlas := self.atlas()) is not None:
+            result["atlas"] = atlas
+        return result

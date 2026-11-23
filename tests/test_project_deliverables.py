@@ -1,0 +1,2314 @@
+"""REQ-PROJ-05: real formats, private publication, durable bytes and derived previews."""
+
+from __future__ import annotations
+
+import asyncio
+import copy
+import hashlib
+import io
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+import tempfile
+import time
+import unittest
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock, patch
+from uuid import uuid4
+
+import psycopg
+from psycopg.types.json import Jsonb
+
+from packages.doc_render import render, verify
+from packages.doc_render.schema import Content, Section
+from services.retrieval import deliverable_render
+from services.retrieval.project_files import ProjectFiles, reopen_artifact
+from services.retrieval.project_identity import sign
+from services.retrieval.project_scoped_api import store
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from test_project_work import ProjectWorkTests
+import test_project_auth as auth
+import own_tests
+
+
+RENDER_TOOLS = deliverable_render.tools
+
+
+class ProjectDeliverableTests(ProjectWorkTests):
+    retrieval_url: str
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        from services.retrieval.api import app
+
+        cls.retrieval_url = getattr(auth.ProjectAuthTests.serve, "__func__")(cls, app)
+
+    def setUp(self) -> None:
+        super().setUp()
+        # These tests check the verified text preview; the server's rendered
+        # gallery has its own test (test_preview_is_a_server_rendering).
+        renderer = patch.object(deliverable_render, "tools", return_value=None)
+        renderer.start()
+        self.addCleanup(renderer.stop)
+
+    def publication_setup(self) -> None:
+        # Match ProjectFilesTests' real-document fixture. Quota-refusal tests
+        # retain the isolation fixture's deliberately tiny upload ceiling.
+        for name in (
+            "upload_bytes",
+            "stored_bytes",
+            "versioned_bytes",
+            "derived_bytes",
+        ):
+            self.policy["quotas"][name] = 16777216
+        with psycopg.connect(self.admin_dsn) as db:
+            db.execute(
+                "UPDATE atlas_projects.installation SET ceilings=%s",
+                (Jsonb(self.policy),),
+            )
+            db.execute(
+                "UPDATE atlas_projects.organizations SET policy=%s WHERE org_id=%s",
+                (Jsonb(self.policy), self.org),
+            )
+
+    def selected_sources(self, conversation: str | None = None) -> list[dict[str, str]]:
+        with store(self.app_dsn).scope(
+            self.identity("editor"), self.org, self.project
+        ) as scope:
+            files = ProjectFiles(scope)
+            folder = files.folder(
+                dict(name="Inputs", locality="server", model_use="allow")
+            )
+            sources = [
+                files.create_file(
+                    folder["id"], "first.txt", b"First source evidence", 0
+                ),
+                files.create_file(
+                    folder["id"], "second.txt", b"Second source evidence", 1
+                ),
+            ]
+        response = self.request(
+            "POST",
+            self.project_path() + "/work-sessions",
+            "editor",
+            dict(
+                conversation_id=conversation or self.conversation,
+                folder_ids=[folder["id"]],
+                base_versions=[
+                    dict(file_id=f["id"], version_id=f["version_id"]) for f in sources
+                ],
+            ),
+        )
+        self.assertEqual(response.status_code, 201, response.text)
+        self.session = response.json()
+        return [dict(file_id=f["id"], version=f["version_id"]) for f in sources]
+
+    def test_a_deck_from_a_project_file_publishes(self) -> None:
+        """Staging -142 (2026-11-21): "from notes/projet.txt, make a 5-slide
+        deck" failed twice at publication and the turn ran out of steps. A
+        deck summarises its source and never holds the whole text, and the
+        excerpts of a declared source were only appended to Markdown input:
+        the deck failed the source coverage check. The excerpts now go in the
+        speaker notes of the last slide: never a slide of their own, which
+        made a deck asked with five slides one slide longer (staging -151)."""
+        from pptx import Presentation
+
+        from services.orchestrator.code_api import ExecutionBroker
+        from services.orchestrator.code_mode import WorkExecution
+        from services.orchestrator.code_tools import WorkTools
+        from services.orchestrator.code_worker import perform
+        from services.orchestrator.loop import Call
+
+        self.publication_setup()
+        sources = self.selected_sources()
+        acquired = self.acquire()
+        self.assertEqual(acquired.status_code, 200)
+        execution = WorkExecution(
+            ExecutionBroker("editor", self.org, self.project),
+            acquired.json()["session"],
+            self.turn_id,
+        )
+        args = dict(
+            path="plan.pptx",
+            title="Evidence review",
+            slides=[
+                dict(title="Evidence review", bullets=["Two notes back the plan"]),
+                dict(
+                    title="What the notes say",
+                    bullets=["The first note and the second agree", "Both are recent"],
+                ),
+                dict(title="Next step", bullets=["Present the plan on Monday"]),
+            ],
+            sources=sources,
+        )
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.dict(
+                os.environ,
+                {
+                    "ATLAS_RETRIEVAL_URL": self.retrieval_url,
+                    "ATLAS_PROJECT_IDENTITY_SECRET": os.urandom(32).hex(),
+                },
+            ),
+        ):
+            workspace = MagicMock()
+            workspace.invoke = AsyncMock(
+                side_effect=lambda name, data, timeout: perform(
+                    Path(directory), name, data
+                )
+            )
+            tools = WorkTools(workspace, execution)
+            reply = asyncio.run(
+                tools.execute(
+                    Call(str(uuid4()), "publish_document", json.dumps(args)), 60
+                )
+            )
+        self.assertNotIn("error", reply, reply)
+        receipt = reply["deliverable"]
+        assert isinstance(receipt, dict)
+        self.assertEqual(receipt["source_version_ids"], [s["version"] for s in sources])
+        downloaded = self.request("GET", receipt["download_route"], "viewer")
+        self.assertEqual(downloaded.status_code, 200)
+        deck = Presentation(io.BytesIO(downloaded.content))
+        # The person's slides only, the excerpts in the speaker notes of the
+        # last one.
+        self.assertEqual(len(deck.slides), 3)
+        self.assertEqual(reply["length"], dict(slides=3))
+        notes = deck.slides[2].notes_slide.notes_text_frame.text
+        self.assertIn("First source evidence", notes)
+        self.assertIn("Second source evidence", notes)
+
+    def test_work_dispatch_publishes_all_formats_with_source_bound_receipts(
+        self,
+    ) -> None:
+        from services.orchestrator.code_api import ExecutionBroker
+        from services.orchestrator.code_mode import WorkExecution
+        from services.orchestrator.code_tools import WorkTools, declarations
+        from services.orchestrator.code_worker import perform
+        from services.orchestrator.loop import Call
+
+        self.publication_setup()
+        sources = self.selected_sources()
+        acquired = self.acquire()
+        self.assertEqual(acquired.status_code, 200)
+        execution = WorkExecution(
+            ExecutionBroker("editor", self.org, self.project),
+            acquired.json()["session"],
+            self.turn_id,
+        )
+        args = dict(
+            path="findings.docx",
+            content=dict(
+                title="Findings",
+                sections=[
+                    dict(
+                        heading="Evidence",
+                        paragraphs=["First source evidence", "Second source evidence"],
+                    )
+                ],
+            ),
+            sources=sources,
+        )
+        self.assertIn("publish_document", str(declarations(scoped=True)))
+        self.assertNotIn("publish_document", str(declarations()))
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.dict(
+                os.environ,
+                {
+                    "ATLAS_RETRIEVAL_URL": self.retrieval_url,
+                    "ATLAS_PROJECT_IDENTITY_SECRET": os.urandom(32).hex(),
+                },
+            ),
+        ):
+            workspace = MagicMock()
+            workspace.invoke = AsyncMock(
+                side_effect=lambda name, data, timeout: perform(
+                    Path(directory), name, data
+                )
+            )
+            tools = WorkTools(workspace, execution)
+
+            async def run() -> None:
+                for suffix in (".docx", ".xlsx", ".pptx", ".pdf"):
+                    reply = await tools.execute(
+                        Call(
+                            str(uuid4()),
+                            "publish_document",
+                            json.dumps(dict(args, path="findings" + suffix)),
+                        ),
+                        60,
+                    )
+                    self.assertNotIn("error", reply, reply)
+                    receipt = reply["deliverable"]
+                    assert isinstance(receipt, dict)
+                    assert isinstance(reply["text"], str)
+                    self.assertEqual(
+                        receipt["source_version_ids"], [s["version"] for s in sources]
+                    )
+                    self.assertEqual(receipt["turn_id"], self.turn_id)
+                    self.assertEqual(receipt["session_id"], self.session["id"])
+                    self.assertIn(receipt["download_route"], reply["text"])
+                    self.assertIn("/preview", reply["text"])
+                for bad in (
+                    dict(
+                        args,
+                        path="missing.pdf",
+                        content=dict(
+                            title="Unrelated",
+                            sections=[
+                                dict(
+                                    heading="No evidence", paragraphs=["Unrelated text"]
+                                )
+                            ],
+                        ),
+                    ),
+                    dict(args, path="forged.pdf", validation=dict(status="passed")),
+                    dict(
+                        args,
+                        path="foreign.pdf",
+                        sources=[
+                            dict(file_id=str(uuid4()), version=sources[0]["version"])
+                        ],
+                    ),
+                    dict(args, path="../escape.pdf"),
+                ):
+                    refused = await tools.execute(
+                        Call(str(uuid4()), "publish_document", json.dumps(bad)), 60
+                    )
+                    self.assertIn("error", refused)
+                self.assertEqual(len(tools.deliverables), 4)
+
+            asyncio.run(run())
+        # Temporary reader workspace has expired; all canonical bytes remain readable.
+        for receipt in tools.deliverables:
+            raw = self.request("GET", receipt["download_route"], "viewer").content
+            self.assertEqual(hashlib.sha256(raw).hexdigest(), receipt["sha256"])
+            preview = self.request(
+                "GET",
+                receipt["download_route"].removesuffix("download") + "preview",
+                "viewer",
+            )
+            self.assertEqual(preview.status_code, 200)
+            self.assertIn(b"First source evidence", preview.content)
+            self.assertIn(b"Second source evidence", preview.content)
+        listing = self.request(
+            "GET", self.project_path() + "/deliverables", "viewer"
+        ).json()["items"]
+        self.assertEqual(len(listing), 4)
+
+    def test_deleting_conversation_preserves_published_deliverable(self) -> None:
+        from services.orchestrator.code_api import ExecutionBroker
+        from services.orchestrator.code_mode import WorkExecution
+        from services.orchestrator.code_tools import WorkTools
+        from services.orchestrator.code_worker import perform
+        from services.orchestrator.loop import Call
+
+        self.publication_setup()
+        authored = self.request(
+            "POST",
+            self.project_path() + "/conversations",
+            "editor",
+            {"title": "Fictional deliverable conversation"},
+        )
+        self.assertEqual(authored.status_code, 201, authored.text)
+        sources = self.selected_sources(authored.json()["id"])
+        acquired = self.acquire()
+        self.assertEqual(acquired.status_code, 200)
+        execution = WorkExecution(
+            ExecutionBroker("editor", self.org, self.project),
+            acquired.json()["session"],
+            self.turn_id,
+        )
+        args = dict(
+            path="fictional-findings.docx",
+            content=dict(
+                title="Fictional findings",
+                sections=[
+                    dict(
+                        heading="Evidence",
+                        paragraphs=["First source evidence", "Second source evidence"],
+                    )
+                ],
+            ),
+            sources=sources,
+        )
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.dict(
+                os.environ,
+                {
+                    "ATLAS_RETRIEVAL_URL": self.retrieval_url,
+                    "ATLAS_PROJECT_IDENTITY_SECRET": os.urandom(32).hex(),
+                },
+            ),
+        ):
+            workspace = MagicMock()
+            workspace.invoke = AsyncMock(
+                side_effect=lambda name, data, timeout: perform(
+                    Path(directory), name, data
+                )
+            )
+            tools = WorkTools(workspace, execution)
+            reply = asyncio.run(
+                tools.execute(
+                    Call(
+                        str(uuid4()),
+                        "publish_document",
+                        json.dumps(args),
+                    ),
+                    60,
+                )
+            )
+        self.assertNotIn("error", reply, reply)
+        receipt = reply["deliverable"]
+        assert isinstance(receipt, dict)
+        deleted = self.request(
+            "DELETE",
+            self.project_path() + "/conversations/" + authored.json()["id"],
+            "editor",
+            match=0,
+        )
+        self.assertEqual(deleted.status_code, 204, deleted.text)
+        self.assertEqual(
+            self.request("GET", receipt["download_route"], "viewer").status_code,
+            200,
+        )
+        listing = self.request(
+            "GET", self.project_path() + "/deliverables", "viewer"
+        ).json()["items"]
+        self.assertIn(receipt["id"], [item["id"] for item in listing])
+
+    def test_work_lifecycle_keeps_verified_links_after_real_worker_cleanup(
+        self,
+    ) -> None:
+        from decimal import Decimal
+        from services.orchestrator.terminal_stack import IMAGE
+        from services.orchestrator.chat_schema import ChatRequest
+        from services.orchestrator.code_mode import CodeModel, process_work
+        from services.orchestrator.code_workspace import volume
+        from services.orchestrator.interactions import Interaction
+        from services.orchestrator.loop import Call, CodeResult
+
+        try:
+            available = (
+                subprocess.run(
+                    ["docker", "image", "inspect", IMAGE],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=15,
+                ).returncode
+                == 0
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            available = False
+        if not available:
+            self.skipTest(
+                "real document worker image unavailable; no image pull in task J"
+            )
+        self.publication_setup()
+        sources = self.selected_sources()
+        self.policy["quotas"]["temporary_bytes"] = 16777216
+        self.policy["quotas"]["per_turn"]["expanded_bytes"] = 1048576
+        with psycopg.connect(self.admin_dsn) as db:
+            db.execute(
+                "UPDATE atlas_projects.installation SET ceilings=%s",
+                (Jsonb(self.policy),),
+            )
+            db.execute(
+                "UPDATE atlas_projects.organizations SET policy=%s WHERE org_id=%s",
+                (Jsonb(self.policy), self.org),
+            )
+        with store(self.app_dsn).scope(
+            self.identity("editor"), self.org, self.project
+        ) as scope:
+            files = ProjectFiles(scope)
+            session = files.get("work_session", self.session["id"])
+            session["effective_limits"] = self.policy["quotas"]["per_turn"]
+            files.save(session)
+        request = ChatRequest.model_validate(
+            dict(
+                messages=[
+                    dict(role="user", content="Create a report from both sources")
+                ],
+                project_id=self.project,
+                conversation_id=self.conversation,
+            )
+        )
+        item = Interaction()
+        model = MagicMock(spec=CodeModel)
+        model.spent, model.input_tokens, model.output_tokens, model.work_unknown = (
+            Decimal(0),
+            0,
+            0,
+            False,
+        )
+        receipts: list[dict[str, Any]] = []
+
+        async def turn(*args: Any) -> CodeResult:
+            tools = args[2]
+            # The turn carries the request to the checks made on publication.
+            self.assertEqual(tools.request_text, "Create a report from both sources")
+            self.assertEqual(tools.calculation_refusals, set())
+            reply = await tools.execute(
+                Call(
+                    str(uuid4()),
+                    "publish_document",
+                    json.dumps(
+                        dict(
+                            path="report.pdf",
+                            content=dict(
+                                title="Findings",
+                                sections=[
+                                    dict(
+                                        heading="Evidence",
+                                        paragraphs=[
+                                            "First source evidence",
+                                            "Second source evidence",
+                                        ],
+                                    )
+                                ],
+                            ),
+                            sources=sources,
+                        )
+                    ),
+                ),
+                60,
+            )
+            self.assertNotIn("error", reply, reply)
+            receipts.append(reply["deliverable"])
+            # The recap must preserve receipts even when the model omits every link.
+            return CodeResult(
+                text="The report contains both sources.",
+                state="done",
+                tool_calls=1,
+                model_calls=0,
+            )
+
+        self.addCleanup(
+            subprocess.run, ["docker", "volume", "rm", volume()], capture_output=True
+        )
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "ATLAS_PROJECT_MODE": "1",
+                    "ATLAS_RETRIEVAL_URL": self.retrieval_url,
+                    "ATLAS_PROJECT_IDENTITY_SECRET": os.urandom(32).hex(),
+                },
+            ),
+            patch.object(CodeModel, "connect", AsyncMock(return_value=model)),
+            patch("services.orchestrator.code_mode.execute_turn", side_effect=turn),
+        ):
+            asyncio.run(
+                process_work(
+                    request,
+                    item,
+                    subject="editor",
+                    org_id=self.org,
+                    project_id=self.project,
+                    session_id=self.session["id"],
+                )
+            )
+        self.assertEqual(item.state, "done")
+        self.assertEqual(len(receipts), 1)
+        receipt = receipts[0]
+        self.assertIn(receipt["download_route"], item.reponse)
+        self.assertIn("/preview", item.reponse)
+        session = self.request(
+            "GET",
+            self.project_path() + "/work-sessions/" + self.session["id"],
+            "editor",
+        ).json()
+        self.assertIsNone(session["lease"])
+        self.assertEqual(session["state"], "completed")
+        self.assertEqual(session["usage"]["tool_calls"], 1)
+        downloaded = self.request("GET", receipt["download_route"], "viewer")
+        self.assertEqual(downloaded.status_code, 200)
+        self.assertEqual(
+            hashlib.sha256(downloaded.content).hexdigest(), receipt["sha256"]
+        )
+        self.assertIn(
+            b"Second source evidence", reopen_artifact(downloaded.content, ".pdf")
+        )
+
+    def artifact(self, suffix: str) -> tuple[bytes, bytes]:
+        content = Content(
+            title="Project findings",
+            sections=(
+                Section(
+                    heading="Evidence", paragraphs=("Expected project content 42",)
+                ),
+            ),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / ("report" + suffix)
+            render(content, path, image_root=Path(directory))
+            verified = verify(path, expected=content)
+            self.assertIn("Expected project content 42", "\n".join(verified.text))
+            raw = path.read_bytes()
+        return raw, reopen_artifact(raw, suffix)
+
+    def metadata(
+        self, raw: bytes, suffix: str = ".docx", revision: int = 0
+    ) -> dict[str, Any]:
+        return dict(
+            self.fence(),
+            turn_id=self.turn_id,
+            path="report" + suffix,
+            expected_parent_revision=revision,
+            source_version_ids=[],
+            strategy="created",
+            validation=dict(
+                status="passed",
+                checks=["package_readable", "requested_content", "source_coverage"],
+                warnings=[],
+                verifier_exit=0,
+                artifact_sha256=hashlib.sha256(raw).hexdigest(),
+            ),
+        )
+
+    def publish(
+        self,
+        metadata: dict[str, Any],
+        raw: bytes,
+        preview: bytes | None = None,
+        *,
+        key: str | None = None,
+        role: str = "editor",
+        extra: dict[str, Any] | None = None,
+    ) -> Any:
+        parts: dict[str, Any] = dict(
+            metadata=(None, json.dumps(metadata), "application/json"),
+            file=("artifact", raw, "application/octet-stream"),
+        )
+        if preview is not None:
+            parts["preview"] = ("preview", preview, "text/plain")
+        parts.update(extra or {})
+        return self.client.post(
+            "/internal/atlas/execution/publish",
+            files=parts,
+            headers={
+                "X-Atlas-Execution-Secret": os.environ[
+                    "ATLAS_PROJECT_EXECUTION_SECRET"
+                ],
+                "X-Atlas-Execution-Audience": "atlas-retrieval-execution",
+                "X-Atlas-Project-Identity": sign(
+                    self.identity(role, self.project), self.key.encode()
+                ),
+                "Idempotency-Key": key or str(uuid4()),
+            },
+        )
+
+    @unittest.skipUnless(
+        RENDER_TOOLS() is not None and deliverable_render.isolation() is not None,
+        "LibreOffice, poppler or network isolation absent",
+    )
+    def test_preview_is_a_server_rendering_of_the_verified_file(self) -> None:
+        self.publication_setup()
+        self.assertEqual(self.acquire().status_code, 200)
+        with patch.object(deliverable_render, "tools", RENDER_TOOLS):
+            for revision, suffix in enumerate((".docx", ".pptx")):
+                with self.subTest(format=suffix):
+                    raw, preview = self.artifact(suffix)
+                    reply = self.publish(
+                        self.metadata(raw, suffix, revision), raw, preview
+                    )
+                    self.assertEqual(reply.status_code, 201, reply.text)
+                    value = reply.json()
+                    route = value["download_route"].removesuffix("download")
+                    shown = self.request("GET", route + "preview", "viewer")
+                    self.assertEqual(shown.status_code, 200)
+                    self.assertTrue(
+                        shown.headers["content-type"].startswith("text/html")
+                    )
+                    self.assertEqual(
+                        shown.headers["content-security-policy"],
+                        deliverable_render.GALLERY_CSP,
+                    )
+                    self.assertEqual(shown.headers["x-content-type-options"], "nosniff")
+                    self.assertIn(b'<img src="data:image/jpeg;base64,', shown.content)
+                    self.assertNotIn(b"<script", shown.content)
+                    self.assertIn(value["download_route"].encode(), shown.content)
+                    # Stored once, beside the deliverable, never as the
+                    # version's extraction record.
+                    with store(self.app_dsn).scope(
+                        self.identity("viewer", self.project),
+                        self.org,
+                        self.project,
+                    ) as scope:
+                        files = ProjectFiles(scope)
+                        row = files.row(
+                            "derived", deliverable_render.render_id(value["id"])
+                        )
+                        self.assertEqual(str(row["parent_id"]), value["id"])
+                        self.assertEqual(
+                            row["data"]["source_version_id"], value["file_version_id"]
+                        )
+                    again = self.request("GET", route + "preview", "viewer")
+                    self.assertEqual(again.content, shown.content)
+
+    def test_four_formats_durable_download_preview_hash_and_idempotency(self) -> None:
+        self.publication_setup()
+        self.assertEqual(self.acquire().status_code, 200)
+        for revision, suffix in enumerate((".docx", ".xlsx", ".pptx", ".pdf")):
+            with self.subTest(format=suffix):
+                raw, preview = self.artifact(suffix)
+                data, key = self.metadata(raw, suffix, revision), str(uuid4())
+                reply = self.publish(data, raw, preview, key=key)
+                self.assertEqual(reply.status_code, 201, reply.text)
+                value = reply.json()
+                self.validator.validate(
+                    value, self.contract["components"]["schemas"]["Deliverable"]
+                )
+                self.assertEqual(value["sha256"], hashlib.sha256(raw).hexdigest())
+                self.assertEqual(
+                    value["validation"]["artifact_sha256"], value["sha256"]
+                )
+                replay = self.publish(data, raw, preview, key=key)
+                self.assertEqual(replay.status_code, 201, replay.text)
+                self.assertEqual(replay.json(), value)
+                self.error(
+                    self.publish(
+                        dict(data, path="different" + suffix), raw, preview, key=key
+                    ),
+                    409,
+                    "idempotency_conflict",
+                )
+                # Builder scratch was destroyed before publication. No delivery cache exists.
+                download = self.request("GET", value["download_route"], "viewer")
+                self.assertEqual(
+                    download.status_code,
+                    200,
+                    download.text[:100] if suffix == ".pdf" else "",
+                )
+                self.assertEqual(download.content, raw)
+                derived = self.request(
+                    "GET",
+                    value["download_route"].removesuffix("download") + "preview",
+                    "viewer",
+                )
+                self.assertEqual(derived.status_code, 200)
+                self.assertEqual(derived.content, preview)
+                self.assertIn(b"Expected project content 42", derived.content)
+                self.assertEqual(derived.headers["x-content-type-options"], "nosniff")
+        ledger = self.request("GET", self.project_path() + "/ledger", "viewer").json()[
+            "items"
+        ]
+        self.assertEqual(sum(e["kind"] == "deliverable_created" for e in ledger), 4)
+        for event in ledger:
+            if event["kind"] == "deliverable_created":
+                self.assertEqual(event["request_id"], self.turn_id)
+                self.assertEqual(event["session_id"], self.session["id"])
+                self.assertEqual(event["conversation_id"], self.conversation)
+
+    def test_publication_refuses_missing_failed_or_forged_verification(self) -> None:
+        self.publication_setup()
+        self.assertEqual(self.acquire().status_code, 200)
+        raw, preview = self.artifact(".docx")
+        valid = self.metadata(raw)
+        invalid = [
+            dict(valid, validation=dict(valid["validation"], status="failed")),
+            dict(valid, validation=dict(valid["validation"], verifier_exit=1)),
+            dict(
+                valid,
+                validation=dict(valid["validation"], checks=["model_says_passed"]),
+            ),
+            dict(valid, validation=dict(valid["validation"], artifact_sha256="0" * 64)),
+            dict(valid, turn_id=str(uuid4())),
+            dict(valid, path="../escape.docx"),
+            dict(valid, org_id=self.org),
+        ]
+        missing = copy.deepcopy(valid)
+        del missing["validation"]
+        invalid.append(missing)
+        for data in invalid:
+            with self.subTest(metadata=data):
+                self.error(self.publish(data, raw, preview), 422, "invalid_request")
+        malformed = b"not an Office package"
+        self.error(
+            self.publish(self.metadata(malformed), malformed), 422, "invalid_request"
+        )
+        self.error(
+            self.publish(valid, raw, b"invented preview"), 422, "invalid_request"
+        )
+        self.error(
+            self.publish(valid, raw, extra={"scope": (None, self.project)}),
+            422,
+            "invalid_request",
+        )
+        self.assertEqual(
+            self.request("GET", self.project_path() + "/deliverables", "viewer").json()[
+                "items"
+            ],
+            [],
+        )
+
+    def test_publication_fences_revisions_roles_and_atomic_rollback(self) -> None:
+        self.publication_setup()
+        self.assertEqual(self.acquire().status_code, 200)
+        raw, preview = self.artifact(".pdf")
+        data = self.metadata(raw, ".pdf")
+        self.error(self.publish(data, raw, role="viewer"), 403, "permission_denied")
+        self.error(self.publish(dict(data, generation=2), raw), 409, "session_busy")
+        self.error(
+            self.publish(dict(data, expected_parent_revision=1), raw),
+            409,
+            "revision_conflict",
+        )
+        self.error(
+            self.publish(dict(data, source_version_ids=[str(uuid4())]), raw),
+            404,
+            "not_found",
+        )
+        original = ProjectFiles.put
+
+        def fail_outbox(
+            files: ProjectFiles, kind: str, *args: Any, **kwargs: Any
+        ) -> None:
+            if kind == "deliverable":
+                raise OSError("Injected publication transaction failure")
+            original(files, kind, *args, **kwargs)
+
+        with patch.object(ProjectFiles, "put", fail_outbox):
+            self.error(self.publish(data, raw, preview), 503, "dependency_unavailable")
+        with store(self.app_dsn).scope(
+            self.identity("editor"), self.org, self.project
+        ) as scope:
+            files = ProjectFiles(scope)
+            self.assertEqual(files.listing("deliverable"), [])
+            self.assertEqual(files.listing("preview"), [])
+            self.assertEqual(files.listing("derived"), [])
+            self.assertEqual(
+                files.listing("file", scope.project_data["deliverables_folder_id"]), []
+            )
+            self.assertEqual(
+                files.get("folder", scope.project_data["deliverables_folder_id"])[
+                    "revision"
+                ],
+                0,
+            )
+        success = self.publish(data, raw, preview)
+        self.assertEqual(success.status_code, 201, success.text)
+        self.assertEqual(
+            self.turn(
+                "release", terminal_state="completed", cleanup_confirmed=True
+            ).status_code,
+            200,
+        )
+        self.error(self.publish(data, raw), 409, "session_busy")
+
+    def test_upload_ceiling_refuses_before_parsing_and_leaves_no_publication(
+        self,
+    ) -> None:
+        self.assertEqual(self.acquire().status_code, 200)
+        raw, _ = self.artifact(".docx")
+        response = self.publish(self.metadata(raw), raw)
+        self.error(response, 413, "size_limit")
+        self.assertEqual(
+            response.json()["measurements"],
+            [dict(measured=len(raw), limit=100, unit="bytes")],
+        )
+        self.assertEqual(
+            self.request("GET", self.project_path() + "/deliverables", "viewer").json()[
+                "items"
+            ],
+            [],
+        )
+
+    def test_publisher_uses_real_identity_and_execution_http_boundary(self) -> None:
+        from services.orchestrator.code_api import ExecutionBroker
+        from services.orchestrator.code_mode import WorkExecution
+        from services.orchestrator.presentation_delivery import build_project_document
+        from services.orchestrator.terminal_client import ProjectPublisher
+
+        self.publication_setup()
+        acquired = self.acquire()
+        self.assertEqual(acquired.status_code, 200)
+        content = Content(
+            title="Verified report",
+            sections=(
+                Section(heading="Findings", paragraphs=("Canonical project evidence",)),
+            ),
+        )
+        document = build_project_document(
+            content, ".docx", [], max_bytes=16777216, timeout=20
+        )
+        execution = WorkExecution(
+            ExecutionBroker("editor", self.org, self.project),
+            acquired.json()["session"],
+            self.turn_id,
+        )
+        with patch.dict(
+            os.environ,
+            {
+                "ATLAS_RETRIEVAL_URL": self.retrieval_url,
+                "ATLAS_PROJECT_IDENTITY_SECRET": os.urandom(32).hex(),
+            },
+        ):
+            result = asyncio.run(
+                ProjectPublisher(execution).publish(
+                    document, "verified.docx", "created", [], 0, str(uuid4()), 20
+                )
+            )
+        reply = self.request("GET", result["download_route"], "viewer")
+        self.assertEqual(reply.content, document.content)
+
+    def test_preview_and_canonical_aliases_recheck_source_restrictions(self) -> None:
+        self.publication_setup()
+        with store(self.app_dsn).scope(
+            self.identity("editor"), self.org, self.project
+        ) as scope:
+            files = ProjectFiles(scope)
+            source_folder = files.folder(
+                dict(name="Sources", locality="server", model_use="allow")
+            )
+            source = files.create_file(
+                source_folder["id"], "source.txt", b"Expected project content 42", 0
+            )
+        response = self.request(
+            "POST",
+            self.project_path() + "/work-sessions",
+            "editor",
+            dict(
+                conversation_id=self.conversation,
+                folder_ids=[source_folder["id"]],
+                base_versions=[
+                    dict(file_id=source["id"], version_id=source["version_id"])
+                ],
+            ),
+        )
+        self.assertEqual(response.status_code, 201, response.text)
+        self.session = response.json()
+        self.assertEqual(self.acquire().status_code, 200)
+        raw, preview = self.artifact(".pdf")
+        data = dict(
+            self.metadata(raw, ".pdf"), source_version_ids=[source["version_id"]]
+        )
+        reply = self.publish(data, raw, preview)
+        self.assertEqual(reply.status_code, 201, reply.text)
+        value = reply.json()
+        with store(self.app_dsn).scope(
+            self.identity("editor"), self.org, self.project
+        ) as scope:
+            files = ProjectFiles(scope)
+            version = files.get("version", value["file_version_id"])
+            source_folder["model_use"] = "deny"
+            files.save(source_folder)
+        for path in (
+            value["download_route"],
+            value["download_route"].removesuffix("download") + "preview",
+            self.project_path() + "/files/" + version["file_id"] + "/content",
+        ):
+            with self.subTest(path=path):
+                self.error(self.request("GET", path, "viewer"), 403, "policy_denied")
+        self.assertEqual(
+            self.request("GET", self.project_path() + "/deliverables", "viewer").json()[
+                "items"
+            ],
+            [],
+        )
+
+    TEXT_SAMPLES = {
+        ".md": (
+            "text/markdown",
+            "# Findings\n\nExpected project content 42\n".encode(),
+        ),
+        ".csv": ("text/csv", b"item,amount\nExpected project content 42,42\n"),
+        ".txt": ("text/plain", "Expected project content 42 été\n".encode()),
+        ".html": (
+            "text/html",
+            b"<!doctype html><p>Expected project content 42</p><script>x()</script>",
+        ),
+    }
+
+    def test_text_formats_publish_download_headers_and_named_failures(self) -> None:
+        self.publication_setup()
+        self.assertEqual(self.acquire().status_code, 200)
+        for revision, (suffix, (mime, raw)) in enumerate(self.TEXT_SAMPLES.items()):
+            with self.subTest(format=suffix):
+                reply = self.publish(self.metadata(raw, suffix, revision), raw, raw)
+                self.assertEqual(reply.status_code, 201, reply.text)
+                value = reply.json()
+                self.validator.validate(
+                    value, self.contract["components"]["schemas"]["Deliverable"]
+                )
+                self.assertEqual(value["mime"], mime)
+                self.assertEqual(value["validation"]["status"], "passed")
+                download = self.request("GET", value["download_route"], "viewer")
+                self.assertEqual(download.status_code, 200)
+                self.assertEqual(download.content, raw)
+                self.assertEqual(
+                    download.headers["content-type"], mime + "; charset=utf-8"
+                )
+                self.assertEqual(
+                    download.headers["content-disposition"],
+                    "attachment; filename*=UTF-8''report" + suffix,
+                )
+                self.assertEqual(download.headers["x-content-type-options"], "nosniff")
+                self.assertEqual(
+                    download.headers.get("content-security-policy"),
+                    "sandbox" if suffix == ".html" else None,
+                )
+                preview = self.request(
+                    "GET",
+                    value["download_route"].removesuffix("download") + "preview",
+                    "viewer",
+                )
+                self.assertEqual(preview.status_code, 200)
+                self.assertEqual(preview.content, raw)
+                self.assertTrue(
+                    preview.headers["content-type"].startswith("text/plain")
+                )
+                self.assertEqual(preview.headers["x-content-type-options"], "nosniff")
+        listing = self.request(
+            "GET", self.project_path() + "/deliverables", "viewer"
+        ).json()["items"]
+        self.assertEqual(
+            sorted(item["mime"] for item in listing),
+            sorted(mime for mime, _ in self.TEXT_SAMPLES.values()),
+        )
+        for raw, suffix, code in (
+            (b"a,b\n1,2,3\n", ".csv", "csv_inconsistent_columns"),
+            (b'a,b\n"1,2\n', ".csv", "csv_parse_error"),
+            ("café".encode("latin-1"), ".md", "text_not_utf8"),
+            (b" \n\t\n", ".txt", "text_empty"),
+        ):
+            with self.subTest(failure=code):
+                refused = self.publish(self.metadata(raw, suffix, 4), raw, raw)
+                self.error(refused, 422, "invalid_request")
+                self.assertIn(code, refused.json()["message"])
+        raw = self.TEXT_SAMPLES[".md"][1]
+        self.error(
+            self.publish(self.metadata(raw, ".md", 4), raw, b"invented preview"),
+            422,
+            "invalid_request",
+        )
+        self.assertEqual(
+            len(
+                self.request(
+                    "GET", self.project_path() + "/deliverables", "viewer"
+                ).json()["items"]
+            ),
+            4,
+        )
+
+    def test_work_tools_publish_text_formats_with_source_coverage(self) -> None:
+        from services.orchestrator.code_api import ExecutionBroker
+        from services.orchestrator.code_mode import WorkExecution
+        from services.orchestrator.code_tools import WorkTools
+        from services.orchestrator.code_worker import perform
+        from services.orchestrator.loop import Call
+
+        self.publication_setup()
+        sources = self.selected_sources()
+        acquired = self.acquire()
+        self.assertEqual(acquired.status_code, 200)
+        execution = WorkExecution(
+            ExecutionBroker("editor", self.org, self.project),
+            acquired.json()["session"],
+            self.turn_id,
+        )
+        accepted = {
+            "notes.md": "# Notes\n\nSynthesis only.\n",
+            "notes.txt": "First source evidence\nSecond source evidence\n",
+            "table.csv": "source,quote\n1,First source evidence\n2,Second source evidence\n",
+            "page.html": "<ul><li>First source evidence</li><li>Second source evidence</li></ul>",
+        }
+        # A text file is never refused for leaving the person's notes out,
+        # and none is appended to it (staging -151).
+        accepted.update(
+            {
+                "other.csv": "source\nUnrelated\n",
+                "other.html": "<p>Unrelated</p>",
+            }
+        )
+        refused = {
+            "ragged.csv": (
+                "a,b\nFirst source evidence\nSecond source evidence,x\n",
+                "csv_inconsistent_columns",
+            ),
+        }
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.dict(
+                os.environ,
+                {
+                    "ATLAS_RETRIEVAL_URL": self.retrieval_url,
+                    "ATLAS_PROJECT_IDENTITY_SECRET": os.urandom(32).hex(),
+                },
+            ),
+        ):
+            workspace = MagicMock()
+            workspace.invoke = AsyncMock(
+                side_effect=lambda name, data, timeout: perform(
+                    Path(directory), name, data
+                )
+            )
+            tools = WorkTools(workspace, execution)
+
+            async def run() -> None:
+                for path, text in accepted.items():
+                    reply = await tools.execute(
+                        Call(
+                            str(uuid4()),
+                            "publish_document",
+                            json.dumps(dict(path=path, content=text, sources=sources)),
+                        ),
+                        60,
+                    )
+                    self.assertNotIn("error", reply, reply)
+                    self.assertIn("/preview", str(reply["text"]))
+                for path, (text, code) in refused.items():
+                    reply = await tools.execute(
+                        Call(
+                            str(uuid4()),
+                            "publish_document",
+                            json.dumps(dict(path=path, content=text, sources=sources)),
+                        ),
+                        60,
+                    )
+                    self.assertIn(code, str(reply.get("error")), reply)
+
+            asyncio.run(run())
+        self.assertEqual(len(tools.deliverables), 6)
+        downloaded = {
+            receipt["relative_path"]: self.request(
+                "GET", receipt["download_route"], "viewer"
+            ).content
+            for receipt in tools.deliverables
+        }
+        for path, text in accepted.items():
+            self.assertEqual(downloaded[path], text.encode())
+        for receipt in tools.deliverables:
+            self.assertEqual(
+                receipt["source_version_ids"], [s["version"] for s in sources]
+            )
+
+    def test_chat_files_take_numbered_copies_and_project_names_stay(self) -> None:
+        """The hidden chat project numbers a taken name; project mode keeps -2."""
+        from services.orchestrator.code_api import ExecutionBroker
+        from services.orchestrator.code_mode import WorkExecution
+        from services.orchestrator.code_tools import WorkTools
+        from services.orchestrator.code_worker import perform
+        from services.orchestrator.loop import Call
+
+        self.publication_setup()
+        acquired = self.acquire()
+        self.assertEqual(acquired.status_code, 200, acquired.text)
+        execution = WorkExecution(
+            ExecutionBroker("editor", self.org, self.project),
+            acquired.json()["session"],
+            self.turn_id,
+        )
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.dict(
+                os.environ,
+                {
+                    "ATLAS_RETRIEVAL_URL": self.retrieval_url,
+                    "ATLAS_PROJECT_IDENTITY_SECRET": os.urandom(32).hex(),
+                },
+            ),
+        ):
+            workspace = MagicMock()
+            workspace.invoke = AsyncMock(
+                side_effect=lambda name, data, timeout: perform(
+                    Path(directory), name, data
+                )
+            )
+
+            def chat() -> WorkTools:
+                # Each publication from another conversation (another turn):
+                # within one turn a name of that turn is its next version.
+                tools = WorkTools(workspace, execution)
+                tools.numbered_copies = True
+                return tools
+
+            project = WorkTools(workspace, execution)
+
+            async def publish(
+                tools: Any, path: str, text: str, strategy: str = "created"
+            ) -> dict[str, Any]:
+                reply = await tools.execute(
+                    Call(
+                        str(uuid4()),
+                        "publish_document",
+                        json.dumps(
+                            dict(path=path, content=text, sources=[], strategy=strategy)
+                        ),
+                    ),
+                    60,
+                )
+                self.assertNotIn("error", reply, reply)
+                return dict(reply)
+
+            async def run() -> list[dict[str, Any]]:
+                return [
+                    await publish(chat(), "tracker.csv", "day,km\nmonday,5\n"),
+                    await publish(chat(), "tracker.csv", "day,km\ntuesday,7\n"),
+                    await publish(chat(), "tracker.csv", "day,km\nfriday,9\n"),
+                    # A regeneration under a taken name is a copy too, never a failure.
+                    await publish(
+                        chat(), "tracker.csv", "day,km\nsunday,12\n", "regenerated"
+                    ),
+                    await publish(project, "plan.md", "# Plan\n\nOne.\n"),
+                    # Another turn: in its own turn a name is its next version.
+                    await publish(
+                        WorkTools(workspace, execution), "plan.md", "# Plan\n\nTwo.\n"
+                    ),
+                ]
+
+            replies = asyncio.run(run())
+        self.assertEqual(
+            [r["deliverable"].get("relative_path") for r in replies[:4]],
+            ["tracker.csv", "tracker (2).csv", "tracker (3).csv", "tracker (4).csv"],
+        )
+        self.assertNotIn("note", replies[0])
+        self.assertIn("saved as tracker (2).csv", replies[1]["note"])
+        self.assertIn("Download tracker (2).csv", replies[1]["text"])
+        with store(self.app_dsn).scope(
+            self.identity("editor"), self.org, self.project
+        ) as scope:
+            files = ProjectFiles(scope)
+            delivered = files.listing(
+                "file", scope.project_data["deliverables_folder_id"]
+            )
+            names = sorted(f["relative_path"] for f in delivered)
+            # Nothing was overwritten: one version per file.
+            identifiers = {f["id"] for f in delivered}
+            versions = [
+                v for v in files.listing("version") if v["file_id"] in identifiers
+            ]
+        self.assertEqual(
+            names,
+            [
+                "plan-2.md",
+                "plan.md",
+                "tracker (2).csv",
+                "tracker (3).csv",
+                "tracker (4).csv",
+                "tracker.csv",
+            ],
+        )
+        self.assertEqual(len(versions), len(names))
+        # Each copy downloads its own bytes.
+        self.assertEqual(
+            self.request(
+                "GET", replies[1]["deliverable"]["download_route"], "viewer"
+            ).content,
+            b"day,km\ntuesday,7\n",
+        )
+
+    def test_a_chat_file_published_again_in_its_turn_is_its_next_version(
+        self,
+    ) -> None:
+        """Staging -157 (2026-11-22): a report published with a gap, then
+        fixed in the same turn, came as "Four_Days_Full_Output (2).docx",
+        next to the first file, and kept that name in the next turns. In one
+        turn a file published again under its name is its next version: the
+        person sees one file, under the name asked, with one link."""
+        from services.orchestrator.code_api import ExecutionBroker
+        from services.orchestrator.code_mode import WorkExecution
+        from services.orchestrator.code_tools import WorkTools
+        from services.orchestrator.code_worker import perform
+        from services.orchestrator.loop import Call
+
+        self.publication_setup()
+        acquired = self.acquire()
+        self.assertEqual(acquired.status_code, 200, acquired.text)
+        execution = WorkExecution(
+            ExecutionBroker("editor", self.org, self.project),
+            acquired.json()["session"],
+            self.turn_id,
+        )
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.dict(
+                os.environ,
+                {
+                    "ATLAS_RETRIEVAL_URL": self.retrieval_url,
+                    "ATLAS_PROJECT_IDENTITY_SECRET": os.urandom(32).hex(),
+                },
+            ),
+        ):
+            workspace = MagicMock()
+            workspace.invoke = AsyncMock(
+                side_effect=lambda name, data, timeout: perform(
+                    Path(directory), name, data
+                )
+            )
+            turn = WorkTools(workspace, execution)
+            turn.numbered_copies = True
+            # Behind the chat the overwrite is approved on the person's behalf.
+            turn.approvals_unattended = True
+
+            async def publish(text: str, strategy: str) -> dict[str, Any]:
+                reply = await turn.execute(
+                    Call(
+                        str(uuid4()),
+                        "publish_document",
+                        json.dumps(
+                            dict(
+                                path="Short_Weeks.md",
+                                content=text,
+                                sources=[],
+                                strategy=strategy,
+                            )
+                        ),
+                    ),
+                    60,
+                )
+                self.assertNotIn("error", reply, reply)
+                return dict(reply)
+
+            async def run() -> list[dict[str, Any]]:
+                return [
+                    await publish("# Short Weeks\n\nFirst.\n", "created"),
+                    await publish("# Short Weeks\n\nFixed.\n", "regenerated"),
+                ]
+
+            replies = asyncio.run(run())
+        names = [r["deliverable"].get("relative_path") for r in replies]
+        self.assertEqual(names, ["Short_Weeks.md", "Short_Weeks.md"])
+        self.assertEqual(len(turn.deliverables), 1)
+        self.assertEqual(
+            self.request(
+                "GET", replies[1]["deliverable"]["download_route"], "viewer"
+            ).content,
+            b"# Short Weeks\n\nFixed.\n",
+        )
+        with store(self.app_dsn).scope(
+            self.identity("editor"), self.org, self.project
+        ) as scope:
+            files = ProjectFiles(scope)
+            delivered = files.listing(
+                "file", scope.project_data["deliverables_folder_id"]
+            )
+            versions = [
+                v
+                for v in files.listing("version")
+                if v["file_id"] in {f["id"] for f in delivered}
+            ]
+        # One file, two versions: the fix replaced the first under its name.
+        self.assertEqual([f["relative_path"] for f in delivered], ["Short_Weeks.md"])
+        self.assertEqual(len(versions), 2)
+
+    def test_a_project_file_retried_in_its_turn_needs_no_approval(self) -> None:
+        """Staging -159 (2026-11-22): in a project, the deck the turn had just
+        created was published again after its self-check; the new version
+        went to the overwrite approval card, the turn waited 120 s for it,
+        and the answer said the regeneration had not been approved. A file
+        the turn created is replaced by its retry without a card; a file
+        that existed before the turn still asks."""
+        from services.orchestrator.code_api import ExecutionBroker
+        from services.orchestrator.code_mode import WorkExecution
+        from services.orchestrator.code_tools import WorkTools
+        from services.orchestrator.code_worker import perform
+        from services.orchestrator.loop import Call
+
+        self.publication_setup()
+        acquired = self.acquire()
+        self.assertEqual(acquired.status_code, 200, acquired.text)
+        execution = WorkExecution(
+            ExecutionBroker("editor", self.org, self.project),
+            acquired.json()["session"],
+            self.turn_id,
+        )
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.dict(
+                os.environ,
+                {
+                    "ATLAS_RETRIEVAL_URL": self.retrieval_url,
+                    "ATLAS_PROJECT_IDENTITY_SECRET": os.urandom(32).hex(),
+                },
+            ),
+        ):
+            workspace = MagicMock()
+            workspace.invoke = AsyncMock(
+                side_effect=lambda name, data, timeout: perform(
+                    Path(directory), name, data
+                )
+            )
+            turn = WorkTools(workspace, execution)
+
+            async def publish(text: str, strategy: str) -> dict[str, Any]:
+                return dict(
+                    await turn.execute(
+                        Call(
+                            str(uuid4()),
+                            "publish_document",
+                            json.dumps(
+                                dict(
+                                    path="plan.md",
+                                    content=text,
+                                    sources=[],
+                                    strategy=strategy,
+                                )
+                            ),
+                        ),
+                        60,
+                    )
+                )
+
+            async def run() -> list[dict[str, Any]]:
+                return [
+                    await publish("# Plan\n\nFirst.\n", "created"),
+                    await publish("# Plan\n\nFixed.\n", "regenerated"),
+                ]
+
+            started = time.monotonic()
+            replies = asyncio.run(run())
+            elapsed = time.monotonic() - started
+        for reply in replies:
+            self.assertNotIn("error", reply, reply)
+            self.assertNotIn("not_published", reply, reply)
+        self.assertLess(elapsed, 30)
+        self.assertEqual(
+            [r["deliverable"]["relative_path"] for r in replies], ["plan.md"] * 2
+        )
+        self.assertEqual(turn.turn_created, {"plan.md"})
+        self.assertEqual(len(turn.deliverables), 1)
+        self.assertEqual(
+            self.request(
+                "GET", replies[1]["deliverable"]["download_route"], "viewer"
+            ).content,
+            b"# Plan\n\nFixed.\n",
+        )
+        # The next turn did not create it: its own tools ask as before.
+        later = WorkTools(MagicMock(), execution)
+        self.assertEqual(later.turn_created, set())
+
+    def test_a_refused_file_retried_gets_a_free_name_behind_a_stale_listing(
+        self,
+    ) -> None:
+        """Staging 2026-11-21: a presentation asked for many times had 29 copies
+        of its name in the chat files; the listing missed the newest ones, the
+        file found gaps was refused, its retry was refused eight times with
+        path_conflict, five times in a row, and the turn ended with no file."""
+        from services.orchestrator import deliverable_check, work_save
+        from services.orchestrator.code_api import ExecutionBroker
+        from services.orchestrator.code_mode import WorkExecution
+        from services.orchestrator.code_tools import WorkTools
+        from services.orchestrator.code_worker import perform
+        from services.orchestrator.loop import Call
+
+        self.publication_setup()
+        with store(self.app_dsn).scope(
+            self.identity("editor"), self.org, self.project
+        ) as scope:
+            files = ProjectFiles(scope)
+            folder_id = scope.project_data["deliverables_folder_id"]
+            # Earlier conversations of the same person asked for the same file.
+            for number in range(1, 13):
+                name = "notes.md" if number == 1 else f"notes ({number}).md"
+                files.create_file(
+                    folder_id,
+                    name,
+                    f"# Notes {number}\n".encode(),
+                    files.get("folder", folder_id)["revision"],
+                    origin="work",
+                    verified_mime="text/markdown",
+                )
+        acquired = self.acquire()
+        self.assertEqual(acquired.status_code, 200, acquired.text)
+        execution = WorkExecution(
+            ExecutionBroker("editor", self.org, self.project),
+            acquired.json()["session"],
+            self.turn_id,
+        )
+        listing = work_save.project_file_paths
+        reads: list[int] = []
+
+        async def stale_first(execution: Any, folder: str | None = None) -> Any:
+            # The first read misses the newest copies, as a listing cut short did.
+            found = await listing(execution, folder)
+            reads.append(len(found))
+            if len(reads) == 1:
+                return {k: v for k, v in found.items() if "notes (" not in k}
+            return found
+
+        gaps = deliverable_check.Outcome(gaps=["the third section"], checked=True)
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.dict(
+                os.environ,
+                {
+                    "ATLAS_RETRIEVAL_URL": self.retrieval_url,
+                    "ATLAS_PROJECT_IDENTITY_SECRET": os.urandom(32).hex(),
+                },
+            ),
+            patch.object(work_save, "project_file_paths", new=stale_first),
+            patch.object(deliverable_check, "review", new=AsyncMock(return_value=gaps)),
+        ):
+            workspace = MagicMock()
+            workspace.invoke = AsyncMock(
+                side_effect=lambda name, data, timeout: perform(
+                    Path(directory), name, data
+                )
+            )
+            chat = WorkTools(workspace, execution)
+            chat.numbered_copies = True
+
+            async def publish() -> dict[str, Any]:
+                return dict(
+                    await chat.execute(
+                        Call(
+                            str(uuid4()),
+                            "publish_document",
+                            json.dumps(
+                                dict(
+                                    path="deliverables/notes.md",
+                                    content="# Notes\n\nThree sections.\n",
+                                    sources=[],
+                                )
+                            ),
+                        ),
+                        60,
+                    )
+                )
+
+            async def run() -> list[dict[str, Any]]:
+                return [await publish(), await publish()]
+
+            refused, published = asyncio.run(run())
+        # The gaps are refused once, for a repair; nothing was saved then.
+        self.assertIn("error", refused)
+        self.assertNotIn("error", published, published)
+        # The retry gets a free name in the chat's flat files, at once after
+        # reading the names again.
+        self.assertEqual(published["deliverable"]["relative_path"], "notes (13).md")
+        self.assertEqual(len(reads), 2)
+        self.assertIn("Download notes (13).md", published["text"])
+        self.assertNotIn("Download deliverables/", published["text"])
+        self.assertIn("saved as notes (13).md", published["note"])
+        self.assertIn("the third section", published["note"])
+        with store(self.app_dsn).scope(
+            self.identity("editor"), self.org, self.project
+        ) as scope:
+            names = sorted(
+                f["relative_path"]
+                for f in ProjectFiles(scope).listing(
+                    "file", scope.project_data["deliverables_folder_id"]
+                )
+            )
+        self.assertEqual(len(names), 13)
+        self.assertIn("notes (13).md", names)
+
+    def test_a_change_of_a_chat_file_is_its_next_version(self) -> None:
+        """Staging 2026-11-20: "write a report as a Word document", then "change
+        the title", then "add a table" gave three files with three names, each
+        one created. A change of a file the conversation delivered is now that
+        file's next version; a new request, or another format, is a new file."""
+        from services.orchestrator import current_file
+        from services.orchestrator.code_api import ExecutionBroker
+        from services.orchestrator.code_mode import WorkExecution
+        from services.orchestrator.code_tools import WorkTools
+        from services.orchestrator.code_worker import perform
+        from services.orchestrator.loop import Call
+        from services.orchestrator.terminal_client import (
+            ProjectPublisher,
+            VerifiedDocument,
+        )
+        from services.retrieval.project_identity import ProjectError
+
+        self.publication_setup()
+        acquired = self.acquire()
+        self.assertEqual(acquired.status_code, 200, acquired.text)
+        execution = WorkExecution(
+            ExecutionBroker("editor", self.org, self.project),
+            acquired.json()["session"],
+            self.turn_id,
+        )
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.dict(
+                os.environ,
+                {
+                    "ATLAS_RETRIEVAL_URL": self.retrieval_url,
+                    "ATLAS_PROJECT_IDENTITY_SECRET": os.urandom(32).hex(),
+                },
+            ),
+        ):
+            workspace = MagicMock()
+            workspace.invoke = AsyncMock(
+                side_effect=lambda name, data, timeout: perform(
+                    Path(directory), name, data
+                )
+            )
+            chat = WorkTools(workspace, execution)
+            chat.numbered_copies = True
+            chat.approvals_unattended = True
+
+            async def publish(path: str, text: str) -> dict[str, Any]:
+                reply = await chat.execute(
+                    Call(
+                        str(uuid4()),
+                        "publish_document",
+                        json.dumps(dict(path=path, content=text, sources=[])),
+                    ),
+                    60,
+                )
+                self.assertNotIn("error", reply, reply)
+                return dict(reply)
+
+            loaded: list[Any] = []
+
+            async def run() -> list[dict[str, Any]]:
+                replies = [
+                    await publish("Team_Week.docx", "# Four Days\n\nOur trial.\n")
+                ]
+                # The next turns change it: the chat decided they are follow-ups.
+                chat.revises_delivered = True
+                chat.earlier_answers = [replies[0]["text"]]
+                replies.append(
+                    await publish("Friday_Report.docx", "# Friday Test\n\nOur trial.\n")
+                )
+                chat.earlier_answers.append(replies[1]["text"])
+                # The next change starts from the stored second version, read
+                # from its bytes (current_file.py), and is compared with it.
+                _, project = await execution.broker.public("GET", "")
+                chat.current_file = await current_file.load(chat, project)
+                loaded.append(chat.current_file)
+                replies.append(
+                    await publish(
+                        "Friday_Report (2).docx",
+                        "# Friday Test\n\nOur trial.\n\n| Quarter | Tickets |\n"
+                        "| --- | --- |\n| Q1 | 112 |\n",
+                    )
+                )
+                # Another format in a follow-up is a new file.
+                replies.append(
+                    await publish("Team_Week.md", "# Friday Test\n\nNotes.\n")
+                )
+                # A new request, not a change, is a new file too (a new turn:
+                # its own tools, without the files of the turns before).
+                chat.revises_delivered = False
+                chat.turn_files = {}
+                replies.append(await publish("Team_Week.docx", "# Other\n\nNew.\n"))
+                return replies
+
+            replies = asyncio.run(run())
+
+            async def refused(revision_of: dict[str, str], strategy: str) -> Any:
+                content = b"# Refused\n"
+                document = VerifiedDocument(
+                    content, content, hashlib.sha256(content).hexdigest()
+                )
+                _, project = await execution.broker.public("GET", "")
+                _, listing = await execution.broker.public("GET", "folders")
+                folder = next(
+                    f
+                    for f in listing["items"]
+                    if f["id"] == project["deliverables_folder_id"]
+                )
+                with self.assertRaises(ProjectError) as caught:
+                    await ProjectPublisher(execution).publish(
+                        document,
+                        "Team_Week.md",
+                        strategy,
+                        [],
+                        int(folder["revision"]),
+                        str(uuid4()),
+                        30,
+                        revision_of=revision_of,
+                    )
+                return caught.exception.args
+
+            md = replies[3]["deliverable"]
+            # A receipt names its deliverable; the file is the one of its version.
+            _, listing = asyncio.run(execution.broker.public("GET", "files"))
+            md_file = next(
+                f for f in listing["items"] if f["version_id"] == md["file_version_id"]
+            )
+            stale = dict(
+                file_id=str(md_file["id"]),
+                base_version=str(uuid4()),
+                approval_id=str(uuid4()),
+            )
+            current = dict(stale, base_version=str(md["file_version_id"]))
+            conflict = asyncio.run(refused(stale, "regenerated"))
+            unapproved = asyncio.run(refused(current, "regenerated"))
+            created = asyncio.run(refused(current, "created"))
+        self.assertIn("revision_conflict", conflict)
+        self.assertIn("approval_required", unapproved)
+        self.assertIn("invalid_request", created)
+        names = [r["deliverable"].get("relative_path") for r in replies]
+        self.assertEqual(
+            names,
+            [
+                "Team_Week.docx",
+                "Team_Week.docx",
+                "Team_Week.docx",
+                "Team_Week.md",
+                "Team_Week (2).docx",
+            ],
+        )
+        self.assertNotIn("note", replies[0])
+        self.assertIn("saved as its new version", replies[1]["note"])
+        self.assertIn("Download Team_Week.docx", replies[2]["text"])
+        # The writer of the third version received the second one, title
+        # change included; unchecked here (no turn model), the answer must
+        # name what the new version changed.
+        self.assertEqual(loaded[0].name, "Team_Week.docx")
+        self.assertEqual(loaded[0].document.title, "Friday Test")
+        self.assertEqual(
+            loaded[0].version_id, replies[1]["deliverable"]["file_version_id"]
+        )
+        self.assertEqual(
+            loaded[0].context("add a table")["current"],
+            {"title": "Friday Test", "content": "Our trial."},
+        )
+        self.assertIn('added "Quarter | Tickets Q1 | 112"', replies[2]["note"])
+        self.assertNotIn("removed", replies[2]["note"])
+        self.assertEqual(
+            [r["deliverable"]["strategy"] for r in replies[:3]],
+            ["created", "regenerated", "regenerated"],
+        )
+        # Three deliverables, three versions of one file.
+        self.assertEqual(len({r["deliverable"]["id"] for r in replies[:3]}), 3)
+        self.assertEqual(
+            len({r["deliverable"]["file_version_id"] for r in replies[:3]}), 3
+        )
+        with store(self.app_dsn).scope(
+            self.identity("editor"), self.org, self.project
+        ) as scope:
+            files = ProjectFiles(scope)
+            delivered = files.listing(
+                "file", scope.project_data["deliverables_folder_id"]
+            )
+            report = next(
+                f for f in delivered if f["relative_path"] == "Team_Week.docx"
+            )
+            versions = files.listing("version", report["id"])
+        self.assertEqual(
+            sorted(f["relative_path"] for f in delivered),
+            ["Team_Week (2).docx", "Team_Week.docx", "Team_Week.md"],
+        )
+        self.assertEqual(
+            {v["id"] for v in versions},
+            {r["deliverable"]["file_version_id"] for r in replies[:3]},
+        )
+        self.assertEqual(
+            report["version_id"], replies[2]["deliverable"]["file_version_id"]
+        )
+        # A link already given keeps serving its own version.
+        for reply in (replies[0], replies[2]):
+            served = self.request(
+                "GET", reply["deliverable"]["download_route"], "viewer"
+            )
+            self.assertEqual(served.status_code, 200)
+            self.assertEqual(
+                hashlib.sha256(served.content).hexdigest(),
+                reply["deliverable"]["sha256"],
+            )
+        self.assertNotEqual(
+            replies[0]["deliverable"]["sha256"], replies[2]["deliverable"]["sha256"]
+        )
+
+    def test_a_change_of_a_project_file_is_its_next_version_once_approved(
+        self,
+    ) -> None:
+        """docs/17, section 12, item 20: in project mode a change of a delivered
+        file is its next version, as in the chat, but only once the person
+        approves the overwrite; a declined approval publishes nothing and the
+        answer says so; a new deliverable or another format is a new file."""
+        from services.orchestrator.code_api import ExecutionBroker
+        from services.orchestrator.code_mode import WorkExecution
+        from services.orchestrator.code_tools import WorkTools
+        from services.orchestrator.code_worker import perform
+        from services.orchestrator.loop import Call
+        from services.orchestrator.work_save import not_saved_line, not_saved_paths
+
+        self.publication_setup()
+        acquired = self.acquire()
+        self.assertEqual(acquired.status_code, 200, acquired.text)
+        execution = WorkExecution(
+            ExecutionBroker("editor", self.org, self.project),
+            acquired.json()["session"],
+            self.turn_id,
+        )
+        decisions: list[bool] = []
+        cards: list[dict[str, Any]] = []
+
+        def decide(approval: dict[str, Any], allow: bool) -> None:
+            digest = approval.get("action_digest")
+            if not digest:
+                session = self.request(
+                    "GET",
+                    self.project_path() + "/work-sessions/" + self.session["id"],
+                    "editor",
+                ).json()
+                digest = next(
+                    a["action_digest"]
+                    for a in session["pending_approvals"]
+                    if a["id"] == approval["id"]
+                )
+            reply = self.request(
+                "POST",
+                self.project_path() + "/approvals/" + approval["id"] + "/decision",
+                "editor",
+                dict(allow=allow, action_digest=digest),
+                key="decision-" + approval["id"],
+            )
+            self.assertEqual(reply.status_code, 200, reply.text)
+
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.dict(
+                os.environ,
+                {
+                    "ATLAS_RETRIEVAL_URL": self.retrieval_url,
+                    "ATLAS_PROJECT_IDENTITY_SECRET": os.urandom(32).hex(),
+                },
+            ),
+        ):
+            workspace = MagicMock()
+            workspace.invoke = AsyncMock(
+                side_effect=lambda name, data, timeout: perform(
+                    Path(directory), name, data
+                )
+            )
+            project = WorkTools(workspace, execution)
+            emit = project.emit
+
+            async def answered(kind: str, **event: Any) -> Any:
+                # The person answers the approval card as it appears.
+                if kind == "approval" and event.get("status") == "running":
+                    approval = event["output"]["approval"]
+                    cards.append(approval)
+                    await asyncio.to_thread(decide, approval, decisions.pop(0))
+                return await emit(kind, **event)
+
+            project.emit = answered  # type: ignore[method-assign]
+
+            async def publish(path: str, text: str, strategy: str) -> dict[str, Any]:
+                reply = await project.execute(
+                    Call(
+                        str(uuid4()),
+                        "publish_document",
+                        json.dumps(
+                            dict(path=path, content=text, sources=[], strategy=strategy)
+                        ),
+                    ),
+                    60,
+                )
+                self.assertNotIn("error", reply, reply)
+                return dict(reply)
+
+            async def run() -> list[dict[str, Any]]:
+                replies = [
+                    await publish(
+                        "Field_Notes.docx", "# Field Notes\n\nDay one.\n", "created"
+                    )
+                ]
+                # Later turns change it: their tools did not create it.
+                project.turn_files, project.turn_created = {}, set()
+                decisions.extend([True, True])
+                replies.append(
+                    await publish(
+                        "Field_Notes.docx",
+                        "# Field Notes, revised\n\nDay one.\n",
+                        "regenerated",
+                    )
+                )
+                replies.append(
+                    await publish(
+                        "Field_Notes.docx",
+                        "# Field Notes, revised\n\nDay one.\n\n| Day | Birds |\n"
+                        "| --- | --- |\n| 1 | 14 |\n",
+                        "edited_in_place",
+                    )
+                )
+                # The person declines the fourth change: nothing is published,
+                # and the same change is not asked again in this turn.
+                decisions.append(False)
+                replies.append(
+                    await publish(
+                        "Field_Notes.docx", "# Declined\n\nGone.\n", "regenerated"
+                    )
+                )
+                replies.append(
+                    await publish(
+                        "Field_Notes.docx", "# Declined\n\nAgain.\n", "regenerated"
+                    )
+                )
+                # Another format, and a new deliverable, are new files.
+                replies.append(
+                    await publish(
+                        "Field_Notes.md", "# Field Notes\n\nNotes.\n", "regenerated"
+                    )
+                )
+                # A new request in a new turn.
+                project.turn_files, project.turn_created = {}, set()
+                replies.append(
+                    await publish("Field_Notes.docx", "# Other\n\nNew.\n", "created")
+                )
+                return replies
+
+            replies = asyncio.run(run())
+        self.assertEqual(decisions, [])
+        # One card per change: three approvals asked, none for the repeat.
+        self.assertEqual(len(cards), 3)
+        self.assertEqual([card["action_kind"] for card in cards], ["overwrite"] * 3)
+        for declined in replies[3:5]:
+            self.assertNotIn("deliverable", declined)
+            self.assertEqual(
+                declined["not_published"]["path"], "Field_Notes.docx", declined
+            )
+            self.assertIn("Nothing was overwritten", declined["note"])
+        self.assertEqual(declined["not_published"]["reason"], "denied")
+        self.assertEqual(project.not_published, ["Field_Notes.docx"])
+        # The answer names the file left unchanged (code_mode end of turn).
+        unsaved = not_saved_paths({"not_saved": []}, project)
+        self.assertEqual(unsaved, ["Field_Notes.docx"])
+        self.assertIn("approbation refusée", not_saved_line("fr") + ", ".join(unsaved))
+        self.assertEqual(replies[1]["deliverable"]["relative_path"], "Field_Notes.docx")
+        self.assertIn("saved as its new version", replies[1]["note"])
+        self.assertIn("Download Field_Notes.docx", replies[2]["text"])
+        self.assertEqual(
+            [r["deliverable"]["strategy"] for r in replies[:3]],
+            ["created", "regenerated", "edited_in_place"],
+        )
+        self.assertEqual(
+            len({r["deliverable"]["file_version_id"] for r in replies[:3]}), 3
+        )
+        with store(self.app_dsn).scope(
+            self.identity("editor"), self.org, self.project
+        ) as scope:
+            files = ProjectFiles(scope)
+            delivered = files.listing(
+                "file", scope.project_data["deliverables_folder_id"]
+            )
+            notes = next(
+                f for f in delivered if f["relative_path"] == "Field_Notes.docx"
+            )
+            versions = files.listing("version", notes["id"])
+            names = {
+                v["id"]: files.get("file", v["file_id"])["relative_path"]
+                for v in files.listing("version")
+            }
+        self.assertEqual(
+            sorted(f["relative_path"] for f in delivered),
+            ["Field_Notes-2.docx", "Field_Notes.docx", "Field_Notes.md"],
+        )
+        self.assertEqual(
+            [
+                names[replies[i]["deliverable"]["file_version_id"]]
+                for i in (0, 1, 2, 5, 6)
+            ],
+            [
+                "Field_Notes.docx",
+                "Field_Notes.docx",
+                "Field_Notes.docx",
+                "Field_Notes.md",
+                "Field_Notes-2.docx",
+            ],
+        )
+        # One file, three versions; the declined change left the third current.
+        self.assertEqual(
+            {v["id"] for v in versions},
+            {r["deliverable"]["file_version_id"] for r in replies[:3]},
+        )
+        self.assertEqual(
+            notes["version_id"], replies[2]["deliverable"]["file_version_id"]
+        )
+        # Each link keeps serving its own bytes.
+        hashes = set()
+        for reply in replies[:3]:
+            served = self.request(
+                "GET", reply["deliverable"]["download_route"], "viewer"
+            )
+            self.assertEqual(served.status_code, 200)
+            self.assertEqual(
+                hashlib.sha256(served.content).hexdigest(),
+                reply["deliverable"]["sha256"],
+            )
+            hashes.add(reply["deliverable"]["sha256"])
+        self.assertEqual(len(hashes), 3)
+
+    def test_a_project_revision_is_checked_before_its_approval(self) -> None:
+        """PR 591's guarantees in project mode: the writer is given the stored
+        version, and a new version that loses a section nobody asked to change
+        is refused once before any approval card; the repair still lacking it
+        is approved, published, and its note says so for the answer."""
+        from decimal import Decimal
+        from types import SimpleNamespace
+
+        from services.orchestrator import current_file, deliverable_check
+        from services.orchestrator.code_api import ExecutionBroker
+        from services.orchestrator.code_mode import WorkExecution
+        from services.orchestrator.code_tools import WorkTools
+        from services.orchestrator.code_worker import perform
+        from services.orchestrator.loop import Call
+
+        self.publication_setup()
+        acquired = self.acquire()
+        self.assertEqual(acquired.status_code, 200, acquired.text)
+        execution = WorkExecution(
+            ExecutionBroker("editor", self.org, self.project),
+            acquired.json()["session"],
+            self.turn_id,
+        )
+        report = (
+            "# Orchard report\n\n## Harvest\n\nThe harvest reached 3 400 kg of "
+            "apples.\n\n## Members\n\nAda Fernhill coordinates the picking teams "
+            "and Bruno Calvel keeps the accounts.\n"
+        )
+        lost = (
+            "# Season review\n\n## Harvest\n\nThe harvest reached 3 400 kg of apples.\n"
+        )
+        gap = 'the section "Members" was removed without being asked'
+        judged = AsyncMock(
+            side_effect=[
+                dict(text=json.dumps({"gaps": [gap], "variants": []}), cost_eur="0"),
+                dict(text=json.dumps({"gaps": [gap], "variants": []}), cost_eur="0"),
+            ]
+        )
+        cards: list[dict[str, Any]] = []
+
+        def allow(approval: dict[str, Any]) -> None:
+            session = self.request(
+                "GET",
+                self.project_path() + "/work-sessions/" + self.session["id"],
+                "editor",
+            ).json()
+            digest = approval.get("action_digest") or next(
+                a["action_digest"]
+                for a in session["pending_approvals"]
+                if a["id"] == approval["id"]
+            )
+            reply = self.request(
+                "POST",
+                self.project_path() + "/approvals/" + approval["id"] + "/decision",
+                "editor",
+                dict(allow=True, action_digest=digest),
+                key="decision-" + approval["id"],
+            )
+            self.assertEqual(reply.status_code, 200, reply.text)
+
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.dict(
+                os.environ,
+                {
+                    "ATLAS_RETRIEVAL_URL": self.retrieval_url,
+                    "ATLAS_PROJECT_IDENTITY_SECRET": os.urandom(32).hex(),
+                },
+            ),
+            patch.object(deliverable_check, "_complete", judged),
+        ):
+            workspace = MagicMock()
+            workspace.invoke = AsyncMock(
+                side_effect=lambda name, data, timeout: perform(
+                    Path(directory), name, data
+                )
+            )
+            project = WorkTools(workspace, execution)
+            emit = project.emit
+
+            async def answered(kind: str, **event: Any) -> Any:
+                if kind == "approval" and event.get("status") == "running":
+                    cards.append(event["output"]["approval"])
+                    await asyncio.to_thread(allow, event["output"]["approval"])
+                return await emit(kind, **event)
+
+            project.emit = answered  # type: ignore[method-assign]
+
+            async def publish(text: str, strategy: str) -> dict[str, Any]:
+                return dict(
+                    await project.execute(
+                        Call(
+                            str(uuid4()),
+                            "publish_document",
+                            json.dumps(
+                                dict(
+                                    path="Orchard_Report.docx",
+                                    content=text,
+                                    sources=[],
+                                    strategy=strategy,
+                                )
+                            ),
+                        ),
+                        60,
+                    )
+                )
+
+            async def run() -> tuple[Any, list[dict[str, Any]]]:
+                first = await publish(report, "created")
+                # The next turn: "change the title to Season review" (its own
+                # tools: the file was not created by it).
+                project.turn_files, project.turn_created = {}, set()
+                _, data = await execution.broker.public("GET", "")
+                given = await current_file.load(project, data, [first["text"]])
+                project.current_file = given
+                project.check_model = SimpleNamespace(
+                    profile="atlas-qwen",
+                    strict=False,
+                    spent=Decimal(0),
+                    allowance=Decimal("0.1"),
+                )
+                project.request_text = "Change the title to Season review"
+                project.earlier_requests = ["Write the orchard report in Word"]
+                project.deliverable_checks = 0
+                project.deliverable_refused = False
+                return given, [
+                    first,
+                    await publish(lost, "regenerated"),
+                    await publish(lost, "regenerated"),
+                ]
+
+            given, replies = asyncio.run(run())
+        # The writer started from the stored version, with the project wording.
+        assert given is not None
+        self.assertTrue(given.project)
+        self.assertEqual(given.name, "Orchard_Report.docx")
+        self.assertEqual(given.document.title, "Orchard report")
+        context = given.context("Change the title to Season review")
+        self.assertIn(
+            "If this turn changes Orchard_Report.docx", context["instruction"]
+        )
+        self.assertIn("Bruno Calvel", json.dumps(context["current"]))
+        # Refused once, before any approval card, with the lost text named.
+        self.assertIn("deliverable_check", replies[1]["error"])
+        self.assertIn("Members", replies[1]["error"])
+        self.assertNotIn("deliverable", replies[1])
+        payload = judged.await_args_list[0].args[0]
+        self.assertIn("new version of a file", payload["messages"][0]["content"])
+        self.assertIn("Bruno Calvel", json.dumps(payload["messages"][1]))
+        # The repair still lacking it: one card, approved, the note says so.
+        self.assertEqual(len(cards), 1)
+        self.assertEqual(
+            replies[2]["deliverable"]["relative_path"], "Orchard_Report.docx"
+        )
+        self.assertIn("saved as its new version", replies[2]["note"])
+        self.assertIn("must say so plainly", replies[2]["note"])
+        self.assertIn("Members", replies[2]["note"])
+        with store(self.app_dsn).scope(
+            self.identity("editor"), self.org, self.project
+        ) as scope:
+            files = ProjectFiles(scope)
+            delivered = files.listing(
+                "file", scope.project_data["deliverables_folder_id"]
+            )
+            self.assertEqual(
+                [f["relative_path"] for f in delivered], ["Orchard_Report.docx"]
+            )
+            versions = files.listing("version", delivered[0]["id"])
+        self.assertEqual(
+            {v["id"] for v in versions},
+            {r["deliverable"]["file_version_id"] for r in (replies[0], replies[2])},
+        )
+
+    def test_web_pages_declared_as_sources_are_ignored_not_refused(self) -> None:
+        """Staging corpus 2026-11-12: a researched report listed its web pages
+        as sources with invented identifiers and was refused twice."""
+        from services.orchestrator.code_api import ExecutionBroker
+        from services.orchestrator.code_mode import WorkExecution
+        from services.orchestrator.code_tools import WorkTools
+        from services.orchestrator.code_worker import perform
+        from services.orchestrator.loop import Call
+
+        self.publication_setup()
+        acquired = self.acquire()
+        self.assertEqual(acquired.status_code, 200, acquired.text)
+        execution = WorkExecution(
+            ExecutionBroker("editor", self.org, self.project),
+            acquired.json()["session"],
+            self.turn_id,
+        )
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.dict(
+                os.environ,
+                {
+                    "ATLAS_RETRIEVAL_URL": self.retrieval_url,
+                    "ATLAS_PROJECT_IDENTITY_SECRET": os.urandom(32).hex(),
+                },
+            ),
+        ):
+            workspace = MagicMock()
+            workspace.invoke = AsyncMock(
+                side_effect=lambda name, data, timeout: perform(
+                    Path(directory), name, data
+                )
+            )
+            tools = WorkTools(workspace, execution)
+            invented = [
+                dict(file_id="https://example.test/fusion-report", version="1"),
+                dict(file_id="ITER fusion report", version="2026"),
+            ]
+            reply = asyncio.run(
+                tools.execute(
+                    Call(
+                        str(uuid4()),
+                        "publish_document",
+                        json.dumps(
+                            dict(
+                                path="fusion.md",
+                                content="# Fusion\n\nITER, see https://example.test/fusion-report.\n",
+                                sources=invented,
+                            )
+                        ),
+                    ),
+                    60,
+                )
+            )
+        self.assertNotIn("error", reply, reply)
+        self.assertIn(
+            "2 of the declared sources were not file identifiers", str(reply["note"])
+        )
+        self.assertEqual(tools.deliverables[-1]["source_version_ids"], [])
+
+
+class BoundedDeliverableTests(unittest.TestCase):
+    def test_trusted_builder_reopens_all_formats_and_refuses_missing_source_content(
+        self,
+    ) -> None:
+        from services.orchestrator.presentation_delivery import build_project_document
+
+        content = Content(
+            title="Expected title",
+            sections=(
+                Section(heading="Evidence", paragraphs=("Verified source quotation",)),
+            ),
+        )
+        for suffix in (".docx", ".xlsx", ".pptx", ".pdf"):
+            with self.subTest(suffix=suffix):
+                document = build_project_document(
+                    content,
+                    suffix,
+                    ["Verified source quotation"],
+                    max_bytes=16777216,
+                    timeout=20,
+                )
+                self.assertEqual(
+                    hashlib.sha256(document.content).hexdigest(), document.sha256
+                )
+                self.assertIn(b"Expected title", document.preview)
+                self.assertIn(b"Verified source quotation", document.preview)
+                self.assertEqual(
+                    reopen_artifact(document.content, suffix), document.preview
+                )
+        with self.assertRaisesRegex(ValueError, "verification failed"):
+            build_project_document(
+                content,
+                ".pdf",
+                ["Missing required source quotation"],
+                max_bytes=16777216,
+                timeout=20,
+            )
+        with self.assertRaisesRegex(ValueError, "verification failed"):
+            build_project_document(content, ".pdf", [], max_bytes=1, timeout=20)
+
+    def test_scoped_links_refuse_foreign_and_unverified_records(self) -> None:
+        from services.orchestrator.file_results import project_deliverable_links
+
+        value = json.loads(
+            Path("contracts/examples/project-mode/Deliverable.valid.json").read_text()
+        )
+        value["validation"]["verifier_exit"] = 0
+        value["validation"]["artifact_sha256"] = value["sha256"]
+        prefix = f"/api/atlas/orgs/{value['org_id']}/projects/{value['project_id']}/deliverables/{value['id']}"
+        value["download_route"] = prefix + "/download"
+        links = project_deliverable_links(value, value["org_id"], value["project_id"])
+        self.assertIn(prefix + "/preview", links)
+        for bad in (
+            dict(value, project_id=str(uuid4())),
+            dict(value, download_route="/api/v1/terminals/anything"),
+            dict(value, validation=dict(value["validation"], status="failed")),
+        ):
+            with self.assertRaises(ValueError):
+                project_deliverable_links(bad, value["org_id"], value["project_id"])
+
+
+class LocalizedDeliverableLinkTests(unittest.TestCase):
+    def test_links_follow_the_answer_language_and_name_the_file(self) -> None:
+        from uuid import uuid4
+
+        from services.orchestrator.file_results import project_deliverable_links
+
+        org, project, identifier = str(uuid4()), str(uuid4()), str(uuid4())
+        prefix = f"/api/atlas/orgs/{org}/projects/{project}/deliverables/{identifier}"
+        receipt: dict[str, object] = {
+            "id": identifier,
+            "org_id": org,
+            "project_id": project,
+            "download_route": prefix + "/download",
+            "sha256": "a" * 64,
+            "validation": {
+                "status": "passed",
+                "verifier_exit": 0,
+                "artifact_sha256": "a" * 64,
+            },
+            "relative_path": "stats.py",
+        }
+        self.assertEqual(
+            project_deliverable_links(receipt, org, project, "fr"),
+            f"[Télécharger stats.py]({prefix}/download) · [Aperçu]({prefix}/preview)",
+        )
+        self.assertTrue(
+            project_deliverable_links(receipt, org, project).startswith(
+                "[Download stats.py]"
+            )
+        )
+
+    def test_a_route_the_answer_already_links_is_not_added_again(self) -> None:
+        from uuid import uuid4
+
+        from services.orchestrator.file_results import (
+            append_deliverable_links,
+            project_deliverable_links,
+        )
+
+        org, project, identifier = str(uuid4()), str(uuid4()), str(uuid4())
+        prefix = f"/api/atlas/orgs/{org}/projects/{project}/deliverables/{identifier}"
+        receipt: dict[str, object] = {
+            "id": identifier,
+            "org_id": org,
+            "project_id": project,
+            "download_route": prefix + "/download",
+            "sha256": "a" * 64,
+            "validation": {
+                "status": "passed",
+                "verifier_exit": 0,
+                "artifact_sha256": "a" * 64,
+            },
+            "relative_path": "letter.docx",
+        }
+        english = project_deliverable_links(receipt, org, project)
+        french = project_deliverable_links(receipt, org, project, "fr")
+
+        def add(answer: str, lang: str = "en") -> str:
+            return append_deliverable_links(answer, receipt, org, project, lang)
+
+        # No link in the answer: the full pair, as before.
+        self.assertEqual(add("Done."), "Done.\n\n" + english)
+        # The model repeated the download link in its own words: one download
+        # link in the answer, and the preview stays available.
+        own = f"Download: [Cover Letter]({prefix}/download)\n\nTo use it: edit."
+        answer = add(own)
+        self.assertEqual(answer, own + f"\n\n[Preview]({prefix}/preview)")
+        self.assertEqual(answer.count(prefix + "/download"), 1)
+        # Both links already there: nothing is added, also on a second pass.
+        self.assertEqual(add(answer), answer)
+        self.assertEqual(add("Done.\n\n" + english), "Done.\n\n" + english)
+        # A verbatim copy of the tool result takes the answer language.
+        self.assertEqual(add(english + "\n\nVoilà.", "fr"), french + "\n\nVoilà.")
+        # An invented host in front of the route is removed, not doubled.
+        hosted = f"[La lettre](https://files.example.org{prefix}/download)"
+        self.assertEqual(
+            add(hosted, "fr"),
+            f"[La lettre]({prefix}/download)\n\n[Aperçu]({prefix}/preview)",
+        )
+        # The link of another file does not count for this one.
+        other = f"[Other]({prefix[:-36]}{uuid4()}/download)"
+        self.assertEqual(add(other), other + "\n\n" + english)
+
+
+load_tests = own_tests.only_own(__name__)

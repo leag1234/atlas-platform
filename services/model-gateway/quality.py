@@ -1,0 +1,1223 @@
+"""M21 profiles share one ledger and at most one affordable recovery attempt."""
+
+from collections.abc import AsyncGenerator
+from contextlib import aclosing
+from decimal import Decimal, ROUND_FLOOR, ROUND_CEILING
+import json
+import asyncio
+import copy
+import logging
+import os
+import zlib
+from time import monotonic
+from pathlib import Path
+from math import ceil
+
+from agent_provider import AgentProvider, AgentRequest, Usage, classify
+from answer_content import (
+    ANSWER_NOW,
+    is_promise_only,
+    failed_terminal_content,
+    possible_promise_answer,
+    missing_file_failure,
+    strip_file_promises,
+)
+from packages.context_limit import ContextExceeded
+from provider_retry import (
+    ModelUnavailableError,
+    ProviderResponseError,
+    TransientProviderError,
+    unbilled,
+)
+from packages.limits import (
+    ProviderFailure,
+    keep_cost,
+    LimitError,
+    ProviderLimitError,
+    MalformedToolCall,
+)
+
+from packages.tool_history import (
+    final_messages,
+    is_history_answer,
+    possible_history_answer,
+)
+from packages.profiles import PROFILES
+from packages.evidence import estimated_tokens
+from packages.images import image_info
+from provider_settings import REASONING_EFFORTS
+from serverless import REASONING_OUTPUT_TOKENS, ServerlessPolicy, classify_task
+
+
+CONTEXT_TRUNCATION_MARKER = "\n[atlas: fetched page truncated to fit model context]\n"
+
+# Work steps contain source and tool output, which averages about three bytes
+# per token; other requests keep the conservative byte-for-token reservation.
+WORK_BYTES_PER_TOKEN = 3
+SHORT_CALL_TOKENS = 200
+
+# These calls are the requested work itself; switch_tool_group is offered at
+# every Work step.
+ACTION_TOOLS = frozenset(
+    {
+        "terminal_command",
+        "publish_document",
+        "edit_file",
+        "write_file",
+        "run_command",
+        "switch_tool_group",
+    }
+)
+
+# A call that keeps receiving output (answer, reasoning or tool arguments) is
+# not cut by its own deadline: each piece moves the deadline to at least this
+# many seconds later, up to the caller's progress_timeout. A call silent this
+# long still fails. On staging a Work step streaming its answer (3161 events,
+# 11385 characters) was cut at 120 s, twice (2026-11-13).
+PROGRESS_STALL_SECONDS = 60.0
+
+
+def made_progress(event: dict[str, object]) -> bool:
+    """True for any piece of model output: content, reasoning or tool arguments."""
+    if "tool_progress" in event or "tool_call" in event:
+        return True
+    delta = event.get("delta")
+    return isinstance(delta, dict) and any(
+        delta.get(key) for key in ("content", "reasoning_content")
+    )
+
+
+def keep_alive(deadline: asyncio.Timeout, bound: float) -> None:
+    """Never shorten the deadline; extend it past a silence window, up to bound."""
+    when = deadline.when()
+    target = min(bound, asyncio.get_running_loop().time() + PROGRESS_STALL_SECONDS)
+    if when is not None and target > when:
+        deadline.reschedule(target)
+
+
+def extend(deadline: asyncio.Timeout, target: float) -> None:
+    """Move the deadline to target unless progress already moved it further."""
+    when = deadline.when()
+    if when is None or target > when:
+        deadline.reschedule(target)
+
+
+def work_context_tokens() -> int:
+    """The input a Work step sends at most, in tokens (ATLAS_WORK_CONTEXT_TOKENS)."""
+    try:
+        value = int(os.environ.get("ATLAS_WORK_CONTEXT_TOKENS", "64000"))
+    except ValueError:
+        value = 64000
+    return max(16000, value)
+
+
+def trim_fetched_pages(
+    messages: list[dict[str, object]],
+    tools: list[dict[str, object]],
+    maximum: int,
+) -> list[dict[str, object]]:
+    """Retain a marked prefix of the largest fetched pages within the model limit."""
+    trimmed = copy.deepcopy(messages)
+    fetches: set[str] = set()
+    for message in trimmed:
+        calls = message.get("tool_calls")
+        if not isinstance(calls, list):
+            continue
+        for call in calls:
+            if not isinstance(call, dict):
+                continue
+            function = call.get("function")
+            if (
+                isinstance(function, dict)
+                and function.get("name") == "web_fetch"
+                and isinstance(call.get("id"), str)
+            ):
+                fetches.add(call["id"])
+    pages: list[tuple[int, str]] = []
+    for index, message in enumerate(trimmed):
+        if message.get("role") != "tool" or message.get("tool_call_id") not in fetches:
+            continue
+        content = message.get("content")
+        if not isinstance(content, str):
+            continue
+        try:
+            output = json.loads(content)
+        except json.JSONDecodeError:
+            continue
+        data = output.get("data") if isinstance(output, dict) else None
+        if isinstance(data, dict) and isinstance(data.get("text"), str):
+            pages.append((index, data["text"]))
+    for index, text in sorted(pages, key=lambda page: len(page[1]), reverse=True):
+        while input_bound(trimmed, tools) > maximum:
+            content = trimmed[index]["content"]
+            assert isinstance(content, str)
+            output = json.loads(content)
+            assert isinstance(output, dict)
+            data = output["data"]
+            assert isinstance(data, dict)
+            current = str(data["text"])
+            retained_text = current.removesuffix(CONTEXT_TRUNCATION_MARKER)
+            if not retained_text:
+                break
+            excess = input_bound(trimmed, tools) - maximum
+            retained = max(0, len(retained_text) - excess)
+            data["text"] = retained_text[:retained] + CONTEXT_TRUNCATION_MARKER
+            data["truncated"] = True
+            data["context_truncated"] = True
+            trimmed[index]["content"] = json.dumps(output, ensure_ascii=False)
+        if input_bound(trimmed, tools) <= maximum:
+            break
+    return trimmed
+
+
+def output_shape(text: str) -> dict[str, object]:
+    """Shape of a cut-off answer for diagnosis: counts only, never the text."""
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    counts: dict[str, int] = {}
+    for line in lines:
+        counts[line] = counts.get(line, 0) + 1
+    return {
+        "lines": len(lines),
+        "distinct_lines": len(counts),
+        "top_line_repeats": max(counts.values(), default=0),
+        "tail_distinct_chars": len(set(text[-2000:])),
+        "tail_compression": round(
+            len(zlib.compress(text[-2000:].encode()))
+            / max(1, len(text[-2000:].encode())),
+            3,
+        ),
+        "tail_words": len(tail_words := text[-2000:].split()),
+        "tail_distinct_words": len(set(tail_words)),
+        "head_distinct_words_ratio": round(
+            len(set(head_words := text[:2000].split())) / max(1, len(head_words)), 3
+        ),
+        "digits_ratio": round(
+            sum(c.isdigit() for c in text[-2000:]) / max(1, len(text[-2000:])), 3
+        ),
+        "tool_markup": any(
+            mark in text
+            for mark in ("<tool_call", "</tool_call", '"name": "web_', "<|")
+        ),
+    }
+
+
+def repetitive(window: str, ratio: float = 0.2) -> bool:
+    """A window of generated text that compresses like a loop, not like prose."""
+    data = window.encode()
+    return len(zlib.compress(data)) < ratio * len(data)
+
+
+def repetition_cut(text: str) -> str | None:
+    """Clean prefix of an answer that ended in a repetition loop, or None.
+
+    The code model sometimes repeats a short pattern until max_tokens (2026-11-02: 4 of 18 short
+    factual answers, 24 to 29 thousand characters). The looping tail compresses far better than
+    prose; the answer written before it is kept.
+    """
+
+    compact = repetitive
+    size = 500
+    if len(text) < 4 * size or not compact(text[-size:]):
+        return None
+    start = len(text) - size
+    while start >= size and compact(text[start - size : start]):
+        start -= size
+    head = text[:start]
+    boundary = max(head.rfind("\n"), head.rfind(". "), head.rfind("。"))
+    if boundary >= len(head) - size:
+        head = head[: boundary + 1]
+    head = head.rstrip()
+    return head if len(head) >= 40 else None
+
+
+def input_bound(
+    messages: list[dict[str, object]], tools: list[dict[str, object]]
+) -> int:
+    normalized = copy.deepcopy(messages)
+    pixel_tokens = count = byte_count = pixels = 0
+    for message in normalized:
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, dict) or part.get("type") != "image_url":
+                continue
+            image = part.get("image_url")
+            if not isinstance(image, dict) or not isinstance(image.get("url"), str):
+                raise ValueError("invalid_image")
+            info = image_info(image["url"])
+            width, height = int(info["width"]), int(info["height"])
+            pixel_tokens += ((width + 15) // 16 + 1) * ((height + 15) // 16) + 1
+            count += 1
+            byte_count += int(info["bytes"])
+            pixels += width * height
+            image["url"] = "[image]"
+    for measured, maximum, unit in (
+        (count, 4, "images"),
+        (byte_count, 4 * 1024 * 1024, "bytes"),
+        (pixels, 16000000, "pixels"),
+    ):
+        if measured > maximum:
+            raise LimitError("image_size_exceeded", measured, maximum, unit)
+    # Reserve the larger representation before I/O, including answer-only JSON
+    # escaping. Tool schemas are retained in this bound even if not transmitted.
+    return (
+        max(
+            len(
+                json.dumps(
+                    {"messages": value, "tools": tools}, ensure_ascii=False
+                ).encode()
+            )
+            for value in (normalized, final_messages(normalized))
+        )
+        + 256
+        + pixel_tokens
+        + (1024 if count else 0)
+    )
+
+
+def work_step(tools: list[dict[str, object]]) -> bool:
+    return any(
+        isinstance(function := tool.get("function"), dict)
+        and function.get("name") == "switch_tool_group"
+        for tool in tools
+    )
+
+
+def profile_candidates(
+    policy: ServerlessPolicy, profile: str, default_role: str
+) -> list[str]:
+    roles = [policy.profile_roles.get(profile, default_role)]
+    if profile not in policy.hidden_profiles:
+        roles.extend(policy.public_profiles.values())
+    return list(dict.fromkeys(roles))
+
+
+async def complete(provider: AgentProvider, request: AgentRequest) -> dict[str, object]:
+    async with aclosing(
+        stream_quality(provider, request, complete_response=True)
+    ) as events:
+        async for event in events:
+            result = event.get("result")
+            if isinstance(result, dict):
+                return result
+    raise RuntimeError("provider_response_invalid")
+
+
+async def stream_quality(
+    provider: AgentProvider, request: AgentRequest, *, complete_response: bool = False
+) -> AsyncGenerator[dict[str, object], None]:
+    from stream_transport import attempt, response_window
+
+    policy = ServerlessPolicy()
+    task = classify_task(request.messages)
+    role = (
+        request.vision_role
+        if task == "vision"
+        else policy.profile_roles.get(request.profile or "", task)
+    )
+    primary = policy.models[role]
+    fallback_role = policy.config[role]["fallback"]
+    budget = Decimal(request.budget_eur or "0.10")
+    if work_step(request.tools):
+        # Fetched pages used to reach the step that writes a document whole, up
+        # to the model context: about 290k tokens per call for a researched
+        # report, over 100 s before the first token under load, the call cut
+        # and the document never delivered (staging 2026-11-12). A Work step
+        # reads at most ATLAS_WORK_CONTEXT_TOKENS of page text; the longest
+        # pages keep a marked prefix, as when the model context is reached.
+        limit = work_context_tokens() * WORK_BYTES_PER_TOKEN
+        if input_bound(request.messages, request.tools) > limit:
+            messages = trim_fetched_pages(request.messages, request.tools, limit)
+            if messages != request.messages:
+                request = request.model_copy(update={"messages": messages})
+                logging.getLogger(__name__).info(
+                    json.dumps(
+                        {
+                            "event": "work_context_trimmed",
+                            "bytes": input_bound(request.messages, request.tools),
+                            "limit": limit,
+                        }
+                    )
+                )
+    input_bytes = input_bound(request.messages, request.tools)
+    incoming = (
+        ceil(input_bytes / WORK_BYTES_PER_TOKEN)
+        if work_step(request.tools)
+        else input_bytes
+    )
+    spent = Decimal(0)
+    prompt_tokens = completion_tokens = trace_tokens = answer_tokens = 0
+    retry_completion_tokens = 0
+    reasoning = ""
+    estimated = retried = fallback = False
+    started = monotonic()
+    current = request
+    model = primary
+    malformed_name: MalformedToolCall | None = None
+    # The failure that sent this call to its recovery attempt, if any.
+    failure: tuple[BaseException, int] | None = None
+
+    def given_up(exc: BaseException, index: int) -> BaseException:
+        """What a failed attempt without recovery reports: the failure itself."""
+        if malformed_name is not None and not isinstance(exc, LimitError):
+            return MalformedToolCall(malformed_name.measured, index)
+        if isinstance(exc, (TimeoutError, LimitError)):
+            return exc
+        return ProviderFailure(str(exc), getattr(exc, "finish_reason", None), index)
+
+    def recovery_unaffordable(measured: Decimal) -> BaseException | None:
+        """A provider failure is never reported as a budget refusal.
+
+        When the recovery of a failed attempt no longer fits the call budget,
+        the call failed because the provider failed: it reports that failure
+        (provider_failure, timeout), never cost_budget (the mirror of D5).
+        """
+        if failure is None:
+            return None
+        logging.getLogger(__name__).warning(
+            json.dumps(
+                {
+                    "event": "quality_recovery_unaffordable",
+                    "measured_microeur": int(
+                        (measured * 1_000_000).to_integral_value(rounding=ROUND_CEILING)
+                    ),
+                    "limit_microeur": int(
+                        (budget * 1_000_000).to_integral_value(rounding=ROUND_FLOOR)
+                    ),
+                    "spent_eur": str(spent),
+                }
+            )
+        )
+        return given_up(*failure)
+
+    def select_affordable_model() -> None:
+        nonlocal role, model, fallback_role, fallback
+        alternate = policy.models[fallback_role]
+        if request.single_attempt:
+            return
+        if policy.cost(model, incoming, 1) > budget:
+            selected = None
+            if policy.cost(alternate, incoming, 1) <= budget:
+                selected = fallback_role
+            elif task != "vision":
+                # Preserve complete attachment context when both configured expert
+                # roles exceed the cap. Only already configured public text roles are
+                # eligible; no input sampling or larger cost allowance is permitted.
+                affordable_roles = [
+                    candidate
+                    for candidate in profile_candidates(
+                        policy, request.profile or "", task
+                    )
+                    if incoming + 1
+                    <= policy.config[candidate]["capabilities"][
+                        policy.models[candidate]
+                    ]["context"]
+                    and policy.cost(policy.models[candidate], incoming, 1) <= budget
+                ]
+                if affordable_roles:
+                    selected = min(
+                        affordable_roles,
+                        key=lambda candidate: policy.cost(
+                            policy.models[candidate], incoming, request.max_tokens
+                        ),
+                    )
+                    fallback_role = policy.config[selected]["fallback"]
+            if selected is not None:
+                role, model = selected, policy.models[selected]
+                fallback = True
+                logging.getLogger(__name__).info(
+                    json.dumps(
+                        {
+                            "event": "quality_affordable_alternate",
+                            "budget_eur": str(budget),
+                        }
+                    )
+                )
+
+    select_affordable_model()
+    # Research is optional once another selection turn plus the full-context
+    # answer no longer fit. Keep all acquired evidence and the selected effort.
+    # File operations are the requested deliverable, so an answer-only turn
+    # cannot substitute for them. Each attempt still reserves its full bound
+    # below; lacking funds must stop explicitly rather than promise a file.
+    file_tools = any(
+        isinstance(function := tool.get("function"), dict)
+        and function.get("name") in ACTION_TOOLS
+        for tool in request.tools
+    )
+    terminal_failed = any(
+        m.get("role") == "tool"
+        and '"terminal_operation_failed"' in str(m.get("content", ""))
+        for m in request.messages
+    )
+    evidence_without_tools = not request.tools and any(
+        message.get("role") == "tool" for message in request.messages
+    )
+    if (
+        terminal_failed
+        or evidence_without_tools
+        or (
+            request.tools
+            and not file_tools
+            and (
+                policy.cost(model, incoming, request.max_tokens)
+                + policy.cost(model, incoming, 3000)
+                > budget
+            )
+        )
+    ):
+        request = request.model_copy(
+            update={
+                "tool_choice": "none",
+                # Research finalization presupposes acquired evidence. Before
+                # any tool result, preserve the original task and disposition.
+                "messages": [
+                    *(
+                        final_messages(request.messages)
+                        if terminal_failed
+                        else request.messages
+                    ),
+                    *(
+                        [
+                            {
+                                "role": "system",
+                                "content": Path(
+                                    "prompts/file-failure.txt"
+                                    if any(
+                                        m.get("role") == "tool"
+                                        and '"terminal_operation_failed"'
+                                        in str(m.get("content", ""))
+                                        for m in request.messages
+                                    )
+                                    else "prompts/budget-answer.txt"
+                                ).read_text()
+                                + ("\n" + ANSWER_NOW if terminal_failed else ""),
+                            }
+                        ]
+                        if any(m.get("role") == "tool" for m in request.messages)
+                        else []
+                    ),
+                ],
+            }
+        )
+        current = request
+        input_bytes = input_bound(request.messages, request.tools)
+        incoming = (
+            ceil(input_bytes / WORK_BYTES_PER_TOKEN)
+            if work_step(request.tools)
+            else input_bytes
+        )
+        logging.getLogger(__name__).info(
+            json.dumps({"event": "quality_answer_budget", "remaining_eur": str(budget)})
+        )
+    # Finalization instructions may invalidate the initial affordability check.
+    select_affordable_model()
+    for index in range(2):
+        elapsed = monotonic() - started
+        remaining = request.timeout - elapsed
+        if remaining <= 0:
+            if malformed_name is not None:
+                raise MalformedToolCall(malformed_name.measured, index) from None
+            raise TimeoutError("timeout")
+        # How long an attempt still receiving output may run: the caller's own
+        # time left, never less than this request's deadline.
+        active = max(request.timeout, request.progress_timeout or 0) - elapsed
+        active_deadline = asyncio.get_running_loop().time() + active
+        # Retain room for one bounded recovery, not all future tool turns.
+        # Actual cost is reserved immediately before each transport call.
+        recovery = (
+            policy.cost(policy.models[fallback_role], incoming, 1000)
+            if index == 0 and not request.single_attempt
+            else Decimal(0)
+        )
+        if (
+            index == 0
+            and request.profile == PROFILES[0]
+            and recovery + policy.cost(model, incoming, current.max_tokens)
+            > budget - spent
+        ):
+            recovery = Decimal(0)
+        if recovery + policy.cost(model, incoming, 1) > budget - spent:
+            recovery = Decimal(0)
+        if (
+            index
+            or policy.cost(model, incoming, current.max_tokens)
+            > budget - spent - recovery
+        ):
+            available = budget - spent - recovery - policy.cost(model, incoming, 0)
+            price = policy.cost(model, 0, 1)
+            affordable = (
+                int((available / price).to_integral_value(rounding=ROUND_FLOOR))
+                if price
+                else 3000
+            )
+            if affordable < 1:
+                if (
+                    abandoned := recovery_unaffordable(
+                        spent + recovery + policy.cost(model, incoming, 1)
+                    )
+                ) is not None:
+                    raise abandoned from None
+                raise ProviderLimitError(
+                    "cost_budget",
+                    int(
+                        (policy.cost(model, incoming, 1) * 1_000_000).to_integral_value(
+                            rounding=ROUND_CEILING
+                        )
+                    ),
+                    int(
+                        ((budget - spent) * 1_000_000).to_integral_value(
+                            rounding=ROUND_FLOOR
+                        )
+                    ),
+                    "microEUR",
+                )
+            current = request.model_copy(
+                update={
+                    "max_tokens": min(
+                        3000 if index else request.max_tokens, affordable
+                    ),
+                    "reasoning_effort": "none" if index else request.reasoning_effort,
+                }
+            )
+        # Configured reasoning applies to the first attempt only. Any recovery
+        # (empty or truncated answer, provider failure) and every later turn of a
+        # recovered answer run without reasoning, within the 3000-token bound.
+        current = current.model_copy(
+            update={
+                "reasoning_effort": "none"
+                if index or request.reasoning_disabled
+                else min(
+                    policy.efforts.get(model, "none"),
+                    request.reasoning_ceiling or "high",
+                    key=REASONING_EFFORTS.index,
+                )
+            }
+        )
+        if current.reasoning_effort != "none":
+            # Reasoning tokens count against max_tokens: without extra room a long
+            # document can spend the whole budget thinking and be cut mid-answer,
+            # after streaming started, where no retry is possible (2026-11-04).
+            # Widen only within the context and the cost budget, never refusing a
+            # turn that fitted before, and only while the bounded 3000-token
+            # recovery stays affordable: a widened attempt can end empty with
+            # finish_reason=length after spending all of it on reasoning.
+            widened = min(
+                current.max_tokens + REASONING_OUTPUT_TOKENS[current.reasoning_effort],
+                policy.config[role]["capabilities"][model]["context"] - incoming,
+            )
+            if (
+                widened > current.max_tokens
+                and spent
+                + policy.cost(model, incoming, widened)
+                + (
+                    Decimal(0)
+                    if request.single_attempt
+                    else policy.cost(model, incoming, 3000)
+                )
+                <= budget
+            ):
+                current = current.model_copy(update={"max_tokens": widened})
+        reserved = policy.cost(model, incoming, current.max_tokens)
+        if spent + reserved > budget:
+            if (abandoned := recovery_unaffordable(spent + reserved)) is not None:
+                raise abandoned from None
+            raise ProviderLimitError(
+                "cost_budget",
+                int(
+                    ((spent + reserved) * 1_000_000).to_integral_value(
+                        rounding=ROUND_CEILING
+                    )
+                ),
+                int((budget * 1_000_000).to_integral_value(rounding=ROUND_FLOOR)),
+                "microEUR",
+            )
+        capabilities = policy.config[role]["capabilities"][model]
+        if incoming + current.max_tokens > capabilities["context"]:
+            messages = trim_fetched_pages(
+                request.messages,
+                request.tools,
+                capabilities["context"] - current.max_tokens,
+            )
+            if messages != request.messages:
+                request = request.model_copy(update={"messages": messages})
+                current = current.model_copy(update={"messages": messages})
+                input_bytes = input_bound(request.messages, request.tools)
+                incoming = (
+                    ceil(input_bytes / WORK_BYTES_PER_TOKEN)
+                    if work_step(request.tools)
+                    else input_bytes
+                )
+                logging.getLogger(__name__).info(
+                    json.dumps(
+                        {
+                            "event": "research_context_trimmed",
+                            "incoming": incoming,
+                            "context": capabilities["context"],
+                        }
+                    )
+                )
+            if incoming + current.max_tokens > capabilities["context"]:
+                raise ContextExceeded(
+                    incoming + current.max_tokens, capabilities["context"]
+                )
+        # Track the pre-validation streaming decision separately from withholding
+        # tool-enabled text. Only malformed names may undo that decision.
+        answer_started = False
+        answer_emitted = False
+        streamed, checked, looping, held_from = "", 0, False, 0
+        held_content: list[dict[str, object]] = []
+        buffered: list[dict[str, object]] = []
+        prefix = ""
+        prefix_open = True
+        partial_reasoning = ""
+        # Counts of what an attempt received, for a cut attempt's log line.
+        progress_chars = 0
+        event_count = 0
+        started_call = ""
+        result: dict[str, object] | None = None
+        # Reserve time for recovery, still under the original request deadline.
+        # A short call (a routing decision, a title: at most SHORT_CALL_TOKENS of
+        # output) keeps no recovery reserve: retrying the same slow provider
+        # with the rest gave nothing, while one attempt with the whole budget
+        # usually answers (staging 2026-11-13: first token between 0.4 and 6.6 s,
+        # first attempts cut at 1.2 to 4 s).
+        # A single_attempt call has no recovery to reserve time for: it gets the
+        # whole deadline (a painter draft reasoning for 40 s or more was cut at
+        # half of it, then dropped without any retry; 2026-11-14).
+        short = current.max_tokens <= SHORT_CALL_TOKENS
+        allotted = (
+            remaining * (0.5 if complete_response else 0.8)
+            if index == 0 and not short and not request.single_attempt
+            else remaining
+        )
+        full_deadline = asyncio.get_running_loop().time() + remaining
+        try:
+            async with (
+                response_window(max(remaining, active)),
+                asyncio.timeout(allotted) as deadline,
+                aclosing(attempt(current, model, allotted)) as events,
+            ):
+                async for event in events:
+                    terminal = event.get("result")
+                    if isinstance(terminal, dict):
+                        result = terminal
+                        break
+                    event_count += 1
+                    if made_progress(event):
+                        keep_alive(deadline, active_deadline)
+                    if "tool_call" in event:
+                        started_call = str(event["tool_call"])
+                        # The requested work (a document, a file, a command)
+                        # is being written as tool arguments, which the
+                        # provider may send only once complete: a researched
+                        # report stayed silent for 110 s after its first
+                        # arguments (staging provider, 2026-11-13), was cut at the
+                        # recovery share and failed. It keeps the original
+                        # deadline, as a long call in progress does below.
+                        if started_call in ACTION_TOOLS:
+                            extend(deadline, full_deadline)
+                        continue
+                    if "tool_progress" in event:
+                        progress_chars = int(str(event["tool_progress"]) or 0)
+                        # A long tool call is being written. Cutting it at the
+                        # recovery share would only restart the same generation,
+                        # with less time and the first attempt's budget gone: a
+                        # researched document was cut at 60 s and at 120 s, then
+                        # refused on cost (staging 2026-11-10). It keeps the
+                        # original deadline; the event is internal.
+                        extend(deadline, full_deadline)
+                        continue
+                    delta = event.get("delta")
+                    if isinstance(delta, dict):
+                        if isinstance(delta.get("reasoning_content"), str):
+                            partial_reasoning += str(delta["reasoning_content"])
+                    if isinstance(delta, dict) and delta.get("content"):
+                        # Stop forwarding a repetition loop; the final text is trimmed below.
+                        streamed += str(delta["content"])
+                        if not looping and len(streamed) >= checked + 250:
+                            checked = len(streamed)
+                            if checked >= 2000 and repetitive(streamed[-1000:], 0.1):
+                                looping, held_from = (
+                                    True,
+                                    checked - len(str(delta["content"])),
+                                )
+                        if looping:
+                            if len(streamed) - held_from >= 8000 and repetitive(
+                                streamed[-1000:], 0.1
+                            ):
+                                # Confirmed loop (measured loops run 25 to 29 thousand
+                                # characters; a regular table rarely repeats identically
+                                # this long): close the provider stream instead of
+                                # reading it to max_tokens. Its usage is unknown, so the
+                                # full reservation is billed, as for any interrupted
+                                # attempt; the text is trimmed below like a length stop.
+                                result = {
+                                    "text": streamed,
+                                    "calls": [],
+                                    "usage": {
+                                        "prompt_tokens": incoming,
+                                        "completion_tokens": current.max_tokens,
+                                    },
+                                    "finish_reason": "length",
+                                    "reasoning": partial_reasoning,
+                                    "reasoning_tokens": None,
+                                }
+                                estimated = True
+                                logging.getLogger(__name__).warning(
+                                    json.dumps(
+                                        {
+                                            "event": "repetition_stopped",
+                                            "streamed_chars": len(streamed),
+                                            "max_tokens": current.max_tokens,
+                                            "attempt": index + 1,
+                                        }
+                                    )
+                                )
+                                break
+                            continue
+                        if current.max_tokens < request.max_tokens or terminal_failed:
+                            buffered.append(event)
+                            continue
+                        if prefix_open:
+                            prefix += str(delta["content"])
+                            buffered.append(event)
+                            if possible_history_answer(
+                                prefix
+                            ) or possible_promise_answer(prefix):
+                                continue
+                            prefix_open = False
+                            # Answers that are already visible or held cannot be
+                            # retried. Let this attempt use the original deadline
+                            # instead of cancelling it early to reserve time for
+                            # an ineligible recovery.
+                            extend(deadline, full_deadline)
+                            for pending_event in buffered:
+                                if current.tools and not answer_emitted:
+                                    held_content.append(pending_event)
+                                else:
+                                    yield pending_event
+                                    answer_emitted = True
+                            buffered.clear()
+                        elif current.tools and not answer_emitted:
+                            held_content.append(event)
+                        else:
+                            yield event
+                            answer_emitted = True
+                        answer_started = True
+                        # Keep a short preamble recoverable if a malformed tool
+                        # name follows it, without withholding the entire answer.
+                        # Once visible, a late provider error must stop, not retry.
+                        if (
+                            sum(
+                                len(str(held_delta.get("content", "")))
+                                for part in held_content
+                                if isinstance(held_delta := part.get("delta"), dict)
+                            )
+                            > 128
+                        ):
+                            for pending_event in held_content:
+                                yield pending_event
+                            held_content.clear()
+                            answer_emitted = True
+                        continue
+                    yield event
+            if result is None:
+                raise RuntimeError("provider_response_invalid")
+        except ProviderLimitError:
+            for event in held_content:
+                yield event
+            raise
+        except ProviderResponseError:
+            raise
+        except (RuntimeError, TimeoutError, LimitError) as exc:
+            if isinstance(exc, ModelUnavailableError) and task != "code":
+                raise
+            if isinstance(exc, MalformedToolCall):
+                malformed_name = exc
+                if current.tools and not answer_emitted:
+                    answer_started = False
+            else:
+                for event in held_content:
+                    yield event
+            # Invalid provider fields are recoverable output failures. Keep the
+            # same decoder limits and charge the unknown attempt in full.
+            # Request/output budgets must never enter this recovery path.
+            if isinstance(exc, LimitError) and exc.code not in {
+                "provider_response_limit",
+                "tool_limit",
+            }:
+                raise
+            failed_usage = (
+                exc.usage if isinstance(exc, TransientProviderError) else None
+            )
+            # Charging rule: provider_retry.unbilled. Reported usage is charged;
+            # an attempt the provider refused before running it (or never
+            # received) costs nothing and keeps no reservation; any other
+            # failure keeps its full reservation.
+            charge = (
+                "measured"
+                if failed_usage is not None
+                else "none"
+                if unbilled(exc)
+                else "reservation"
+            )
+            if failed_usage is not None:
+                if (
+                    failed_usage.prompt_tokens > input_bytes
+                    or failed_usage.completion_tokens > current.max_tokens
+                ):
+                    raise RuntimeError("provider_usage_exceeds_reservation") from None
+                spent += policy.cost(
+                    model,
+                    failed_usage.prompt_tokens,
+                    failed_usage.completion_tokens,
+                )
+                prompt_tokens += failed_usage.prompt_tokens
+                completion_tokens += failed_usage.completion_tokens
+                retry_completion_tokens += failed_usage.completion_tokens
+            elif charge == "reservation":
+                spent += reserved
+                prompt_tokens += incoming
+                completion_tokens += current.max_tokens
+                retry_completion_tokens += current.max_tokens
+                estimated = True
+            # Keep the trace actually shown before an interrupted attempt.
+            # Its token count is estimated; unknown billing stays fully reserved.
+            reasoning += partial_reasoning
+            trace_tokens += estimated_tokens(partial_reasoning)
+            logging.getLogger(__name__).warning(
+                json.dumps(
+                    {
+                        "event": "quality_attempt_failed",
+                        "category": "malformed_tool_call"
+                        if isinstance(exc, MalformedToolCall)
+                        else "timeout"
+                        if isinstance(exc, TimeoutError)
+                        else "model_unavailable"
+                        if isinstance(exc, ModelUnavailableError)
+                        else "provider",
+                        "attempt": index + 1,
+                        "elapsed_seconds": round(monotonic() - started, 3),
+                        "reserved_unknown_eur": str(spent),
+                        "final_usage_measured": failed_usage is not None,
+                        "attempt_charge": charge,
+                        "visible_content": answer_started,
+                        # Lengths only, never text: what the cut attempt had
+                        # received (staging 2026-11-12, researched reports cut
+                        # after 90-107 s with no visible content).
+                        "events": event_count,
+                        "reasoning_chars": len(partial_reasoning),
+                        "content_chars": len(streamed),
+                        "tool_progress_chars": progress_chars,
+                        "tool_call": started_call,
+                    }
+                )
+            )
+            if (
+                index
+                or request.single_attempt
+                or (answer_started and not complete_response)
+                or (
+                    bool(os.environ.get("ATLAS_PROVIDER"))
+                    and model == policy.models[fallback_role]
+                )
+            ):
+                # The failure reports what this call kept (the reservation of an
+                # attempt cut in flight), read back by the caller's report.
+                abandoned = keep_cost(given_up(exc, index), spent)
+                if abandoned is exc:
+                    raise
+                raise abandoned from None
+            failure = (exc, index)
+            role = fallback_role
+            model = policy.models[role]
+            fallback = True
+            retried = False
+            if isinstance(exc, MalformedToolCall):
+                # Keep the original history and its reservation; the rejected
+                # name is never sent back. No additional retry is introduced.
+                request = request.model_copy(update={"tool_choice": "none"})
+            yield {"phase": "reasoning_fallback" if retried else "provider_fallback"}
+            continue
+        for event in held_content:
+            yield event
+        if malformed_name is not None and result.get("ignored_calls"):
+            raise MalformedToolCall(malformed_name.measured, index)
+        usage = Usage.model_validate(result["usage"])
+        if (
+            usage.prompt_tokens > input_bytes
+            or usage.completion_tokens > current.max_tokens
+        ):
+            raise RuntimeError("provider_usage_exceeds_reservation")
+        spent += policy.cost(model, usage.prompt_tokens, usage.completion_tokens)
+        prompt_tokens += usage.prompt_tokens
+        completion_tokens += usage.completion_tokens
+        trace = str(result.get("reasoning", ""))
+        reasoning += trace
+        count = result.get("reasoning_tokens")
+        if type(count) is not int:
+            estimated |= bool(trace)
+            count = (
+                max(
+                    0,
+                    usage.completion_tokens
+                    - estimated_tokens(str(result.get("text", ""))),
+                )
+                if trace
+                else 0
+            )
+        trace_tokens += count
+        answer_tokens += usage.completion_tokens - count
+        malformed_arguments = False
+        calls = result.get("calls")
+        if isinstance(calls, list):
+            for call in calls:
+                if isinstance(call, dict):
+                    try:
+                        arguments = json.loads(str(call.get("arguments", "")))
+                        malformed_arguments |= not isinstance(arguments, dict)
+                    except ValueError:
+                        malformed_arguments = True
+        if malformed_arguments:
+            logging.getLogger(__name__).warning(
+                json.dumps({"event": "invalid_tool_arguments", "attempt": index + 1})
+            )
+            if index or answer_started:
+                if malformed_name is not None:
+                    raise MalformedToolCall(malformed_name.measured, index)
+                raise RuntimeError("invalid_tool_arguments")
+        malformed = is_history_answer(str(result.get("text", "")))
+        if malformed:
+            logging.getLogger(__name__).warning(
+                json.dumps(
+                    {
+                        "event": "unexpected_tool_history_answer",
+                        "content_chars": len(str(result.get("text", ""))),
+                        "completion_tokens": usage.completion_tokens,
+                        "attempt": index + 1,
+                    }
+                )
+            )
+            if index or answer_started:
+                if malformed_name is not None:
+                    raise MalformedToolCall(malformed_name.measured, index)
+                # A named provider failure, never an opaque one (D5; staging
+                # 2026-11-17: the person read "an unexpected error").
+                raise ProviderFailure(
+                    "unexpected_tool_history_answer",
+                    str(result.get("finish_reason")),
+                    index,
+                )
+        future_action = (
+            terminal_failed
+            and not calls
+            and (
+                strip_file_promises(str(result.get("text", "")))
+                != result.get("text", "")
+            )
+        )
+        if future_action and index:
+            # The single retry is exhausted. Only validated substantive content
+            # and the failure disclosure may survive; no rejected delta escapes.
+            result["text"] = strip_file_promises(str(result["text"]))
+            buffered = [{"delta": {"content": result["text"]}}]
+            future_action = False
+        invalid_content = terminal_failed and failed_terminal_content(
+            str(result.get("text", "")), request.messages
+        )
+        promise_only = not calls and (
+            is_promise_only(str(result.get("text", "")))
+            or invalid_content
+            or future_action
+        )
+        missing_failure = (
+            terminal_failed
+            and not calls
+            and missing_file_failure(str(result.get("text", "")))
+        )
+        delivery_error = (
+            "promise_only_final_answer" if promise_only else "missing_file_failure"
+        )
+        if promise_only or missing_failure:
+            logging.getLogger(__name__).warning(
+                json.dumps({"event": delivery_error, "attempt": index + 1})
+            )
+            if index or answer_started:
+                raise ProviderFailure(
+                    delivery_error, str(result.get("finish_reason")), index
+                )
+            request = request.model_copy(
+                update={
+                    "tool_choice": "none",
+                    "messages": [
+                        *request.messages,
+                        {
+                            "role": "system",
+                            "content": (
+                                str(request.messages[-1]["content"])
+                                if terminal_failed
+                                else ANSWER_NOW
+                            )
+                            + (
+                                " The last response was rejected: deliver the content itself, "
+                                "not document-generation code, intentions, or an apology. "
+                                "Keep only a brief failure disclosure before the requested content. "
+                                "Remove EVERY sentence promising a future file action or retry, "
+                                "even when the rest of the answer already contains useful content."
+                                if terminal_failed
+                                else ""
+                            ),
+                        },
+                    ],
+                }
+            )
+            input_bytes = input_bound(request.messages, request.tools)
+            incoming = (
+                ceil(input_bytes / WORK_BYTES_PER_TOKEN)
+                if work_step(request.tools)
+                else input_bytes
+            )
+        incomplete = result.get("finish_reason") == "length"
+        trimmed = False
+        if incomplete:
+            logging.getLogger(__name__).warning(
+                json.dumps(
+                    {
+                        "event": "provider_output_incomplete",
+                        "finish_reason": "length",
+                        "completion_tokens": usage.completion_tokens,
+                        "max_tokens": current.max_tokens,
+                        "content_chars": len(str(result.get("text", ""))),
+                        "attempt": index + 1,
+                        **output_shape(str(result.get("text", ""))),
+                    }
+                )
+            )
+            clean = (
+                None
+                if result.get("calls")
+                else repetition_cut(str(result.get("text", "")))
+            )
+            if clean is not None:
+                logging.getLogger(__name__).warning(
+                    json.dumps(
+                        {
+                            "event": "repetition_trimmed",
+                            "kept_chars": len(clean),
+                            "dropped_chars": len(str(result["text"])) - len(clean),
+                            "attempt": index + 1,
+                        }
+                    )
+                )
+                result = dict(result, text=clean, finish_reason="stop")
+                incomplete, trimmed = False, True
+            elif index or answer_started or request.single_attempt:
+                if malformed_name is not None:
+                    raise MalformedToolCall(malformed_name.measured, index)
+                if index and (not str(result.get("text", "")).strip()):
+                    raise ProviderFailure(
+                        "empty_content_after_retry",
+                        str(result.get("finish_reason")),
+                        index,
+                    )
+                raise ProviderFailure(
+                    "incomplete_provider_answer",
+                    str(result.get("finish_reason")),
+                    index,
+                )
+        # Empty terminal responses retain validated billing, then get one retry.
+        if (
+            promise_only
+            or missing_failure
+            or malformed
+            or malformed_arguments
+            or incomplete
+            or (not str(result.get("text", "")).strip() and not result.get("calls"))
+        ):
+            if index or request.single_attempt:
+                if malformed_name is not None:
+                    raise MalformedToolCall(malformed_name.measured, index)
+                raise ProviderFailure(
+                    "empty_content_after_retry", str(result.get("finish_reason")), index
+                )
+            # A large evidence input may no longer fit the original provider's
+            # conservative reservation. Try the configured alternate before
+            # rejecting a recovery that still fits the same request ledger.
+            alternate = policy.models[fallback_role]
+            if trace.strip():
+                logging.getLogger(__name__).warning(
+                    json.dumps(
+                        {
+                            "event": "provider_default_regression",
+                            "effort": current.reasoning_effort,
+                            "trace_tokens": count,
+                            "attempt": index + 1,
+                        }
+                    )
+                )
+            if result.get("finish_reason") != "length" and not trace.strip():
+                role, model = fallback_role, alternate
+                fallback = True
+            if (
+                policy.cost(model, incoming, 3000) > budget - spent
+                and policy.cost(alternate, incoming, 3000) <= budget - spent
+            ):
+                role, model = fallback_role, alternate
+                fallback = True
+            retried = True
+            yield {"phase": "reasoning_fallback"}
+            continue
+        for event in buffered:
+            yield event
+        if looping and result.get("finish_reason") == "stop" and not trimmed:
+            # A regular answer that only looked repetitive: deliver what was held back.
+            yield {"delta": {"content": streamed[held_from:]}}
+        answer = {
+            "provider_model": model,
+            "text": result["text"],
+            "calls": result["calls"],
+            "usage": {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+            },
+            "cost_eur": str(spent),
+            "reasoning": reasoning,
+            "trace_tokens": trace_tokens,
+            "answer_tokens": answer_tokens,
+            "token_split_estimated": estimated,
+            "reasoning_retried": retried,
+            "reasoning_effort": current.reasoning_effort,
+            "provider_retries": index,
+        }
+        if retry_completion_tokens:
+            answer["retry_completion_tokens"] = retry_completion_tokens
+        if request.observe:
+            answer["observation"] = {
+                "provider": "escalade",
+                "route": "simple"
+                if classify(request.messages) == "chat_simple"
+                else "complexe",
+                "task_type": task,
+                "fallback": fallback,
+            }
+        logging.getLogger(__name__).info(
+            json.dumps(
+                {
+                    "event": "quality_usage",
+                    "provider_model": model,
+                    "profile": request.profile,
+                    "effort": current.reasoning_effort,
+                    "trace_tokens": trace_tokens,
+                    "answer_tokens": answer_tokens,
+                    "token_split_estimated": estimated,
+                    "cost_eur": str(spent),
+                    "reasoning_retried": retried,
+                    "fallback": fallback,
+                }
+            )
+        )
+        yield {"result": answer}
+        return
+    raise RuntimeError("provider_error")

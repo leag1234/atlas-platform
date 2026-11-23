@@ -1,0 +1,180 @@
+{
+  "version": "2026-11-18",
+  "aliases": {
+    "atlas-code-2026-10-30": "atlas-code",
+    "atlas-chat-2026-10-30": "atlas-chat",
+    "atlas-dev": "atlas-code"
+  },
+  "structured_output": {
+    "mistral": true,
+    "scaleway": true
+  },
+  "usages": {
+    "atlas-code-fast": {
+      "route": "atlas-code",
+      "effort": "none"
+    },
+    "atlas-code": {
+      "none": [
+        {
+          "provider": "mistral",
+          "model": "zai-glm-5-3-flash",
+          "effort": "low",
+          "context": 1048576
+        },
+        {
+          "provider": "scaleway",
+          "model": "deepseek-v4-flash-0731",
+          "context": 256000
+        },
+        {
+          "provider": "owned-vllm",
+          "model": "owned-vllm-model",
+          "context": 32768,
+          "privacy": "owned"
+        }
+      ],
+      "low": [
+        {
+          "provider": "mistral",
+          "model": "mistral-large-4",
+          "effort": "low",
+          "context": 1048576
+        },
+        {
+          "provider": "mistral",
+          "model": "zai-glm-5-3",
+          "effort": "low",
+          "context": 1048576
+        },
+        {
+          "provider": "scaleway",
+          "model": "deepseek-v4-flash-0731",
+          "context": 256000
+        },
+        {
+          "provider": "owned-vllm",
+          "model": "owned-vllm-model",
+          "context": 32768,
+          "privacy": "owned"
+        }
+      ],
+      "medium": [
+        {
+          "provider": "mistral",
+          "model": "zai-glm-5-3",
+          "effort": "high",
+          "context": 1048576
+        },
+        {
+          "provider": "scaleway",
+          "model": "deepseek-v4-flash-0731",
+          "context": 256000
+        },
+        {
+          "provider": "owned-vllm",
+          "model": "owned-vllm-model",
+          "context": 32768,
+          "privacy": "owned"
+        }
+      ],
+      "high": [
+        {
+          "provider": "mistral",
+          "model": "zai-glm-5-3",
+          "effort": "high",
+          "context": 1048576
+        },
+        {
+          "provider": "scaleway",
+          "model": "deepseek-v4-flash-0731",
+          "context": 256000
+        },
+        {
+          "provider": "owned-vllm",
+          "model": "owned-vllm-model",
+          "context": 32768,
+          "privacy": "owned"
+        }
+      ]
+    },
+    "atlas-chat": {
+      "none": [
+        {
+          "provider": "mistral",
+          "model": "zai-glm-5-3-flash",
+          "effort": "low",
+          "context": 1048576
+        },
+        {
+          "provider": "scaleway",
+          "model": "glm-5.2",
+          "context": 256000
+        },
+        {
+          "provider": "owned-vllm",
+          "model": "owned-vllm-model",
+          "context": 32768,
+          "privacy": "owned"
+        }
+      ],
+      "low": [
+        {
+          "provider": "mistral",
+          "model": "zai-glm-5-3",
+          "effort": "low",
+          "context": 1048576
+        },
+        {
+          "provider": "scaleway",
+          "model": "glm-5.2",
+          "context": 256000
+        },
+        {
+          "provider": "owned-vllm",
+          "model": "owned-vllm-model",
+          "context": 32768,
+          "privacy": "owned"
+        }
+      ],
+      "medium": [
+        {
+          "provider": "mistral",
+          "model": "zai-glm-5-3",
+          "effort": "high",
+          "context": 1048576
+        },
+        {
+          "provider": "scaleway",
+          "model": "glm-5.2",
+          "context": 256000
+        },
+        {
+          "provider": "owned-vllm",
+          "model": "owned-vllm-model",
+          "context": 32768,
+          "privacy": "owned"
+        }
+      ],
+      "high": [
+        {
+          "provider": "mistral",
+          "model": "zai-glm-5-3",
+          "effort": "high",
+          "context": 1048576
+        },
+        {
+          "provider": "scaleway",
+          "model": "glm-5.2",
+          "context": 256000
+        },
+        {
+          "provider": "owned-vllm",
+          "model": "owned-vllm-model",
+          "context": 32768,
+          "privacy": "owned"
+        }
+      ]
+    }
+  }
+}

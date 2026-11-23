@@ -1,0 +1,19 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Hostile navigation probe</title>
+</head>
+<body>
+  <h1>Navigation probe</h1>
+  <p id="marker">Navigation fixture ready</p>
+  <button id="run" type="button">Run</button>
+  <p id="result">not-run</p>
+  <script>
+    document.getElementById("run").addEventListener("click", () => {
+      document.getElementById("result").textContent = "allowed";
+      location.href = "__ATTACKER__/self-navigation";
+    });
+  </script>
+</body>
+</html>

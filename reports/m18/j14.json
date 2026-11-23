@@ -1,0 +1,12 @@
+{
+  "j14_prompt": "Crée une image d'un lapin qui saute avec un hérisson, tous deux portant des bottes orange et des bonnets violets.",
+  "j14_rewritten_prompt": "Subjects: A rabbit and a hedgehog jumping together.\nAttributes: Both subjects are wearing orange boots and purple beanies.\nScene: A dynamic setting suitable for jumping.\nStyle: Vibrant and playful illustration.",
+  "j14_seed": 1079227799,
+  "j14_image": "http://localhost:8020/images/000000000000000000000000000003e9",
+  "j14_constraints_detail": {
+    "animals_jumping": true,
+    "orange_boots": true,
+    "purple_beanies": true
+  },
+  "j14_constraints_met": 3
+}

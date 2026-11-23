@@ -1,0 +1,95 @@
+[
+  {
+    "category": "minors",
+    "all_of": [
+      "(?i)\\b(?:child(?:ren)?|minor[es]*|underage|teen(?:ager)?s?|enfants?|mineur[es]*|adolescent\\w*|bebe[s]?|baby|babies|kind(?:es|er|ern)?|minderjahrig\\w*|jugendlich\\w*|nino[s]?|nina[s]?|menor[es]*|bambin[oi]|minorenne|minorenni|neonat\\w*)\\b|(?i:\\b(?:[0-9]|1[0-7])[- ](?:year[- ]old|years old|ans|anos|jahre|anni)\\b)",
+      "(?i)\\b(?:sexual\\w*|sexuel\\w*|sexuell\\w*|sessual\\w*|(?:<<sex_word>>)|porn\\w*|eroti\\w*|naked|nude|nudi|nuda|nu|nue|nus|nues|desnud\\w*|nackt\\w*|masturb\\w*|intercourse|penetration|fellatio|fellation)\\b"
+    ],
+    "messages": {
+      "en": "I do not generate this kind of image: sexual content involving minors.",
+      "fr": "Je ne génère pas ce type d’image : contenu sexuel impliquant des mineurs.",
+      "de": "Ich erzeuge diese Art von Bild nicht: sexuelle Inhalte mit Minderjährigen.",
+      "es": "No genero este tipo de imagen: contenido sexual con menores.",
+      "it": "Non genero questo tipo di immagine: contenuti sessuali con minori."
+    }
+  },
+  {
+    "category": "real_people",
+    "all_of": [
+      "(?:<<name>>|(?i:\\b(?:<<real_person>>)\\b))[^.!?\\n]{0,80}?(?i:\\b(?:<<sexual_request>>)\\b)|(?i:\\b(?:<<sexual_request>>)\\b)[^.!?\\n]{0,80}?(?:<<name>>|(?i:\\b(?:<<real_person>>)\\b))"
+    ],
+    "messages": {
+      "en": "I do not generate this kind of image: sexually explicit depictions of real named people.",
+      "fr": "Je ne génère pas ce type d’image : représentation sexuellement explicite de personnes réelles nommées.",
+      "de": "Ich erzeuge diese Art von Bild nicht: sexuell explizite Darstellungen realer, namentlich genannter Personen.",
+      "es": "No genero este tipo de imagen: representaciones sexualmente explícitas de personas reales identificadas por su nombre.",
+      "it": "Non genero questo tipo di immagine: rappresentazioni sessualmente esplicite di persone reali nominate."
+    }
+  },
+  {
+    "category": "real_people",
+    "all_of": [
+      "実在(?:の|する)(?:人物|人)[^。!?\\n]{0,40}?(?:エロ|ホルノ|ヌート|裸|性的|官能)|(?:エロ|ホルノ|ヌート|裸|性的|官能)[^。!?\\n]{0,40}?実在(?:の|する)(?:人物|人)"
+    ],
+    "messages": {
+      "en": "I do not generate this kind of image: sexually explicit depictions of real named people.",
+      "fr": "Je ne génère pas ce type d’image : représentation sexuellement explicite de personnes réelles nommées.",
+      "de": "Ich erzeuge diese Art von Bild nicht: sexuell explizite Darstellungen realer, namentlich genannter Personen.",
+      "es": "No genero este tipo de imagen: representaciones sexualmente explícitas de personas reales identificadas por su nombre.",
+      "it": "Non genero questo tipo di immagine: rappresentazioni sessualmente esplicite di persone reali nominate."
+    }
+  },
+  {
+    "category": "incitement",
+    "all_of": [
+      "(?i:\\b(?:<<call>>))\\b[^.!?\\n]{0,80}?(?:(?i:\\b(?:<<kill>>)\\b)\\s+<<words_between>>(?:<<target>>|<<name>>)|(?i:\\b(?:<<attack>>)\\b)\\s+<<words_between>>(?:<<target>>)|(?i:\\b(?!(?:leute|menschen)\\b)(?:<<people>>)\\b)[^,.!?\\n]{0,20}?(?i:\\b(?:<<verb_last>>)\\b))"
+    ],
+    "messages": {
+      "en": "I do not generate this kind of image: direct incitement to violence against identifiable people or groups.",
+      "fr": "Je ne génère pas ce type d’image : incitation directe à la violence contre des personnes ou groupes identifiables.",
+      "de": "Ich erzeuge diese Art von Bild nicht: direkte Gewaltaufrufe gegen identifizierbare Personen oder Gruppen.",
+      "es": "No genero este tipo de imagen: incitación directa a la violencia contra personas o grupos identificables.",
+      "it": "Non genero questo tipo di immagine: incitamento diretto alla violenza contro persone o gruppi identificabili."
+    }
+  },
+  {
+    "category": "incitement",
+    "all_of": [
+      "(?:<<clause_start>>)(?:(?i:(?:<<kill_imperative>>)\\b)\\s+<<words_between>>(?:<<target>>|<<name>>)|(?i:(?:<<imperative>>)\\b)\\s+<<words_between>>(?:<<target>>)|(?i:(?:<<imperative_with_pronoun>>)\\b))"
+    ],
+    "messages": {
+      "en": "I do not generate this kind of image: direct incitement to violence against identifiable people or groups.",
+      "fr": "Je ne génère pas ce type d’image : incitation directe à la violence contre des personnes ou groupes identifiables.",
+      "de": "Ich erzeuge diese Art von Bild nicht: direkte Gewaltaufrufe gegen identifizierbare Personen oder Gruppen.",
+      "es": "No genero este tipo de imagen: incitación directa a la violencia contra personas o grupos identificables.",
+      "it": "Non genero questo tipo di immagine: incitamento diretto alla violenza contro persone o gruppi identificabili."
+    }
+  },
+  {
+    "category": "incitement",
+    "all_of": [
+      "(?:難民|移民|外国人|記者|警察官?|隣人|住民|イスラム教徒|ユタヤ人|キリスト教徒|人々|やつら|奴ら)(?:を|は|も)(?:全員|皆|みんな)?(?:殺せ|殺そう|皆殺しにしろ|皆殺しにせよ|襲え|襲おう|殴れ|殴ろう|殺すよう|襲うよう|殺すように|襲うように)"
+    ],
+    "messages": {
+      "en": "I do not generate this kind of image: direct incitement to violence against identifiable people or groups.",
+      "fr": "Je ne génère pas ce type d’image : incitation directe à la violence contre des personnes ou groupes identifiables.",
+      "de": "Ich erzeuge diese Art von Bild nicht: direkte Gewaltaufrufe gegen identifizierbare Personen oder Gruppen.",
+      "es": "No genero este tipo de imagen: incitación directa a la violencia contra personas o grupos identificables.",
+      "it": "Non genero questo tipo di immagine: incitamento diretto alla violenza contro persone o gruppi identificabili."
+    }
+  },
+  {
+    "category": "non_consent",
+    "all_of": [
+      "(?i)\\b(?:rape\\w*|raped|non[- ]?consensual\\w*|without (?:her|his|their) consent|against (?:her|his|their) will|forced|viol(?:e|er|ee|ees|s)?|sans (?:son|leur) consentement|contre (?:son|leur) gre|force[es]?|vergewaltig\\w*|gegen ihren willen|ohne einwilligung|erzwungen\\w*|violaci\\w*|violad[oa]s?|sin (?:su )?consentimiento|forzad[oa]s?|stupr\\w*|violentat[oa]|senza consenso|costrett[oa])\\b",
+      "(?i)\\b(?:sexual\\w*|sexuel\\w*|sexuell\\w*|sessual\\w*|(?:<<sex_word>>)|porn\\w*|eroti\\w*|naked|nude|nudi|nuda|nu|nue|nus|nues|desnud\\w*|nackt\\w*|masturb\\w*|intercourse|penetration|fellatio|fellation)\\b"
+    ],
+    "messages": {
+      "en": "I do not generate this kind of content: sexual content without consent.",
+      "fr": "Je ne génère pas ce type de contenu : contenu sexuel sans consentement.",
+      "de": "Ich erzeuge diese Art von Inhalt nicht: sexuelle Inhalte ohne Einwilligung.",
+      "es": "No genero este tipo de contenido: contenido sexual sin consentimiento.",
+      "it": "Non genero questo tipo di contenuto: contenuti sessuali senza consenso."
+    }
+  }
+]

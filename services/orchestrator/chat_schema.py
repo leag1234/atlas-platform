@@ -1,0 +1,542 @@
+"""OpenAI-compatible text/image chat; clients cannot alter tool budgets."""
+
+from collections.abc import Callable
+
+from packages import attached_blocks, linear_scan, privacy
+from packages.profiles import (
+    accepted_profile,
+    chat_seconds,
+    context_window,
+    default_profile,
+)
+from packages.file_intent import produces_file
+from packages.work_intent import continues_work
+from packages.evidence import estimated_tokens
+from packages.language import (
+    LANGUAGES,
+    conversation_language,
+    prose_language,
+    status_language,
+)
+from pydantic_core import PydanticCustomError
+
+import os
+import re
+
+from typing import Any, Literal, Self
+from uuid import UUID
+from pydantic import ConfigDict, Field, PrivateAttr, model_validator, field_validator
+from packages.images import VisionInput, VisionMessage
+
+from services.orchestrator.documents import Attachment, file_parts_to_documents
+from services.orchestrator.location import Location
+
+ChatMessage = VisionMessage
+
+
+# The service message that resumes an answer (Open WebUI's terminal assistant
+# turn). It is not the person's words (ChatRequest.person_texts), and it says
+# no form of address (English has one): staging -155, the polite French
+# instruction of a trip resumed after the device shared its position
+# outweighed the person's own familiar imperative, so the trip block and the
+# service notes read in the polite form, and the answer model drifted to it.
+CONTINUATION_INSTRUCTIONS = {
+    "fr": "Suite de la réponse précédente, exactement là où elle s'est arrêtée, sans rien répéter ni ajouter d'introduction.",
+    "en": "Continue your previous answer exactly from where it stopped. Do not repeat anything and do not add an introduction.",
+    "de": "Fortsetzung der vorherigen Antwort genau an der Stelle, an der sie abgebrochen wurde, ohne Wiederholung und ohne Einleitung.",
+    "es": "Continuación de la respuesta anterior exactamente donde se interrumpió, sin repetir nada ni añadir una introducción.",
+    "it": "Seguito della risposta precedente esattamente da dove si è interrotta, senza ripetere nulla né aggiungere un'introduzione.",
+}
+
+
+def continuation_instruction(answer: str, language: str) -> str:
+    """Ask for a suffix only, preserving any unfinished Markdown structure."""
+    instruction = CONTINUATION_INSTRUCTIONS[language]
+    open_fence = answer.count("```") % 2 == 1
+    cut_citation = _CUT_CITATION.search(answer) is not None
+    lines = [line for line in answer.splitlines() if line.strip()]
+    cut_table = len(lines) >= 2 and "|" in lines[-1] and "|" in lines[-2]
+    if open_fence or cut_citation or cut_table:
+        instruction += (
+            " Preserve and complete any unfinished code block, citation, or table."
+        )
+    return instruction
+
+
+def markdown_tail_viable(
+    *, target: bool, bracket: bool = False, bare: bool = False
+) -> Callable[[str], linear_scan.Viable]:
+    """Whether a "[" (or "![") can start unfinished Markdown that runs to the
+    end of the text: its label reaches the end, or its "]" is followed by a
+    "(" (``target``) or "[" (``bracket``) whose run reaches the end, or the "]"
+    itself ends the text (``bare``). Decided from memoized run ends, so an
+    opening is not reread to the end each time (the former searches retried
+    every "[" to the end: quadratic).
+    """
+
+    def build(text: str) -> linear_scan.Viable:
+        label_end = linear_scan.RunEnd(text, re.compile(r"\]"))
+        target_end = linear_scan.RunEnd(text, re.compile(r"\)"))
+        bracket_end = linear_scan.RunEnd(text, re.compile(r"\]"))
+        size = len(text)
+        line_end = size - 1 if text.endswith("\n") else size
+
+        def viable(found: re.Match[str]) -> bool:
+            if not found[0].endswith("["):
+                return True
+            close = label_end(found.end())
+            if close == size:
+                return True
+            following = text[close + 1 : close + 2]
+            if target and following == "(":
+                return target_end(close + 2) == size
+            if bracket and following == "[":
+                return bracket_end(close + 2) == size
+            return bare and close + 1 >= line_end
+
+        return viable
+
+    return build
+
+
+# A citation cut at the end of the answer.
+_CUT_CITATION = linear_scan.Scan(
+    re.compile(r"\[[^\]]*$|\[[^\]]*\]\([^)]*$"),
+    re.compile(r"\["),
+    linear_scan.attempted,
+    markdown_tail_viable(target=True),
+)
+# An Open WebUI filesystem file tag; a failed "<file " reads to the first ">",
+# which every later "<file " before it reaches too (same outcome, skipped).
+_FILESYSTEM_TAG = linear_scan.Scan(
+    re.compile(r'<file\s[^>]*type=[\'"]filesystem[\'"]'),
+    re.compile(r"<file\s"),
+    linear_scan.up_to(r">"),
+)
+
+
+class ChatRequest(VisionInput):
+    model_config = ConfigDict(extra="ignore", strict=True)
+    location: Location | None = Field(default=None, exclude=True, repr=False)
+    model: str = Field(default_factory=default_profile)
+    documents: list[Attachment] = Field(default_factory=list, max_length=8)
+    org_id: str | None = None
+    connector_org_id: str | None = None
+    file_version_ids: list[str] = Field(default_factory=list)
+    _skill_catalog: Any = PrivateAttr(default=None)
+    _api_key_request: bool = PrivateAttr(default=False)
+    _scheduled_run: bool = PrivateAttr(default=False)
+    _scheduled_target: str | None = PrivateAttr(default=None)
+    _project_subject: str | None = PrivateAttr(default=None)
+    _connector_scope: dict[str, str | None] = PrivateAttr(default_factory=dict)
+    _connector_approvals: list[dict[str, Any]] = PrivateAttr(default_factory=list)
+    _transcript_key: str | None = PrivateAttr(default=None)
+    project_id: str | None = None
+    conversation_id: str | None = None
+    project_action: Literal["chat", "work"] = "chat"
+    work_session_id: str | None = None
+    code_mode: bool = False
+    code_session_id: str | None = None
+    atlas_ui: bool = False
+    stream: bool = False
+    cancel_id: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+        exclude=True,
+    )
+    reasoning_effort: Literal["none", "low", "high"] = "none"
+    max_tokens: int = Field(default=6000, ge=1, le=16000)
+    seed: int | None = Field(default=None, ge=0, le=2**32 - 1)
+    ui_locale: Literal["fr", "de", "es", "it", "en", "nl"] = "fr"
+    ui_timezone: str = Field(default="UTC", max_length=80)
+
+    @field_validator("ui_timezone")
+    @classmethod
+    def valid_timezone(cls, value: str) -> str:
+        from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+        try:
+            ZoneInfo(value)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise ValueError("Unknown IANA time zone") from exc
+        return value
+
+    lang: Literal["fr", "de", "es", "it", "en"] = "fr"
+    continuation: bool = Field(default=False, exclude=True)
+
+    @model_validator(mode="before")
+    @classmethod
+    def discard_empty_assistant_placeholders(cls, value: Any) -> Any:
+        """Keep a cancelled Open WebUI turn from blocking the next user message."""
+        if not isinstance(value, dict) or not isinstance(value.get("messages"), list):
+            return value
+        return {
+            **value,
+            "messages": [
+                message
+                for index, message in enumerate(value["messages"])
+                if not (
+                    isinstance(message, dict)
+                    and message.get("role") == "assistant"
+                    and (
+                        message.get("content") is None
+                        or (
+                            isinstance(message.get("content"), str)
+                            and not message["content"].strip()
+                        )
+                    )
+                    and index + 1 < len(value["messages"])
+                    and isinstance(value["messages"][index + 1], dict)
+                    and value["messages"][index + 1].get("role") == "user"
+                )
+            ],
+        }
+
+    @model_validator(mode="before")
+    @classmethod
+    def side_view_links_as_markers(cls, value: Any) -> Any:
+        """Earlier answers name an attachment's side view, never its file address.
+
+        The side-view link holds the Open WebUI file id; a model that saw it in
+        the history tried to fetch the id as a web page. The attachment itself
+        is read again by the turn-scoped selector (packages.turn_attachments).
+        """
+        if not isinstance(value, dict) or not isinstance(value.get("messages"), list):
+            return value
+        from packages.turn_attachments import side_view_markers
+
+        return {
+            **value,
+            "messages": [
+                {**message, "content": side_view_markers(message["content"])}
+                if isinstance(message, dict)
+                and message.get("role") == "assistant"
+                and isinstance(message.get("content"), str)
+                else message
+                for message in value["messages"]
+            ],
+        }
+
+    @model_validator(mode="before")
+    @classmethod
+    def add_continuation_turn(cls, value: Any) -> Any:
+        """Adapt Open WebUI's terminal assistant turn without relaxing validation."""
+        if not isinstance(value, dict) or value.get("continuation"):
+            return value
+        messages = value.get("messages")
+        if not isinstance(messages, list) or not messages:
+            return value
+        last = messages[-1]
+        if not (
+            isinstance(last, dict)
+            and last.get("role") == "assistant"
+            and isinstance(last.get("content"), str)
+            and last["content"].strip()
+        ):
+            return value
+        locale = value.get("ui_locale", "fr")
+        if locale == "nl":
+            locale = "en"
+        language = value.get("lang", locale)
+        if locale not in CONTINUATION_INSTRUCTIONS:
+            return value
+        try:
+            from packages.language import conversation_language
+
+            language = conversation_language(
+                [VisionMessage.model_validate(message) for message in messages], locale
+            )
+        except (TypeError, ValueError):
+            # VisionInput still reports malformed messages through its normal boundary.
+            language = language if language in CONTINUATION_INSTRUCTIONS else locale
+        return {
+            **value,
+            "messages": [
+                *messages,
+                {
+                    "role": "user",
+                    "content": continuation_instruction(last["content"], language),
+                },
+            ],
+            "continuation": True,
+        }
+
+    @model_validator(mode="before")
+    @classmethod
+    def discard_unsupported_interface_language(cls, value: Any) -> Any:
+        if not isinstance(value, dict) or value.get("ui_locale") in (*LANGUAGES, "nl"):
+            return value
+        return {key: item for key, item in value.items() if key != "ui_locale"}
+
+    @property
+    def answer_language(self) -> str:
+        """The language of the answer: an explicit lang, else the conversation's.
+
+        Clients send ui_locale and rarely lang, whose default is French: the
+        deadline error of an English conversation came back in French
+        (staging 2026-11-12).
+        """
+        if "lang" in self.model_fields_set:
+            return self.lang
+        try:
+            return conversation_language(self.conversation_messages, self.ui_locale)
+        except (IndexError, ValueError):
+            return self.lang
+
+    @property
+    def prose_lang(self) -> str:
+        """The language the model writes its prose in: the answer language, or any
+        other language the user writes in (it stays one of the five otherwise).
+
+        It starts from answer_language, not lang: a client that sends ui_locale
+        and no lang left lang at its French default, and the service sentences
+        written before the turn's language was settled (the sentence replacing a
+        link to an app version that was never stored) came out in French inside
+        a German conversation (class suite, staging -184).
+        """
+        return prose_language(self.conversation_messages, self.answer_language)
+
+    @property
+    def status_language(self) -> str:
+        # The legacy answer-language hint is not evidence of a known UI locale.
+        locale = self.ui_locale if "ui_locale" in self.model_fields_set else None
+        if os.environ.get("ATLAS_STABLE") == "1":
+            return conversation_language(self.conversation_messages, locale or "en")
+        return status_language(self.conversation_messages, locale)
+
+    @property
+    def last_real_user_message(self) -> ChatMessage | None:
+        messages = self.messages[:-1] if self.continuation else self.messages
+        return next((m for m in reversed(messages) if m.role == "user"), None)
+
+    @property
+    def person_texts(self) -> list[str]:
+        """The person's own messages, oldest first: never the continuation
+        instruction the service appends (CONTINUATION_INSTRUCTIONS)."""
+        messages = self.messages[:-1] if self.continuation else self.messages
+        return [m.text for m in messages if m.role == "user"]
+
+    @property
+    def user_text(self) -> str:
+        message = self.last_real_user_message
+        return message.text if message is not None else ""
+
+    @property
+    def conversation_messages(self) -> list[ChatMessage]:
+        if not self.continuation:
+            return self.messages
+        message = self.last_real_user_message
+        return (
+            [*self.messages[:-2], message]
+            if message is not None
+            else self.messages[:-1]
+        )
+
+    @property
+    def has_attachments(self) -> bool:
+        # Open WebUI filesystem uploads arrive as file tags, not document bytes.
+        return bool(self.documents) or any(
+            _FILESYSTEM_TAG.search(block) is not None
+            for message in self.messages
+            if message.role == "user"
+            for block in attached_blocks.CONTENTS.findall(message.text)
+        )
+
+    @property
+    def timeout_seconds(self) -> float:
+        if self.code_mode or self.project_action == "work":
+            from services.orchestrator.code_mode import settings
+
+            # The inner code deadline owns the measured stop, including cleanup.
+            return settings().wall_clock + 15
+        from services.orchestrator.request_router import decision
+
+        # The model routing decision of this turn, when there is one, replaces
+        # the lexical file and Work tests (ATLAS_MODEL_ROUTER=1).
+        routed = decision(self)
+        return (
+            300.0
+            if self.has_attachments
+            or (
+                routed.kind == "file"
+                if routed is not None
+                else produces_file(self.user_text, include_images=False)
+            )
+            or self.app_turn
+            or self.picture_turn
+            # A turn that Work answers behind the chat (code to run, a real file, a
+            # change to either) is not a 120 s chat answer: one slow call cut a
+            # script run at 120 s on staging (2026-11-10).
+            or (
+                os.environ.get("ATLAS_CHAT_WORK") == "1"
+                and not self.__dict__.get("work_declined")
+                and (
+                    routed.work
+                    if routed is not None
+                    else continues_work(self.user_text)
+                )
+            )
+            # A plain chat answer: the limit follows the endpoint that writes it
+            # (the owned server writes at its own measured speed).
+            else chat_seconds(privacy.owned_only())
+        )
+
+    @property
+    def picture_turn(self) -> bool:
+        # Four drafts by code (services/orchestrator/pictures): about 100 s
+        # measured, up to 295 s; a drawing turn outside the app panel (API
+        # callers, no artifact) must not end at the 120 s chat limit.
+        if self.continuation or self.has_attachments:
+            return False
+        from services.orchestrator.pictures.turn import available
+
+        if not available():
+            return False
+        from services.orchestrator.request_router import decision
+
+        routed = decision(self)
+        if routed is not None:
+            return routed.kind == "drawing"
+        from packages.artifact_intent import svg_requested
+        from services.orchestrator.image_tool import explicit_image_request
+
+        return svg_requested(self.user_text) or explicit_image_request(self.user_text)
+
+    @property
+    def app_turn(self) -> bool:
+        # An app turn writes the whole SVG or HTML app in one tool call. Measured
+        # on the assistant models: 30 s to 190 s for a drawing, so
+        # the plain chat 120 s cut the turn while the gateway was still writing.
+        # Same eligibility as the app panel route in chat_pipeline.
+        if (
+            os.environ.get("ATLAS_ARTIFACTS") != "1"
+            or not getattr(self, "artifact_owner", "")
+            or self.continuation
+            or self.has_attachments
+            or any(message.images for message in self.messages)
+        ):
+            return False
+        from packages.artifact_intent import app_intent
+        from services.orchestrator.request_router import app_route, decision
+
+        history = [
+            {"role": message.role, "content": message.text}
+            for message in self.conversation_messages[:-1]
+        ]
+        routed = decision(self)
+        if routed is not None:
+            # An app, or a drawing made as SVG in the panel (images off or SVG asked).
+            return app_route(self, routed, has_artifact=False) is not None
+        return app_intent(self.user_text, history) in ("create", "modify")
+
+    @model_validator(mode="before")
+    @classmethod
+    def documents_from_file_parts(cls, value: Any) -> Any:
+        """Map OpenAI file parts to documents when the adapter has not done it yet.
+
+        The chat adapter (prepare_uploads) maps them before validation. Any other
+        validation of an Open WebUI request (0.11 and 0.13 both send file parts)
+        gets the same mapping instead of a part-type error. Defined after the other
+        "before" validators so that it runs first.
+        """
+        if not isinstance(value, dict) or not isinstance(value.get("messages"), list):
+            return value
+        if not any(
+            isinstance(message, dict)
+            and message.get("role") == "user"
+            and isinstance(message.get("content"), list)
+            and any(
+                isinstance(part, dict) and part.get("type") == "file"
+                for part in message["content"]
+            )
+            for message in value["messages"]
+        ):
+            return value
+        copied = {
+            **value,
+            "messages": [
+                {
+                    **message,
+                    "content": [
+                        dict(part) if isinstance(part, dict) else part
+                        for part in message["content"]
+                    ],
+                }
+                if isinstance(message, dict)
+                and isinstance(message.get("content"), list)
+                else message
+                for message in value["messages"]
+            ],
+        }
+        file_parts_to_documents(copied)
+        return copied
+
+    @model_validator(mode="after")
+    def valid_project(self) -> Self:
+        if self.code_mode and (
+            self.org_id is not None
+            or bool(self.file_version_ids)
+            or self.project_id is not None
+            or self.conversation_id is not None
+            or self.project_action != "chat"
+            or self.work_session_id is not None
+        ):
+            raise ValueError("selector_conflict")
+        if self.code_mode:
+            from services.orchestrator.code_workspace import enabled
+
+            if not enabled():
+                raise ValueError("code_mode_disabled")
+            if self.code_session_id is None:
+                raise ValueError("code_session_id_required")
+            self.code_session_id = str(UUID(self.code_session_id))
+        elif self.code_session_id is not None:
+            raise ValueError("selector_conflict")
+        if self.org_id is not None:
+            self.org_id = str(UUID(self.org_id))
+            if self.project_id is None or self.conversation_id is None:
+                raise ValueError("selector_conflict")
+        elif self.file_version_ids:
+            raise ValueError("selector_conflict")
+        self.file_version_ids = [str(UUID(v)) for v in self.file_version_ids]
+        if len(set(self.file_version_ids)) != len(self.file_version_ids):
+            raise ValueError("selector_conflict")
+        if not accepted_profile(self.model):
+            raise ValueError("invalid_profile")
+        maximum = 6000
+        if "max_tokens" not in self.model_fields_set:
+            self.max_tokens = maximum
+        if self.max_tokens > maximum:
+            raise PydanticCustomError(
+                "output_budget",
+                "Output requested {measured} tokens, limit {limit} tokens",
+                {"measured": self.max_tokens, "limit": maximum},
+            )
+        window = context_window(self.model, vision=any(m.images for m in self.messages))
+        tokens = sum(estimated_tokens(m.text) + 4 for m in self.messages)
+        tool_allowance = 8192
+        if tokens + self.max_tokens + tool_allowance > window:
+            raise PydanticCustomError(
+                "conversation_window_exceeded",
+                "Conversation estimated at {tokens} tokens; model window {window} tokens; "
+                "reserved output {reserved} tokens; tool allowance {tools} tokens",
+                {
+                    "tokens": tokens,
+                    "window": window,
+                    "reserved": self.max_tokens,
+                    "tools": tool_allowance,
+                },
+            )
+        self.reasoning_effort = "none"
+        if (self.project_id is None) != (self.conversation_id is None):
+            raise ValueError("project_conversation_required")
+        if self.project_id is not None and self.conversation_id is not None:
+            UUID(self.project_id)
+            UUID(self.conversation_id)
+        if self.project_action == "work":
+            if self.project_id is None or self.work_session_id is None:
+                raise ValueError("work_session_required")
+            self.work_session_id = str(UUID(self.work_session_id))
+        elif self.work_session_id is not None:
+            raise ValueError("selector_conflict")
+        return self

@@ -1,0 +1,247 @@
+{
+  "version": 1,
+  "note": "One binary rubric per defect class (draft class list of 2026-11-21). Examples are fictional. required_evidence is a list of groups: every group needs at least one of its kinds, otherwise the verdict is unknown without any model call.",
+  "classes": [
+    {
+      "id": "C1",
+      "name": "Lost work across turns",
+      "invariant": "Version n keeps every feature and every piece of content of version n-1 unless the person asked to remove it.",
+      "question": "Does the current version keep every feature and content of the previous version that the person did not ask to remove?",
+      "pass_examples": [
+        "v1 has a score counter and a title; the person asks for a timer; v2 has the title, the score counter and the timer.",
+        "The person asks to drop the second chapter of a report; v2 has every other chapter and no second chapter."
+      ],
+      "fail_examples": [
+        "v2 adds the requested timer but the score counter of v1 is gone.",
+        "After 'change the title', the revised report has the new title but lost its conclusion section."
+      ],
+      "required_evidence": [["request"], ["previous_version"], ["current_version"]],
+      "optional_evidence": ["rendered_pages", "artifact_record"]
+    },
+    {
+      "id": "C2",
+      "name": "Claim without the deed",
+      "invariant": "Every claim in the answer ('done', 'fixed', 'works', 'version N', 'created', 'added X') is true of the delivered artifact.",
+      "question": "Is every claim the answer makes about the work done (created, added, fixed, version, content, counts) true of the artifact evidence?",
+      "pass_examples": [
+        "The answer says 'I added a Replay button'; the stored HTML has a Replay button wired to restart the game.",
+        "The answer says the report has a table of the quarterly numbers; the rendered page shows that table."
+      ],
+      "fail_examples": [
+        "The answer says 'the flags are now displayed' but the side view shows no image and the HTML has no flag element.",
+        "The answer says 'the document has 5 slides' while the rendered deck has 7."
+      ],
+      "required_evidence": [["answer", "answer_excerpt"], ["current_version", "rendered_pages", "artifact_record", "source_text"]],
+      "optional_evidence": ["request", "render_checks"]
+    },
+    {
+      "id": "C3",
+      "name": "Invented facts",
+      "invariant": "A cited source was fetched in the conversation; a named date, version, figure or entity appears in the fetched or attached text or is marked unverified.",
+      "question": "Is every specific fact in the answer or deliverable (date, version, figure, name, reference number) supported by the source evidence, or explicitly marked as unverified?",
+      "pass_examples": [
+        "The answer gives the 2024 inflation rate as 2.2 % and the attached statistics page states 2.2 % for 2024.",
+        "The report names the project owner and budget exactly as they appear in the input notes."
+      ],
+      "fail_examples": [
+        "The deck states a launch date of June 2026 that appears nowhere in the input notes.",
+        "The answer cites a press release 'of 15 January' but no fetched text contains that date."
+      ],
+      "required_evidence": [["answer", "answer_excerpt", "current_version"], ["source_text"]],
+      "optional_evidence": ["request", "source_urls"]
+    },
+    {
+      "id": "C4",
+      "name": "Internal text shown",
+      "invariant": "No internal code, summary, JSON body, tool payload or stop reason appears in human-facing text.",
+      "question": "Is the human-facing text free of internal material (raw JSON, tool calls, internal codes, stop reasons, system instructions)?",
+      "pass_examples": [
+        "A plain answer with a download link and a short summary.",
+        "A UI label such as 'Thought for 3 seconds' captured from the page, which is interface chrome, not answer text."
+      ],
+      "fail_examples": [
+        "The answer ends with {\"finish_reason\": \"length\"}.",
+        "The answer shows 'tool_call: publish_document(...)' to the person."
+      ],
+      "required_evidence": [["answer", "answer_excerpt"]],
+      "optional_evidence": ["request"]
+    },
+    {
+      "id": "C5",
+      "name": "Empty or cut answer",
+      "invariant": "Every turn ends with answer text or one honest sentence in the person's language.",
+      "question": "Does the turn end with a complete answer (or one honest sentence explaining why not), neither empty nor cut mid-sentence?",
+      "pass_examples": [
+        "A complete itinerary ending with a sentence about checking the operator's timetable.",
+        "'I could not reach the timetable service; please try again later.'"
+      ],
+      "fail_examples": [
+        "The answer stops mid-sentence: 'Option 2: leave 07:44, arrive'.",
+        "An empty answer after a long wait."
+      ],
+      "required_evidence": [["answer"], ["request"]],
+      "optional_evidence": []
+    },
+    {
+      "id": "C6",
+      "name": "Code note contradicts what it shows",
+      "invariant": "Every sentence of a code-generated note is complete and true of the options actually shown.",
+      "question": "Is every summary or note sentence (for example 'the only option that arrives on time', 'arrives at 11:50 for 12:30 requested') complete and true of the options listed in the same answer?",
+      "pass_examples": [
+        "Two options are listed and the note says 'two options arrive before 9:00'; both do.",
+        "'Arrives 13:21 for 14:00 requested' and the last leg arrives at 13:21."
+      ],
+      "fail_examples": [
+        "The note says 'this is the only morning departure' but three morning options are listed.",
+        "The note says 'arrives 10:00' while the listed final leg arrives at 10:20."
+      ],
+      "required_evidence": [["answer", "answer_excerpt"], ["request"]],
+      "optional_evidence": ["context"]
+    },
+    {
+      "id": "C7",
+      "name": "Number, unit or currency drift",
+      "invariant": "A figure keeps the value, unit and currency of its source; computed values stay consistent with their inputs.",
+      "question": "Does every figure keep the value, unit and currency of its source, and is every computed figure (durations, sums, differences) consistent with its inputs?",
+      "pass_examples": [
+        "The budget is 12 400 euros in the notes and 12 400 EUR in the report.",
+        "Leave 07:44, arrive 13:21, total 5 h 37 min."
+      ],
+      "fail_examples": [
+        "The notes say 12 400 euros and the deck says 124 000 EUR.",
+        "Leave 08:07, arrive 13:26, announced as 5 h 59 min."
+      ],
+      "required_evidence": [["answer", "answer_excerpt", "current_version"], ["source_text", "request"]],
+      "optional_evidence": []
+    },
+    {
+      "id": "C8",
+      "name": "Privacy level not honoured",
+      "invariant": "The requested privacy level is applied or refused by name; Strict is served only by the owned endpoint, never silently downgraded.",
+      "question": "Was the requested privacy level applied as requested, or refused by name, with Strict served only by the owned endpoint?",
+      "pass_examples": [
+        "Strict requested, applied 'strict', the owned endpoint request counter increased, no fallback in the journal.",
+        "Enhanced requested on a server without it: named refusal 'enhanced_privacy_unavailable', nothing sent."
+      ],
+      "fail_examples": [
+        "Strict requested, applied 'standard' with no refusal.",
+        "Strict applied but the owned endpoint counter did not move and the journal shows a fallback."
+      ],
+      "required_evidence": [["privacy_record"]],
+      "optional_evidence": ["answer", "answer_excerpt"]
+    },
+    {
+      "id": "C9",
+      "name": "Limit disguised as failure",
+      "invariant": "Budget, quota or provider spending limits reach the person as named refusals with measured values.",
+      "question": "When a budget, quota or availability limit applies, is it named as such (with its values when known), rather than shown as a generic failure?",
+      "pass_examples": [
+        "'Daily budget reached: 2.00 EUR of 2.00 EUR used.'",
+        "'Enhanced privacy is not installed on this server; nothing was sent.'"
+      ],
+      "fail_examples": [
+        "A quota exhaustion shown as 'service unavailable, try again later'.",
+        "A budget refusal returned as a 504 timeout."
+      ],
+      "required_evidence": [["limit_record", "privacy_record"]],
+      "optional_evidence": ["answer", "answer_excerpt"]
+    },
+    {
+      "id": "C10",
+      "name": "Poor deliverable form",
+      "invariant": "Structural quality: no near-empty slides or pages, no overflow, layout matches content, tables never truncated, the requested shape (count, sections) is respected, preview renders.",
+      "question": "Looking at the rendered pages, is the deliverable well formed: requested shape respected (page or slide count, sections, tables), no near-empty or overflowing page, readable layout, nothing truncated?",
+      "pass_examples": [
+        "A 5-slide deck as requested, each slide with a heading and balanced content.",
+        "A one-page report with title, introduction, a complete table and a conclusion."
+      ],
+      "fail_examples": [
+        "The person asked for 5 slides; the deck has 7, two of them duplicated source lists.",
+        "Text runs off the bottom of a slide, or a table is cut at the page edge."
+      ],
+      "required_evidence": [["rendered_pages"], ["request"]],
+      "optional_evidence": ["artifact_record", "current_version"]
+    },
+    {
+      "id": "C11",
+      "name": "Wrong file identity",
+      "invariant": "A change to a delivered file is its next version (same name, same file); a new request is a new file; an unrelated question creates no version.",
+      "question": "Does the file and version record match the request: a change becomes the next version of the same file, a new request a new file, an unrelated question no new version?",
+      "pass_examples": [
+        "'Change the title' edits report.docx in place, revision 1 of the same file id.",
+        "An aside question about a German phrase leaves the app at version 2."
+      ],
+      "fail_examples": [
+        "'Change the title' creates report-2.docx next to the original.",
+        "An unrelated question creates version 3 of the app."
+      ],
+      "required_evidence": [["artifact_record"], ["request"]],
+      "optional_evidence": ["answer", "answer_excerpt"]
+    },
+    {
+      "id": "C12",
+      "name": "Media not delivered",
+      "invariant": "Named images and sounds are embedded and visible; no broken image; no sound before a user gesture.",
+      "question": "Are the images or media the person asked for actually visible in the rendered result, without broken images?",
+      "pass_examples": [
+        "The person supplied five flag images; the side view shows the flag above the question."
+      ],
+      "fail_examples": [
+        "The person asked for flags; the screenshot shows only text, no image, while the answer claims the flags are there."
+      ],
+      "required_evidence": [["rendered_pages", "render_checks"], ["request"]],
+      "optional_evidence": ["current_version", "answer", "answer_excerpt"]
+    },
+    {
+      "id": "C13",
+      "name": "Language or register drift",
+      "invariant": "The answer follows the person's language and register (tu/vous, du/Sie, tu/usted) across all generated parts.",
+      "question": "Is every generated part of the answer in the person's language and in a register consistent with the request (and with the interface locale when given)?",
+      "pass_examples": [
+        "Request in Spanish with 'tengo', answer in Spanish with 'tu posición'.",
+        "Request in English, every sentence of the answer in English."
+      ],
+      "fail_examples": [
+        "Request in French with 'tu', the answer switches to 'vous' in its last paragraph.",
+        "Request in German, the generated note is in English."
+      ],
+      "required_evidence": [["answer", "answer_excerpt"], ["request"]],
+      "optional_evidence": ["context"]
+    },
+    {
+      "id": "C14",
+      "name": "Request misread",
+      "invariant": "The answer addresses the request as asked: place, time, constraint, quantity, object.",
+      "question": "Does the answer address the request exactly as asked (place, date, arrival or departure time, constraint, quantity, requested object)?",
+      "pass_examples": [
+        "'Be at Kyoto station before 10 am by shinkansen': options arrive before 10:00 by shinkansen.",
+        "'Change the title' changes the title and nothing else."
+      ],
+      "fail_examples": [
+        "'Arrive by 9:00' answered with options arriving at 9:20.",
+        "'5 slides' answered with 7 slides.",
+        "'Shinkansen' requested; the options use only local trains."
+      ],
+      "required_evidence": [["answer", "answer_excerpt", "current_version", "rendered_pages"], ["request"]],
+      "optional_evidence": ["context", "artifact_record"]
+    },
+    {
+      "id": "C15",
+      "name": "Silent model substitution",
+      "invariant": "A request for model X is served by X, or the substitution is stated to the caller.",
+      "question": "Was the requested model the one that served the request, or was any substitution stated to the caller?",
+      "pass_examples": [
+        "Requested atlas-glm, response header names the same model."
+      ],
+      "fail_examples": [
+        "Requested atlas-glm, served by another model with no notice."
+      ],
+      "required_evidence": [["model_record"]],
+      "optional_evidence": []
+    }
+  ],
+  "pairwise": {
+    "classes": ["C14", "C6"],
+    "question": "Compare answer A and answer B to the same request. For the defect class below, which answer satisfies the invariant better? Answer 'tie' when both are equally good or equally bad, 'unknown' when the evidence does not allow a decision."
+  }
+}

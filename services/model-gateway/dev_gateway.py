@@ -1,0 +1,962 @@
+"""M15 code transport with a frozen, conservatively priced request."""
+
+from packages.limits import LimitError
+
+from collections.abc import AsyncGenerator
+from dataclasses import dataclass, field, replace
+from decimal import Decimal, ROUND_CEILING
+import math
+import json
+import os
+import logging
+import hashlib
+from pathlib import Path
+from typing import Any, Literal
+
+import aiohttp
+from pydantic import BaseModel, Field
+from packages.dev_request import Request
+from serverless import ServerlessPolicy
+import provider_settings
+from api_routing import Target, targets, tier
+from provider_refusal import Refusal, classify_refusal, error_envelope
+from provider_retry import TransientProviderError
+from streaming import Delta
+import upstream
+from stream_usage import validate_usage
+
+
+@dataclass(frozen=True)
+class Plan:
+    body: str
+    endpoint: str
+    reserved: int
+    input_rate: Decimal
+    output_rate: Decimal
+    provider: str = ""
+    model: str = ""
+    api_key: str = ""
+    prompt_cache_key: str | None = None
+    cached_input_rate: Decimal | None = None
+    unpriced: bool = False
+    fallback: "Plan | None" = None
+    attempt_bound: int = 0
+    privacy: str = "shared"
+    # Records every provider attempt of the call, so an outcome without a usage
+    # frame is settled on what was really sent and streamed (see Meter).
+    meter: "Meter | None" = field(default=None, compare=False, repr=False)
+
+    def charge(self, incoming: int, outgoing: int, cached: int = 0) -> int:
+        cached = min(max(cached, 0), incoming)
+        input_rate = self.input_rate
+        if self.cached_input_rate is not None:
+            input_rate = (
+                incoming - cached
+            ) * self.input_rate + cached * self.cached_input_rate
+            return int(
+                (input_rate + outgoing * self.output_rate).to_integral_value(
+                    rounding=ROUND_CEILING
+                )
+            )
+        return int(
+            (
+                incoming * self.input_rate + outgoing * self.output_rate
+            ).to_integral_value(rounding=ROUND_CEILING)
+        )
+
+
+# Unmeasured attempts count one token per 3 bytes, of the request body sent and of
+# the text streamed back. Measured bodies (JSON with code and tool schemas) run
+# above 3.5 bytes per token: the estimate stays on the high side without charging
+# the max_tokens reservation.
+ESTIMATE_BYTES_PER_TOKEN = 3
+
+
+@dataclass
+class Attempt:
+    """One provider call: measured when its usage frame arrived, else estimated."""
+
+    plan: Plan
+    output_bytes: int = 0
+    cost: int | None = None
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    # The provider refused the call with an HTTP status before any answer:
+    # nothing was processed, nothing is billed.
+    refused: bool = False
+
+    def estimate(self) -> tuple[int, int, int]:
+        """(micro-EUR, input tokens, output tokens) of an attempt without usage."""
+        if self.refused:
+            return 0, 0, 0
+        try:
+            body = json.loads(self.plan.body)
+        except ValueError:
+            body = {}
+        incoming = math.ceil(len(self.plan.body.encode()) / ESTIMATE_BYTES_PER_TOKEN)
+        outgoing = math.ceil(self.output_bytes / ESTIMATE_BYTES_PER_TOKEN)
+        bound = body.get("max_tokens")
+        if isinstance(bound, int):
+            outgoing = min(outgoing, bound * int(body.get("n", 1) or 1))
+        # No cache discount is assumed for tokens nobody measured.
+        return self.plan.charge(incoming, outgoing), incoming, outgoing
+
+
+class Meter:
+    """The attempts of one API call, in order (primary, retries, fallback)."""
+
+    def __init__(self) -> None:
+        self.attempts: list[Attempt] = []
+
+    def begin(self, plan: Plan) -> Attempt:
+        attempt = Attempt(plan)
+        self.attempts.append(attempt)
+        return attempt
+
+    def summary(self) -> dict[str, int]:
+        """Measured cost where usage arrived, an estimate elsewhere (micro-EUR)."""
+        total = {"charged": 0, "estimated": 0, "input_tokens": 0, "output_tokens": 0}
+        for attempt in self.attempts:
+            if attempt.cost is not None:
+                total["charged"] += attempt.cost
+                total["input_tokens"] += attempt.input_tokens or 0
+                total["output_tokens"] += attempt.output_tokens or 0
+                continue
+            cost, incoming, outgoing = attempt.estimate()
+            total["charged"] += cost
+            total["estimated"] += cost
+            total["input_tokens"] += incoming
+            total["output_tokens"] += outgoing
+        return total
+
+
+def metered(plan: Plan, meter: Meter) -> Plan:
+    """``plan`` and its fallbacks recording their attempts in ``meter``."""
+    return replace(
+        plan,
+        meter=meter,
+        fallback=metered(plan.fallback, meter) if plan.fallback else None,
+    )
+
+
+class ProviderRejection(RuntimeError):
+    """The provider answered the call with an error status: nothing to bill."""
+
+
+def _cache_key(api_key_id: str, body: dict[str, Any]) -> str:
+    """One cache key per conversation: the API key and the start of the conversation.
+
+    The provider routes requests with the same key to the same cache. Its guide asks
+    for a conversation or session identifier; the API is stateless, so the opening
+    messages (leading system messages and the first user message) stand for it: they
+    never change while an agent appends turns. Measured 2026-11-17 with 12 parallel
+    agent sessions on one API key: one key per conversation served 81 percent of the
+    prompt tokens from the cache, one key per system prompt 71 percent."""
+    messages = body.get("messages")
+    opening: list[Any] = []
+    for message in messages if isinstance(messages, list) else []:
+        opening.append(message)
+        if not isinstance(message, dict) or message.get("role") != "system":
+            break
+    digest = hashlib.sha256(
+        json.dumps(opening, sort_keys=True, ensure_ascii=False).encode()
+    ).hexdigest()
+    return hashlib.sha256((api_key_id + ":" + digest).encode()).hexdigest()
+
+
+def prepare_api(
+    request: Any,
+    usage: str,
+    api_key_id: str,
+    *,
+    strict: bool = False,
+    pinned: bool = False,
+    fallback: bool = True,
+) -> Plan:
+    """Freeze a public usage route; raw IDs never enter this decision."""
+    body = request.model_dump(exclude_none=True, by_alias=True)
+    # One choice without log probabilities is the provider default: keep the body unchanged.
+    if body.get("n") == 1:
+        body.pop("n")
+    if body.get("logprobs") is False:
+        body.pop("logprobs")
+    # Same wire cleanup as prepare(): strict providers reject empty tool_calls,
+    # empty tool lists and an unrequested response_format with HTTP 422.
+    if "response_format" not in request.model_fields_set:
+        body.pop("response_format", None)
+    for message in body["messages"]:
+        if not message.get("tool_calls"):
+            message.pop("tool_calls", None)
+    if not request.tools or request.tool_choice == "none":
+        for key in ("tools", "tool_choice", "parallel_tool_calls"):
+            body.pop(key, None)
+    requested = str(body.get("reasoning_effort", "none"))
+    _, effort = tier(usage, requested)
+    if effort != requested:
+        # A usage with a fixed tier also sends that effort to targets that forward it.
+        body["reasoning_effort"] = effort
+    # Several choices (n) multiply the output the provider may bill.
+    outgoing = request.max_tokens * getattr(request, "n", 1)
+    _, entries = targets(usage, effort, strict=strict, pinned=pinned)
+    incoming = len(json.dumps(body, ensure_ascii=False).encode()) + 512
+    # A requested JSON format gets one corrective attempt, like the code route.
+    retry_margin = 512 if request.validate_output else 0
+    # Estimate tokens as bytes / 4. The reservation remains conservative in
+    # bytes, but is clamped to each target's advertised context.
+    estimated_tokens = incoming // 4
+    fitting = [entry for entry in entries if entry.context >= estimated_tokens]
+    if not fitting:
+        raise LimitError(
+            "context_exceeded", estimated_tokens, entries[0].context, "tokens"
+        )
+
+    def one(target: Target) -> Plan:
+        prices = ServerlessPolicy(allow_unpriced=True).prices
+        price = prices[target.model]
+        # An owned target has no fixed address: the operator configures its server.
+        endpoint = (
+            provider_settings.owned_endpoint()
+            if target.privacy == "owned"
+            else str(provider_settings.preset_value(target.provider, "base_url"))
+        ).rstrip("/")
+        payload = dict(
+            body,
+            model=target.model,
+            stream=True,
+            stream_options={"include_usage": True},
+        )
+        if not payload.get("temperature"):
+            # Greedy sampling ignores top_p and top_k, and one routed provider refuses them with it.
+            payload.pop("top_p", None)
+            payload.pop("top_k", None)
+            greedy_top_p = provider_settings.preset_value(
+                target.provider, "greedy_top_p"
+            )
+            if payload.get("temperature") == 0 and isinstance(
+                greedy_top_p, (int, float)
+            ):
+                payload["top_p"] = greedy_top_p
+        seed_field = provider_settings.preset_value(target.provider, "seed_field")
+        if seed_field and "seed" in payload:
+            payload[seed_field] = payload.pop("seed")
+        if target.effort is not None:
+            # Measured 2026-10-30: some routed models accept only low, high and max.
+            payload["reasoning_effort"] = target.effort
+        if provider_settings.preset_value(target.provider, "prompt_cache_key"):
+            payload["prompt_cache_key"] = _cache_key(api_key_id, payload)
+        return Plan(
+            json.dumps(payload, ensure_ascii=False),
+            endpoint,
+            0,
+            Decimal(str(price["input_eur_per_mtok"])),
+            Decimal(str(price["output_eur_per_mtok"])),
+            provider=target.provider,
+            model=target.model,
+            api_key=provider_settings.api_key_for(target.provider),
+            privacy=target.privacy,
+            prompt_cache_key=payload.get("prompt_cache_key"),
+            cached_input_rate=(
+                Decimal(str(price["cached_input_eur_per_mtok"]))
+                if price.get("cached_input_eur_per_mtok") is not None
+                else None
+            ),
+        )
+
+    plans = [one(entry) for entry in fitting]
+    bound = sum(
+        (
+            plan.charge(min(incoming + retry_margin, target.context), outgoing)
+            for plan, target in zip(plans, fitting)
+        ),
+        0,
+    )
+    if request.validate_output:
+        # The corrective attempt stays inside the same reservation.
+        bound *= 2
+    if bound > call_cap():
+        raise LimitError("cost_budget", bound, call_cap(), "microEUR")
+    primary = replace(
+        plans[0],
+        reserved=bound,
+        attempt_bound=plans[0].charge(
+            min(incoming + retry_margin, fitting[0].context), outgoing
+        ),
+    )
+    if len(plans) > 1 and fallback:
+        fallback_plan = plans[1]
+        if strict:
+            fallback_plan = replace(fallback_plan, fallback=None)
+        primary = replace(
+            primary,
+            fallback=replace(
+                fallback_plan,
+                attempt_bound=fallback_plan.charge(
+                    min(incoming + retry_margin, fitting[1].context), outgoing
+                ),
+            ),
+        )
+    return primary
+
+
+def prepare(request: Request) -> Plan:
+    policy = ServerlessPolicy()
+    model = policy.models["code"]
+    body = request.model_dump(exclude_none=True, by_alias=True)
+    if "response_format" not in request.model_fields_set:
+        body.pop("response_format", None)
+    for message in body["messages"]:
+        if not message["tool_calls"]:
+            message.pop("tool_calls")
+    body["messages"].insert(
+        0, {"role": "system", "content": Path("prompts/code-language.txt").read_text()}
+    )
+    body.update(
+        model=model,
+        max_tokens=request.max_tokens,
+        temperature=request.temperature,
+        reasoning_effort=request.reasoning_effort,
+        stream=True,
+        stream_options={"include_usage": True},
+    )
+    if not request.tools or request.tool_choice == "none":
+        for key in ("tools", "tool_choice", "parallel_tool_calls"):
+            body.pop(key, None)
+    if os.environ.get("ATLAS_PROVIDER"):
+        body = provider_settings.request_options(body)
+    incoming = len(json.dumps(body, ensure_ascii=False).encode()) + 512
+    context = policy.config["code"]["capabilities"][model]["context"]
+    retry_margin = 512 if request.validate_output else 0
+    if incoming + retry_margin + request.max_tokens > context:
+        raise LimitError(
+            "context_exceeded",
+            incoming + retry_margin + request.max_tokens,
+            context,
+            "tokens",
+        )
+    preset = bool(os.environ.get("ATLAS_PROVIDER"))
+    endpoint = (
+        provider_settings.endpoint()
+        if preset
+        else os.environ["SCW_GENERATIVE_BASE_URL"].rstrip("/")
+    )
+    if not preset and not endpoint.startswith("https://"):
+        raise ValueError("provider_configuration")
+
+    def priced_plan(role: str) -> Plan:
+        selected_model = policy.models[role]
+        context = policy.config[role]["capabilities"][selected_model]["context"]
+        if incoming + retry_margin + request.max_tokens > context:
+            raise LimitError(
+                "context_exceeded",
+                incoming + retry_margin + request.max_tokens,
+                context,
+                "tokens",
+            )
+        price = policy.prices[selected_model]
+        return Plan(
+            json.dumps(dict(body, model=selected_model), ensure_ascii=False),
+            endpoint,
+            0,
+            Decimal(str(price["input_eur_per_mtok"])),
+            Decimal(str(price["output_eur_per_mtok"])),
+            unpriced=bool(price.get("unpriced", False)),
+        )
+
+    plan = priced_plan("code")
+    fallback = (
+        priced_plan("text_fallback")
+        if preset and "text_fallback" in policy.models
+        else None
+    )
+    unpriced = plan.unpriced or bool(fallback and fallback.unpriced)
+    if unpriced:
+        # An unpriced route has no defensible monetary bound, including recovery.
+        plan = replace(
+            plan, input_rate=Decimal(0), output_rate=Decimal(0), unpriced=True
+        )
+        if fallback:
+            fallback = replace(
+                fallback, input_rate=Decimal(0), output_rate=Decimal(0), unpriced=True
+            )
+    bound = plan.charge(incoming + retry_margin, request.max_tokens)
+    plan = replace(plan, attempt_bound=bound)
+    if fallback:
+        fallback_bound = fallback.charge(incoming + retry_margin, request.max_tokens)
+        fallback = replace(fallback, attempt_bound=fallback_bound)
+        bound += fallback_bound
+    reserved = bound * (2 if request.validate_output else 1)
+    if not preset:
+        reserved = plan.charge(incoming, request.max_tokens)
+        if request.validate_output:
+            reserved += plan.charge(incoming + retry_margin, request.max_tokens)
+    if reserved > call_cap() or (not preset and reserved <= 0):
+        raise LimitError("cost_budget", reserved, call_cap(), "microEUR")
+    return replace(plan, reserved=reserved, fallback=fallback)
+
+
+def call_cap() -> int:
+    """Per-call reservation ceiling in microEUR (default 0.05 EUR).
+
+    Coding clients such as Codex send large first requests; operators may raise
+    the ceiling with ATLAS_RAW_CALL_MAX_MICRO_EUR (bounded to 5 EUR). Key, user
+    and instance budgets still apply on top of it.
+    """
+    try:
+        value = int(os.environ.get("ATLAS_RAW_CALL_MAX_MICRO_EUR", "50000"))
+    except ValueError:
+        return 50000
+    return min(max(value, 1), 5000000)
+
+
+def raw_models() -> dict[str, str]:
+    """Public raw IDs for configured chat roles; embeddings have no chat endpoint."""
+    policy = ServerlessPolicy(allow_unpriced=True)
+    return {
+        "raw/" + model: role
+        for role, model in policy.models.items()
+        if role != "embedding"
+        and "context" in policy.config[role]["capabilities"][model]
+    }
+
+
+def client_raw_model(name: str) -> str:
+    """Resolve client aliases without allowing arbitrary provider model selection."""
+    configured = raw_models()
+    if name in configured:
+        return name
+    default = os.environ.get("ATLAS_API_DEFAULT_RAW_MODEL") or (
+        "raw/" + ServerlessPolicy(allow_unpriced=True).models["code"]
+    )
+    if default not in configured:
+        raise ValueError("invalid_default_raw_model")
+    return default
+
+
+def prepare_raw(request: Any) -> Plan:
+    """Prepare a direct configured-model request without an Atlas prompt or fallback."""
+    policy = ServerlessPolicy(allow_unpriced=True)
+    roles = raw_models()
+    role = roles.get(request.model)
+    if role is None:
+        raise ValueError("invalid_model")
+    model = policy.models[role]
+    price = policy.prices.get(model)
+    if price is None or price.get("unpriced", False):
+        raise LimitError("unpriced_model", 0, 0, "microEUR")
+    body = request.model_dump(exclude_none=True, by_alias=True)
+    body.update(model=model, stream=True, stream_options={"include_usage": True})
+    incoming = len(json.dumps(body, ensure_ascii=False).encode()) + 512
+    images = sum(
+        1
+        for message in body["messages"]
+        if isinstance(message.get("content"), list)
+        for part in message["content"]
+        if isinstance(part, dict) and part.get("type") == "image_url"
+    )
+    incoming += images * 16384
+    if images and not policy.config[role]["capabilities"][model].get("vision"):
+        raise ValueError("missing_capabilities")
+    context = policy.config[role]["capabilities"][model]["context"]
+    if incoming + request.max_tokens > context:
+        raise LimitError(
+            "context_exceeded", incoming + request.max_tokens, context, "tokens"
+        )
+    plan = Plan(
+        json.dumps(body, ensure_ascii=False),
+        provider_settings.endpoint()
+        if os.environ.get("ATLAS_PROVIDER")
+        else os.environ["SCW_GENERATIVE_BASE_URL"].rstrip("/"),
+        0,
+        Decimal(str(price["input_eur_per_mtok"])),
+        Decimal(str(price["output_eur_per_mtok"])),
+    )
+    reserved = plan.charge(incoming, request.max_tokens)
+    if reserved <= 0 or reserved > call_cap():
+        raise LimitError("cost_budget", reserved, call_cap(), "microEUR")
+    return replace(plan, reserved=reserved, attempt_bound=reserved)
+
+
+def retry(plan: Plan, error: str, remaining: int) -> Plan:
+    body = json.loads(plan.body)
+    body["messages"].append(
+        {
+            "role": "user",
+            "content": "Previous output failed validation: "
+            + error[:80]
+            + ". Produce a nonempty answer in the requested response format; JSON must satisfy the supplied schema.",
+        }
+    )
+    incoming = len(json.dumps(body, ensure_ascii=False).encode()) + 512
+    reserved = plan.charge(incoming, body["max_tokens"])
+    fallback = None
+    if plan.fallback:
+        fallback_body = dict(body, model=json.loads(plan.fallback.body)["model"])
+        fallback = replace(
+            plan.fallback, body=json.dumps(fallback_body, ensure_ascii=False)
+        )
+        reserved += fallback.charge(incoming, body["max_tokens"])
+    if reserved > remaining:
+        raise LimitError("cost_budget", reserved, remaining, "microEUR")
+    return replace(
+        plan,
+        body=json.dumps(body, ensure_ascii=False),
+        reserved=reserved,
+        fallback=fallback,
+    )
+
+
+def corrected(plan: Plan, note: str) -> Plan:
+    """The same request with a short correction after the conversation.
+
+    Used when a tool call stayed unusable (arguments that are not valid JSON): the
+    corrected attempt runs inside the same reservation, on every target of the plan.
+    """
+    body = json.loads(plan.body)
+    body["messages"] = [
+        *(body.get("messages") or []),
+        {"role": "user", "content": note},
+    ]
+    return replace(
+        plan,
+        body=json.dumps(body, ensure_ascii=False),
+        fallback=corrected(plan.fallback, note) if plan.fallback else None,
+    )
+
+
+class Usage(BaseModel):
+    prompt_tokens: int = Field(ge=0, le=1048576, strict=True)
+    completion_tokens: int = Field(ge=0, le=8 * 32768, strict=True)
+    total_tokens: int | None = Field(default=None, ge=0, strict=True)
+    prompt_tokens_details: dict[str, int] | None = None
+    # Reasoning tokens reach Responses usage (output_tokens_details); some providers
+    # send null for details they do not count.
+    completion_tokens_details: dict[str, int | None] | None = None
+
+
+class Choice(BaseModel):
+    index: int = Field(ge=0, le=7, strict=True)
+    delta: dict[str, Any]
+    finish_reason: Literal["stop", "tool_calls", "length"] | None = None
+    logprobs: dict[str, Any] | None = None
+
+
+class Frame(BaseModel):
+    error: None = None
+    choices: list[Choice] = Field(max_length=8)
+    usage: Usage | None = None
+
+
+async def transport(plan: Plan) -> AsyncGenerator[bytes, None]:
+    started = False
+    try:
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=60 if plan.fallback else 120),
+            trust_env=False,
+        ) as session:
+            async with session.post(
+                plan.endpoint + "/chat/completions",
+                data=plan.body.encode(),
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": "Bearer "
+                    + (plan.api_key or provider_settings.api_key()),
+                },
+                allow_redirects=False,
+            ) as response:
+                if response.status != 200:
+                    refusal = classify_refusal(
+                        response.status,
+                        await error_envelope(response),
+                        (plan.api_key or provider_settings.api_key(),),
+                    )
+                    # One line per refused call: status, the provider's error
+                    # identifiers and a class. Never its message, the request
+                    # or the key.
+                    logging.getLogger(__name__).warning(
+                        "devapi_provider_refusal provider=%s model=%s status=%s %s",
+                        plan.provider or "-",
+                        plan.model or "-",
+                        response.status,
+                        refusal.fields(),
+                    )
+                    if refusal.kind == "credit":
+                        # Provider account out of credit, whatever the status that
+                        # carries it: try the fallback target, and if none is left
+                        # report a credit refusal, never a provider failure (D5).
+                        logging.getLogger(__name__).warning(
+                            "devapi_provider_credit", extra={"provider": plan.provider}
+                        )
+                        raise TransientProviderError(
+                            "provider_quota",
+                            detail=f"http_{response.status}",
+                            status=response.status,
+                            refusal=refusal,
+                        )
+                    if response.status == 429 or response.status >= 500:
+                        raise TransientProviderError(
+                            "provider_error",
+                            detail=f"http_{response.status}",
+                            status=response.status,
+                            retry_after=response.headers.get("Retry-After"),
+                            refusal=refusal,
+                        )
+                    raise ProviderRejection("provider_error")
+                with upstream.abort_if_abandoned(response):
+                    async for piece in response.content.iter_chunked(16384):
+                        started = True
+                        yield piece
+    except (aiohttp.ClientError, TimeoutError) as exc:
+        if isinstance(exc, TimeoutError):
+            raise TransientProviderError(
+                "provider_timeout",
+                started=started,
+                detail=type(exc).__name__,
+                status=504,
+            ) from None
+        raise TransientProviderError(
+            "provider_error", started=started, detail=type(exc).__name__, status=503
+        ) from None
+
+
+async def attempt_events(
+    plan: Plan, meter: Meter | None = None
+) -> AsyncGenerator[dict[str, Any], None]:
+    """One provider call, recorded in the meter (measured, refused or estimated)."""
+    from contextlib import aclosing
+
+    wanted = int(json.loads(plan.body).get("n", 1))
+    attempt = (meter or plan.meter or Meter()).begin(plan)
+    try:
+        async with aclosing(_attempt_frames(plan, attempt, wanted)) as frames:
+            async for frame in frames:
+                yield frame
+    except (TransientProviderError, ProviderRejection) as exc:
+        # The provider refused the call or failed before sending one byte of an
+        # answer: like the fallback policy, nothing is billed for it.
+        if attempt.output_bytes == 0 and (
+            isinstance(exc, ProviderRejection)
+            or (isinstance(exc, TransientProviderError) and not exc.started)
+        ):
+            attempt.refused = True
+        raise
+
+
+async def _attempt_frames(
+    plan: Plan, attempt: Attempt, wanted: int
+) -> AsyncGenerator[dict[str, Any], None]:
+    from contextlib import aclosing
+
+    buffer, total, done = b"", 0, False
+    finished: set[int] = set()
+    usage: Usage | None = None
+    async with aclosing(transport(plan)) as chunks:
+        async for piece in chunks:
+            total += len(piece)
+            if total > 2_000_000:
+                raise LimitError("provider_stream_limit", total, 2_000_000, "bytes")
+            buffer += piece
+            while b"\n" in buffer:
+                line, buffer = buffer.split(b"\n", 1)
+                line = line.strip()
+                if not line or line.startswith(b":"):
+                    continue
+                if done or not line.startswith(b"data:"):
+                    raise ValueError("invalid_provider_stream")
+                data = line[5:].strip()
+                if data == b"[DONE]":
+                    done = True
+                    continue
+                frame = Frame.model_validate(json.loads(data))
+                if frame.usage is not None:
+                    if os.environ.get("ATLAS_PROVIDER"):
+                        validate_usage(
+                            frame.usage.model_dump(exclude_none=True),
+                            usage.model_dump(exclude_none=True)
+                            if usage is not None
+                            else None,
+                        )
+                        maximum = json.loads(plan.body)["max_tokens"] * wanted
+                        if frame.usage.completion_tokens > maximum:
+                            raise LimitError(
+                                "output_budget",
+                                frame.usage.completion_tokens,
+                                maximum,
+                                "tokens",
+                            )
+                    elif usage is not None:
+                        raise ValueError("duplicate_usage")
+                    usage = frame.usage
+                for choice in frame.choices:
+                    if choice.index in finished or choice.index >= wanted:
+                        raise ValueError("delta_after_finish")
+                    if choice.finish_reason is not None:
+                        finished.add(choice.index)
+                    # Routed and preset providers may stream typed content parts
+                    # (text, reasoning, references); keep only the answer text.
+                    if (
+                        os.environ.get("ATLAS_PROVIDER") or plan.provider
+                    ) and "content" in choice.delta:
+                        thinking = Delta.thinking_text(choice.delta["content"])
+                        if thinking:
+                            choice.delta["reasoning_content"] = (
+                                str(choice.delta.get("reasoning_content") or "")
+                                + thinking
+                            )
+                        choice.delta["content"] = Delta.text_content(
+                            choice.delta["content"]
+                        )
+                    # vLLM servers name it reasoning_content or reasoning.
+                    if isinstance(choice.delta.get("reasoning"), str):
+                        choice.delta["reasoning_content"] = str(
+                            choice.delta.get("reasoning_content") or ""
+                        ) + str(choice.delta.pop("reasoning"))
+                for choice in frame.choices:
+                    attempt.output_bytes += _streamed_bytes(choice.delta)
+                if frame.choices:
+                    yield {
+                        "choices": [
+                            c.model_dump(exclude_none=True)
+                            | {"finish_reason": c.finish_reason}
+                            for c in frame.choices
+                        ]
+                    }
+    if buffer.strip() or not done or len(finished) != wanted or usage is None:
+        raise ValueError("incomplete_provider_stream")
+    attempt.cost = plan.charge(
+        usage.prompt_tokens,
+        usage.completion_tokens,
+        (usage.prompt_tokens_details or {}).get("cached_tokens", 0),
+    )
+    attempt.input_tokens = usage.prompt_tokens
+    attempt.output_tokens = usage.completion_tokens
+    yield {
+        "choices": [],
+        "usage": usage.model_dump(exclude_none=True),
+        "cost_micro_eur": attempt.cost,
+        "served_by": _target(plan),
+        "privacy": plan.privacy,
+    }
+
+
+def _streamed_bytes(delta: dict[str, Any]) -> int:
+    """UTF-8 bytes of the text, reasoning and tool calls a provider delta carries."""
+    size = 0
+    for key in ("content", "reasoning_content"):
+        if isinstance(delta.get(key), str):
+            size += len(delta[key].encode())
+    for call in delta.get("tool_calls") or []:
+        function = call.get("function") if isinstance(call, dict) else None
+        if isinstance(function, dict):
+            for key in ("name", "arguments"):
+                if isinstance(function.get(key), str):
+                    size += len(function[key].encode())
+    return size
+
+
+def _has_visible_content(frame: dict[str, Any]) -> bool:
+    return any(
+        bool(choice.get("delta", {}).get("content"))
+        or choice.get("delta", {}).get("tool_calls")
+        for frame_choices in (frame.get("choices", []),)
+        for choice in frame_choices
+        if isinstance(choice, dict)
+    )
+
+
+def _cut_by_length(frames: list[dict[str, Any]]) -> bool:
+    """Every choice of the attempt ended because the output budget ran out."""
+    reasons = [
+        choice.get("finish_reason")
+        for frame in frames
+        for choice in frame.get("choices", [])
+        if isinstance(choice, dict) and choice.get("finish_reason") is not None
+    ]
+    return bool(reasons) and all(reason == "length" for reason in reasons)
+
+
+def _settle(
+    frame: dict[str, Any], attempts: list[tuple[Plan, Usage]]
+) -> dict[str, Any]:
+    if not attempts:
+        return frame
+    usage = Usage.model_validate(frame["usage"])
+    for prior_plan, prior_usage in attempts:
+        usage.prompt_tokens += prior_usage.prompt_tokens
+        usage.completion_tokens += prior_usage.completion_tokens
+        if usage.total_tokens is not None and prior_usage.total_tokens is not None:
+            usage.total_tokens += prior_usage.total_tokens
+        frame["cost_micro_eur"] += prior_plan.charge(
+            prior_usage.prompt_tokens,
+            prior_usage.completion_tokens,
+            (prior_usage.prompt_tokens_details or {}).get("cached_tokens", 0),
+        )
+    frame["usage"] = usage.model_dump(exclude_none=True)
+    return frame
+
+
+def _target(plan: Plan) -> str | None:
+    return plan.provider + "/" + plan.model if plan.provider else None
+
+
+def substitution_reason(exc: BaseException) -> str:
+    """Public class of the failure that moved a call to its fallback target."""
+    if str(exc) == "provider_quota":
+        return "provider_quota"
+    refusal = getattr(exc, "refusal", None)
+    if refusal is not None and refusal.kind == "capacity":
+        return "capacity"
+    status = getattr(exc, "status", None)
+    if status == 429:
+        return "rate_limit"
+    if str(exc) == "provider_timeout":
+        return "provider_timeout"
+    if isinstance(status, int) and status >= 500:
+        return "provider_unavailable"
+    return "provider_error"
+
+
+def _substituted(frame: dict[str, Any], substitution: dict[str, Any]) -> dict[str, Any]:
+    """A fallback frame names the target asked first and why it did not answer.
+
+    Every frame carries it, so the first chunk the caller receives already names
+    the model that answers (C15: a substitution is never silent)."""
+    frame["substitution"] = substitution
+    return frame
+
+
+async def events(plan: Plan) -> AsyncGenerator[dict[str, Any], None]:
+    from contextlib import aclosing
+
+    meter = plan.meter or Meter()
+    first = len(meter.attempts)
+    attempts: list[tuple[Plan, Usage]] = []
+    emitted = False
+    held: list[dict[str, Any]] = []
+    try:
+        for current in (plan, plan):
+            held = []
+            visible = False
+            async with aclosing(attempt_events(current, meter)) as attempt:
+                async for frame in attempt:
+                    if visible:
+                        if "cost_micro_eur" in frame:
+                            _settle(frame, attempts)
+                        emitted = True
+                        yield frame
+                        continue
+                    held.append(frame)
+                    if _has_visible_content(frame):
+                        visible = True
+                        for held_frame in held:
+                            if "cost_micro_eur" in held_frame:
+                                _settle(held_frame, attempts)
+                            emitted = True
+                            yield held_frame
+            if visible:
+                return
+            terminal = held[-1]
+            usage = Usage.model_validate(terminal["usage"])
+            if usage.completion_tokens == 0:
+                raise ValueError("empty_completion")
+            if _cut_by_length(held):
+                # The caller's max_tokens ran out while the model was still
+                # reasoning. The same request would run out the same way: return
+                # the outcome as it is (finish_reason "length", the reasoning and
+                # the usage), never a retry or a provider failure.
+                for held_frame in held:
+                    if "cost_micro_eur" in held_frame:
+                        _settle(held_frame, attempts)
+                    emitted = True
+                    yield held_frame
+                return
+            attempts.append((current, usage))
+            logging.getLogger(__name__).warning(
+                "devapi_retry",
+                extra={"reason": "reasoning_only_answer", "attempt": len(attempts)},
+            )
+        if plan.fallback is None:
+            raise ValueError("reasoning_only_answer")
+        held = []
+        visible = False
+        reasoned = {
+            "from": _target(plan),
+            "served": _target(plan.fallback),
+            "reason": "reasoning_only_answer",
+        }
+        async with aclosing(attempt_events(plan.fallback, meter)) as attempt:
+            async for frame in attempt:
+                _substituted(frame, reasoned)
+                if visible:
+                    if "cost_micro_eur" in frame:
+                        _settle(frame, attempts)
+                    emitted = True
+                    yield frame
+                    continue
+                held.append(frame)
+                if _has_visible_content(frame):
+                    visible = True
+                    for held_frame in held:
+                        if "cost_micro_eur" in held_frame:
+                            _settle(held_frame, attempts)
+                        emitted = True
+                        yield held_frame
+        if visible:
+            return
+        emitted = True
+        yield _settle(held[-1], attempts)
+        return
+    except TransientProviderError as exc:
+        # Never append a second answer to frames the client already received.
+        if emitted or plan.fallback is None:
+            for frame in held if not emitted else []:
+                yield frame
+            raise
+        failed_primary_started = exc.started
+        fallback_reason = f"{exc} {exc.detail}".strip()
+        fallback_refusal = exc.refusal or Refusal()
+        substitution: dict[str, Any] = {
+            "from": _target(plan),
+            "served": _target(plan.fallback),
+            "reason": substitution_reason(exc),
+        }
+        if isinstance(exc.status, int):
+            substitution["provider_status"] = exc.status
+    except Exception:
+        # Keep the stream shape of a failed attempt: frames held back while
+        # waiting for visible content still reach the client before the error.
+        if not emitted:
+            for frame in held:
+                yield frame
+        raise
+    # The reason and both targets are in the message itself: the service log
+    # format prints the message only, and the provider alert needs the cause.
+    # The class and the provider's error identifiers follow the existing fields.
+    logging.getLogger(__name__).warning(
+        "devapi_transient_fallback from=%s/%s to=%s/%s reason=%s started=%s %s",
+        plan.provider,
+        plan.model,
+        plan.fallback.provider if plan.fallback else "",
+        plan.fallback.model if plan.fallback else "",
+        fallback_reason[:80],
+        failed_primary_started,
+        fallback_refusal.fields(),
+    )
+    async with aclosing(attempt_events(plan.fallback, meter)) as attempt:
+        async for frame in attempt:
+            _substituted(frame, substitution)
+            if "cost_micro_eur" in frame:
+                # The failed primary sent no usage: it is charged an estimate from
+                # the request sent and the text it streamed (nothing when the
+                # provider refused it), never its max_tokens bound.
+                estimated = sum(
+                    failed.estimate()[0]
+                    for failed in meter.attempts[first:]
+                    if failed.cost is None
+                )
+                if estimated:
+                    frame["cost_micro_eur"] += estimated
+                    frame["estimated_micro_eur"] = (
+                        frame.get("estimated_micro_eur", 0) + estimated
+                    )
+                _settle(frame, attempts)
+            yield frame

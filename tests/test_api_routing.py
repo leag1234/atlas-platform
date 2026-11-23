@@ -1,0 +1,965 @@
+"""Public usage routing is configuration-driven and has no provider I/O."""
+
+import os
+from collections.abc import AsyncIterator
+import unittest
+from unittest.mock import patch
+
+from api_routing import select_public_model, targets
+import dev_gateway
+
+OWNED_URL = "http://127.0.0.1:18090/v1"
+
+
+class ApiRoutingTests(unittest.TestCase):
+    def test_usage_effort_routes_and_aliases(self) -> None:
+        for usage, effort, model in (
+            ("atlas-code", "none", "zai-glm-5-3-flash"),
+            ("atlas-code", "high", "zai-glm-5-3"),
+            ("atlas-chat", "medium", "zai-glm-5-3"),
+            ("atlas-chat-2026-10-30", "low", "zai-glm-5-3"),
+        ):
+            resolved, entries = targets(usage, effort)
+            self.assertIn(resolved, ("atlas-code", "atlas-chat"))
+            self.assertEqual(entries[0].model, model)
+            self.assertEqual(entries[1].provider, "scaleway")
+
+    def test_atlas_code_low_routes_mistral_large_first(self) -> None:
+        _, entries = targets("atlas-code", "low")
+        self.assertEqual(
+            [(entry.provider, entry.model, entry.effort) for entry in entries],
+            [
+                ("mistral", "mistral-large-4", "low"),
+                ("mistral", "zai-glm-5-3", "low"),
+                ("scaleway", "deepseek-v4-flash-0731", None),
+            ],
+        )
+
+    def test_unknown_client_defaults_to_code_but_raw_is_refused(self) -> None:
+        self.assertEqual(select_public_model("claude-fictional"), "atlas-code")
+        self.assertEqual(select_public_model("gpt-fictional"), "atlas-code")
+        with self.assertRaises(ValueError):
+            select_public_model("raw/internal")
+
+    def test_strict_mode_keeps_only_owned_targets_and_never_falls_back(self) -> None:
+        with (
+            patch(
+                "api_routing.config",
+                return_value={
+                    "usages": {
+                        "atlas-code": {
+                            "none": [
+                                {
+                                    "provider": "mistral",
+                                    "model": "shared",
+                                    "context": 1000,
+                                },
+                                {
+                                    "provider": "owned-vllm",
+                                    "model": "owned",
+                                    "context": 1000,
+                                    "privacy": "owned",
+                                },
+                            ]
+                        }
+                    }
+                },
+            ),
+            patch.dict(os.environ, {"ATLAS_OWNED_VLLM_BASE_URL": OWNED_URL}),
+        ):
+            _, entries = targets("atlas-code", "none", strict=True)
+        self.assertEqual([target.privacy for target in entries], ["owned"])
+        self.assertEqual(entries[0].model, "owned")
+
+    def test_owned_targets_serve_strict_requests_only(self) -> None:
+        # The configured owned target is never a fallback for shared traffic.
+        with patch.dict(os.environ, {"ATLAS_OWNED_VLLM_BASE_URL": OWNED_URL}):
+            for usage in ("atlas-code", "atlas-chat"):
+                for effort in ("none", "low", "medium", "high"):
+                    _, shared = targets(usage, effort)
+                    self.assertNotIn("owned", [t.privacy for t in shared])
+                    _, owned = targets(usage, effort, strict=True)
+                    self.assertEqual([t.provider for t in owned], ["owned-vllm"])
+
+    def test_standard_plan_chain_never_contains_owned_target(self) -> None:
+        # Even an owned target listed first, with its server configured, is never a
+        # primary or a fallback of a standard request.
+        from packages.dev_request import Request
+
+        request = Request.model_validate(
+            {"messages": [{"role": "user", "content": "Hello"}], "max_tokens": 10}
+        )
+        owned = {
+            "provider": "owned-vllm",
+            "model": "owned",
+            "context": 1000,
+            "privacy": "owned",
+        }
+        shared = [
+            {"provider": "mistral", "model": "first", "context": 1000},
+            {"provider": "scaleway", "model": "second", "context": 1000},
+        ]
+        routing = {"usages": {"atlas-code": {"none": [owned, *shared, owned]}}}
+        prices = {
+            name: {"input_eur_per_mtok": 0, "output_eur_per_mtok": 0}
+            for name in ("owned", "first", "second")
+        }
+        with (
+            patch("api_routing.config", return_value=routing),
+            patch("dev_gateway.ServerlessPolicy") as policy,
+            patch.dict(os.environ, {"ATLAS_OWNED_VLLM_BASE_URL": OWNED_URL}),
+        ):
+            policy.return_value.prices = prices
+            plan = dev_gateway.prepare_api(request, "atlas-code", "key-test")
+        fallback = plan.fallback
+        assert fallback is not None
+        chain = [plan, fallback]
+        self.assertEqual([p.model for p in chain], ["first", "second"])
+        self.assertEqual([p.privacy for p in chain], ["shared", "shared"])
+        self.assertIsNone(fallback.fallback)
+
+    def test_routing_unchanged_without_an_owned_server(self) -> None:
+        # Production has no owned server: standard routes are the configured shared
+        # targets in order, the owned id is neither listed nor pinnable, strict is 403.
+        from api_routing import config, pinned_models, pinned_target
+
+        env = {k: v for k, v in os.environ.items() if k != "ATLAS_OWNED_VLLM_BASE_URL"}
+        with patch.dict(os.environ, env, clear=True):
+            for usage in ("atlas-code", "atlas-chat"):
+                for effort, entries in config()["usages"][usage].items():
+                    shared = [
+                        (e["provider"], e["model"])
+                        for e in entries
+                        if e.get("privacy") != "owned"
+                    ]
+                    _, routed = targets(usage, effort)
+                    self.assertEqual([(t.provider, t.model) for t in routed], shared)
+                    with self.assertRaises(ValueError) as raised:
+                        targets(usage, effort, strict=True)
+                    self.assertEqual(
+                        str(raised.exception), "strict_privacy_unavailable"
+                    )
+            self.assertFalse(any(m.startswith("owned-vllm/") for m in pinned_models()))
+            with self.assertRaises(ValueError) as pinned:
+                targets("owned-vllm/owned-vllm-model", "none", pinned=True)
+            self.assertEqual(str(pinned.exception), "invalid_model")
+            self.assertIsNotNone(pinned_target("owned-vllm/owned-vllm-model"))
+
+    def test_strict_context_plans_owned_target_with_the_real_policy(self) -> None:
+        from packages import privacy
+        from packages.dev_request import Request
+        from serverless_support import environment
+
+        request = Request.model_validate(
+            {"messages": [{"role": "user", "content": "Bonjour"}], "max_tokens": 10}
+        )
+        env = environment() | {
+            "ATLAS_HIDDEN_PROFILES": "atlas-mistral",
+            "MISTRAL_API_KEY": "test-only",
+            "ATLAS_OWNED_VLLM_BASE_URL": OWNED_URL,
+            "ATLAS_OWNED_VLLM_API_KEY": "owned-test-only",
+        }
+        token = privacy.elevate("strict")
+        try:
+            with patch.dict(os.environ, env):
+                plan = dev_gateway.prepare_api(
+                    request, "atlas-chat", "key-test", strict=True
+                )
+        finally:
+            privacy.reset(token)
+        self.assertEqual(
+            (plan.endpoint, plan.model, plan.privacy),
+            (OWNED_URL, "owned-vllm-model", "owned"),
+        )
+        self.assertEqual(plan.api_key, "owned-test-only")
+        self.assertIsNone(plan.fallback)
+
+    def test_strict_mode_with_owned_target_but_no_server_is_refused(self) -> None:
+        env = {k: v for k, v in os.environ.items() if k != "ATLAS_OWNED_VLLM_BASE_URL"}
+        with patch.dict(os.environ, env, clear=True):
+            with self.assertRaises(ValueError) as raised:
+                targets("atlas-chat", "none", strict=True)
+        self.assertEqual(str(raised.exception), "strict_privacy_unavailable")
+
+    def test_owned_pinned_model_listed_only_with_a_server(self) -> None:
+        from api_routing import pinned_models
+
+        env = {k: v for k, v in os.environ.items() if k != "ATLAS_OWNED_VLLM_BASE_URL"}
+        with patch.dict(os.environ, env, clear=True):
+            self.assertNotIn("owned-vllm/owned-vllm-model", pinned_models())
+        with patch.dict(os.environ, {"ATLAS_OWNED_VLLM_BASE_URL": OWNED_URL}):
+            self.assertIn("owned-vllm/owned-vllm-model", pinned_models())
+
+    def test_strict_mode_without_owned_target_is_refused(self) -> None:
+        with self.assertRaises(ValueError) as raised:
+            targets("atlas-code", "none", strict=True)
+        self.assertEqual(str(raised.exception), "strict_privacy_unavailable")
+
+    def test_strict_mode_never_configures_a_shared_fallback(self) -> None:
+        from packages.dev_request import Request
+
+        request = Request.model_validate(
+            {
+                "messages": [{"role": "user", "content": "Hello"}],
+                "max_tokens": 10,
+            }
+        )
+        with patch(
+            "api_routing.config",
+            return_value={
+                "usages": {
+                    "atlas-code": {
+                        "none": [
+                            {
+                                "provider": "owned-vllm",
+                                "model": "owned",
+                                "context": 1000,
+                                "privacy": "owned",
+                            },
+                            {
+                                "provider": "mistral",
+                                "model": "shared",
+                                "context": 1000,
+                            },
+                        ]
+                    }
+                }
+            },
+        ):
+            with patch("dev_gateway.ServerlessPolicy") as policy:
+                policy.return_value.allow_unpriced = True
+                policy.return_value.prices = {
+                    "owned": {
+                        "input_eur_per_mtok": 0,
+                        "output_eur_per_mtok": 0,
+                    }
+                }
+                with patch.dict(
+                    os.environ, {"ATLAS_OWNED_VLLM_BASE_URL": OWNED_URL + "/"}
+                ):
+                    plan = dev_gateway.prepare_api(
+                        request, "atlas-code", "key-test", strict=True
+                    )
+        self.assertEqual(plan.privacy, "owned")
+        # The owned target is called at the operator's server, not at a preset address.
+        self.assertEqual(plan.endpoint, OWNED_URL)
+        self.assertIsNone(plan.fallback)
+
+
+class RoutedBodyTests(unittest.TestCase):
+    def test_routed_body_has_no_empty_tool_fields(self) -> None:
+        import json as _json
+        import dev_gateway
+        from packages.dev_request import Request
+
+        request = Request.model_validate(
+            {
+                "messages": [{"role": "user", "content": "Reply OK"}],
+                "max_tokens": 20,
+                "reasoning_effort": "low",
+            }
+        )
+        with patch.dict(
+            os.environ,
+            {"MISTRAL_API_KEY": "test-only", "SCW_GENERATIVE_API_KEY": "test-only"},
+        ):
+            plan = dev_gateway.prepare_api(request, "atlas-code", "key-test")
+        body = _json.loads(plan.body)
+        self.assertNotIn("tools", body)
+        self.assertNotIn("tool_choice", body)
+        self.assertNotIn("response_format", body)
+        self.assertTrue(all("tool_calls" not in m for m in body["messages"]))
+
+
+class RoutedContextTests(unittest.TestCase):
+    def test_large_fictional_body_fits_primary_and_skips_small_fallback(self) -> None:
+        import json as _json
+        import dev_gateway
+        from packages.dev_request import Request
+
+        request = Request.model_validate(
+            {
+                "messages": [{"role": "user", "content": "fictional-" * 262144}],
+                "max_tokens": 32,
+                "reasoning_effort": "low",
+            }
+        )
+        with patch.dict(
+            os.environ,
+            {
+                "MISTRAL_API_KEY": "test-only",
+                "SCW_GENERATIVE_API_KEY": "test-only",
+                "ATLAS_RAW_CALL_MAX_MICRO_EUR": "5000000",
+            },
+        ):
+            plan = dev_gateway.prepare_api(request, "atlas-code", "key-test")
+            self.assertLessEqual(plan.reserved, dev_gateway.call_cap())
+        assert plan.fallback is not None
+        self.assertEqual(_json.loads(plan.body)["model"], "mistral-large-4")
+        self.assertEqual(plan.fallback.model, "zai-glm-5-3")
+
+    def test_body_larger_than_every_context_is_refused_as_context(self) -> None:
+        import dev_gateway
+        from packages.dev_request import Request
+        from packages.limits import LimitError
+
+        request = Request.model_validate(
+            {
+                "messages": [{"role": "user", "content": "fictional-" * 524288}],
+                "max_tokens": 32,
+                "reasoning_effort": "low",
+            }
+        )
+        with patch.dict(
+            os.environ,
+            {"MISTRAL_API_KEY": "test-only", "SCW_GENERATIVE_API_KEY": "test-only"},
+        ):
+            with self.assertRaises(LimitError) as raised:
+                dev_gateway.prepare_api(request, "atlas-code", "key-test")
+        self.assertEqual(raised.exception.code, "context_exceeded")
+        self.assertEqual(raised.exception.limit, 1048576)
+
+
+class RoutedEffortTests(unittest.TestCase):
+    def test_routed_effort_uses_values_the_provider_accepts(self) -> None:
+        import json as _json
+        import dev_gateway
+        from packages.dev_request import Request
+
+        expected = {"none": "low", "low": "low", "medium": "high", "high": "high"}
+        with patch.dict(
+            os.environ,
+            {"MISTRAL_API_KEY": "test-only", "SCW_GENERATIVE_API_KEY": "test-only"},
+        ):
+            for level, sent in expected.items():
+                request = Request.model_validate(
+                    {
+                        "messages": [{"role": "user", "content": "Reply OK"}],
+                        "reasoning_effort": level,
+                    }
+                )
+                plan = dev_gateway.prepare_api(request, "atlas-code", "key-test")
+                self.assertEqual(
+                    _json.loads(plan.body)["reasoning_effort"], sent, level
+                )
+                assert plan.fallback is not None
+                self.assertEqual(
+                    _json.loads(plan.fallback.body)["reasoning_effort"], level
+                )
+
+
+class RoutedTypedContentTests(unittest.TestCase):
+    def test_routed_stream_keeps_text_and_moves_reasoning_parts(self) -> None:
+        import asyncio
+        import json as _json
+        from dataclasses import replace
+        import dev_gateway
+        from packages.dev_request import Request
+
+        frames = [
+            {"choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}}]},
+            {
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "content": [
+                                {
+                                    "type": "thinking",
+                                    "thinking": [
+                                        {"type": "text", "text": "fictional reasoning"}
+                                    ],
+                                    "closed": True,
+                                }
+                            ]
+                        },
+                    }
+                ]
+            },
+            {
+                "choices": [
+                    {"index": 0, "delta": {"content": "391"}, "finish_reason": "stop"}
+                ]
+            },
+            {
+                "choices": [],
+                "usage": {
+                    "prompt_tokens": 12,
+                    "completion_tokens": 5,
+                    "total_tokens": 17,
+                },
+            },
+        ]
+        stream = (
+            b"".join(b"data: " + _json.dumps(f).encode() + b"\n\n" for f in frames)
+            + b"data: [DONE]\n\n"
+        )
+
+        async def fake_transport(plan: object):  # type: ignore[no-untyped-def]
+            yield stream
+
+        request = Request.model_validate(
+            {
+                "messages": [{"role": "user", "content": "What is 17 times 23?"}],
+                "reasoning_effort": "low",
+            }
+        )
+        with patch.dict(
+            os.environ,
+            {"MISTRAL_API_KEY": "test-only", "SCW_GENERATIVE_API_KEY": "test-only"},
+        ):
+            plan = replace(
+                dev_gateway.prepare_api(request, "atlas-code", "key-test"),
+                fallback=None,
+            )
+
+        async def collect() -> list[dict[str, object]]:
+            with patch.object(dev_gateway, "transport", fake_transport):
+                return [e async for e in dev_gateway.attempt_events(plan)]
+
+        events = asyncio.run(collect())
+        texts: list[object] = []
+        reasoning: list[object] = []
+        for event in events:
+            choices = event.get("choices")
+            if isinstance(choices, list):
+                texts.extend(c["delta"].get("content") for c in choices)
+                reasoning.extend(c["delta"].get("reasoning_content") for c in choices)
+        # The answer text stays clean; the reasoning goes to its own field.
+        self.assertIn("391", texts)
+        self.assertNotIn("fictional reasoning", _json.dumps(texts))
+        self.assertIn("fictional reasoning", reasoning)
+
+
+class RoutedReasoningOnlyRetryTests(unittest.TestCase):
+    def _plan(self) -> "dev_gateway.Plan":
+        import dev_gateway
+        from packages.dev_request import Request
+
+        request = Request.model_validate(
+            {
+                "messages": [{"role": "user", "content": "Reply OK"}],
+                "reasoning_effort": "low",
+            }
+        )
+        with patch.dict(
+            os.environ,
+            {"MISTRAL_API_KEY": "test-only", "SCW_GENERATIVE_API_KEY": "test-only"},
+        ):
+            return dev_gateway.prepare_api(request, "atlas-code", "key-test")
+
+    @staticmethod
+    def _stream(frames: list[dict[str, object]]) -> bytes:
+        import json as _json
+
+        return (
+            b"".join(
+                b"data: " + _json.dumps(frame).encode() + b"\n\n" for frame in frames
+            )
+            + b"data: [DONE]\n\n"
+        )
+
+    @staticmethod
+    def _reasoning_only() -> bytes:
+        return RoutedReasoningOnlyRetryTests._stream(
+            [
+                {
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"reasoning_content": "fictional reasoning"},
+                            "finish_reason": "stop",
+                        }
+                    ]
+                },
+                {
+                    "choices": [],
+                    "usage": {
+                        "prompt_tokens": 10,
+                        "completion_tokens": 4,
+                        "total_tokens": 14,
+                    },
+                },
+            ]
+        )
+
+    @staticmethod
+    def _answer() -> bytes:
+        return RoutedReasoningOnlyRetryTests._stream(
+            [
+                {
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"content": "OK"},
+                            "finish_reason": "stop",
+                        }
+                    ]
+                },
+                {
+                    "choices": [],
+                    "usage": {
+                        "prompt_tokens": 20,
+                        "completion_tokens": 2,
+                        "total_tokens": 22,
+                    },
+                },
+            ]
+        )
+
+    def test_reasoning_only_retries_same_target_and_sums_usage(self) -> None:
+        import asyncio
+
+        plan = self._plan()
+        streams = iter([self._reasoning_only(), self._answer()])
+
+        async def fake_transport(requested_plan: object) -> AsyncIterator[bytes]:
+            yield next(streams)
+
+        async def collect() -> list[dict[str, object]]:
+            with patch.object(dev_gateway, "transport", fake_transport):
+                return [event async for event in dev_gateway.events(plan)]
+
+        events = asyncio.run(collect())
+        self.assertEqual(
+            [event for event in events if event.get("choices")],
+            [
+                {
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"content": "OK"},
+                            "finish_reason": "stop",
+                        }
+                    ]
+                }
+            ],
+        )
+        self.assertEqual(
+            events[-1]["usage"],
+            {"prompt_tokens": 30, "completion_tokens": 6, "total_tokens": 36},
+        )
+        self.assertEqual(
+            events[-1]["cost_micro_eur"],
+            plan.charge(10, 4) + plan.charge(20, 2),
+        )
+
+    def test_two_reasoning_only_attempts_use_fallback_and_sums_usage(self) -> None:
+        import asyncio
+
+        plan = self._plan()
+        assert plan.fallback is not None
+        streams = iter([self._reasoning_only(), self._reasoning_only(), self._answer()])
+
+        async def fake_transport(requested_plan: object) -> AsyncIterator[bytes]:
+            yield next(streams)
+
+        async def collect() -> list[dict[str, object]]:
+            with patch.object(dev_gateway, "transport", fake_transport):
+                return [event async for event in dev_gateway.events(plan)]
+
+        events = asyncio.run(collect())
+        self.assertEqual(events[-1]["served_by"], "mistral/zai-glm-5-3")
+        self.assertEqual(
+            events[-1]["usage"],
+            {"prompt_tokens": 40, "completion_tokens": 10, "total_tokens": 50},
+        )
+        self.assertEqual(
+            events[-1]["cost_micro_eur"],
+            2 * plan.charge(10, 4) + plan.fallback.charge(20, 2),
+        )
+
+    def test_visible_answer_is_never_retried(self) -> None:
+        import asyncio
+
+        plan = self._plan()
+        calls = 0
+
+        async def fake_transport(requested_plan: object) -> AsyncIterator[bytes]:
+            nonlocal calls
+            calls += 1
+            yield self._answer()
+
+        async def collect() -> list[dict[str, object]]:
+            with patch.object(dev_gateway, "transport", fake_transport):
+                return [event async for event in dev_gateway.events(plan)]
+
+        events = asyncio.run(collect())
+        self.assertEqual(calls, 1)
+        terminal = events[-1]
+        assert isinstance(terminal, dict)
+        usage = terminal["usage"]
+        assert isinstance(usage, dict)
+        self.assertEqual(usage["completion_tokens"], 2)
+
+    def test_transient_error_after_visible_frames_never_appends_fallback(self) -> None:
+        import asyncio
+        import json as _json
+
+        from provider_retry import TransientProviderError
+
+        plan = self._plan()
+        calls = 0
+
+        async def fake_transport(requested_plan: object) -> AsyncIterator[bytes]:
+            nonlocal calls
+            calls += 1
+            frame = {"choices": [{"index": 0, "delta": {"content": "Part"}}]}
+            yield b"data: " + _json.dumps(frame).encode() + b"\n\n"
+            raise TransientProviderError("fictional reset")
+
+        received: list[dict[str, object]] = []
+
+        async def collect() -> None:
+            with patch.object(dev_gateway, "transport", fake_transport):
+                async for event in dev_gateway.events(plan):
+                    received.append(event)
+
+        with self.assertRaises(TransientProviderError):
+            asyncio.run(collect())
+        self.assertEqual(calls, 1)
+        self.assertEqual(len(received), 1)
+
+    def test_streaming_starts_at_first_visible_frame_and_stays_live(self) -> None:
+        import asyncio
+        import json as _json
+
+        plan = self._plan()
+        pulls: list[str] = []
+        deliveries: list[str] = []
+
+        async def fake_transport(requested_plan: object) -> AsyncIterator[bytes]:
+            frames = [
+                {
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"reasoning_content": "fictional reasoning"},
+                        }
+                    ]
+                },
+                {
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"content": "OK"},
+                            "finish_reason": "stop",
+                        }
+                    ]
+                },
+                {
+                    "choices": [],
+                    "usage": {
+                        "prompt_tokens": 20,
+                        "completion_tokens": 2,
+                        "total_tokens": 22,
+                    },
+                },
+            ]
+            for frame, label in zip(frames, ("reasoning", "OK", "usage")):
+                pulls.append(label)
+                yield b"data: " + _json.dumps(frame).encode() + b"\n\n"
+            yield b"data: [DONE]\n\n"
+
+        async def collect() -> None:
+            with patch.object(dev_gateway, "transport", fake_transport):
+                async for event in dev_gateway.events(plan):
+                    if event.get("choices"):
+                        delta = event["choices"][0]["delta"]
+                        deliveries.append(
+                            delta.get("content", delta.get("reasoning_content"))
+                        )
+                    else:
+                        deliveries.append("terminal")
+
+        asyncio.run(collect())
+        self.assertEqual(pulls, ["reasoning", "OK", "usage"])
+        self.assertEqual(deliveries, ["fictional reasoning", "OK", "terminal"])
+        self.assertLess(
+            deliveries.index("OK"), pulls.index("usage"), "terminal frame was buffered"
+        )
+
+    def test_retry_terminal_is_settled_before_consumer_receives_it(self) -> None:
+        import asyncio
+
+        plan = self._plan()
+        streams = iter([self._reasoning_only(), self._answer()])
+        terminal_costs: list[object] = []
+
+        async def fake_transport(requested_plan: object) -> AsyncIterator[bytes]:
+            yield next(streams)
+
+        async def collect() -> None:
+            with patch.object(dev_gateway, "transport", fake_transport):
+                async for event in dev_gateway.events(plan):
+                    if not event.get("choices"):
+                        terminal_costs.append(event["cost_micro_eur"])
+
+        asyncio.run(collect())
+        self.assertEqual(terminal_costs, [plan.charge(10, 4) + plan.charge(20, 2)])
+
+
+class ReusedCallIndexTests(unittest.TestCase):
+    def test_new_call_id_on_reused_index_opens_a_new_call(self) -> None:
+        from services.orchestrator.dev_chat import ChatInput, Output
+
+        request = ChatInput.model_validate(
+            {
+                "model": "atlas-code",
+                "messages": [{"role": "user", "content": "Fictional task."}],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "run",
+                            "parameters": {"type": "object", "properties": {}},
+                        },
+                    }
+                ],
+            }
+        )
+        output = Output("test", request)
+        for call_id in ("call_a", "call_b"):
+            output.feed(
+                {
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": call_id,
+                                        "type": "function",
+                                        "function": {"name": "run", "arguments": "{}"},
+                                    }
+                                ]
+                            },
+                            "finish_reason": None,
+                        }
+                    ]
+                }
+            )
+        output.feed(
+            {"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}
+        )
+        self.assertEqual([c["id"] for c in output.calls.values()], ["call_a", "call_b"])
+
+
+class EmptyContinuationFieldTests(unittest.TestCase):
+    def test_empty_name_in_continuation_chunk_is_not_a_new_identity(self) -> None:
+        from services.orchestrator.dev_chat import ChatInput, Output
+
+        request = ChatInput.model_validate(
+            {
+                "model": "atlas-code",
+                "messages": [{"role": "user", "content": "Fictional task."}],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "run",
+                            "parameters": {"type": "object", "properties": {}},
+                        },
+                    }
+                ],
+            }
+        )
+        output = Output("test", request)
+        output.feed(
+            {
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "call_a",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "run",
+                                        "arguments": '{"command": "',
+                                    },
+                                }
+                            ]
+                        },
+                        "finish_reason": None,
+                    }
+                ]
+            }
+        )
+        output.feed(
+            {
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "type": "function",
+                                    "function": {"name": "", "arguments": 'ls"}'},
+                                }
+                            ]
+                        },
+                        "finish_reason": None,
+                    }
+                ]
+            }
+        )
+        output.feed(
+            {"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}
+        )
+        self.assertEqual(len(output.calls), 1)
+        self.assertEqual(output.calls[0]["function"]["arguments"], '{"command": "ls"}')
+
+
+class GenericNameTests(unittest.TestCase):
+    def test_atlas_dev_is_a_listed_alias_of_the_code_route(self) -> None:
+        from api_routing import PUBLIC_MODELS, select_public_model
+
+        self.assertIn("atlas-dev", PUBLIC_MODELS)
+        self.assertEqual(select_public_model("atlas-dev"), "atlas-code")
+
+
+class PinnedModelTests(unittest.TestCase):
+    def test_models_lists_one_id_per_routing_target(self) -> None:
+        from api_routing import pinned_models
+
+        self.assertEqual(
+            pinned_models(),
+            [
+                "mistral/zai-glm-5-3-flash",
+                "scaleway/deepseek-v4-flash-0731",
+                "mistral/mistral-large-4",
+                "mistral/zai-glm-5-3",
+                "scaleway/glm-5.2",
+            ],
+        )
+
+    def test_pinned_id_selects_its_target_only(self) -> None:
+        from api_routing import pinned_target, select_public_model, targets
+
+        self.assertEqual(select_public_model("scaleway/glm-5.2"), "scaleway/glm-5.2")
+        self.assertEqual(
+            select_public_model("mistral/mistral-large-4"), "mistral/mistral-large-4"
+        )
+        usage, entries = targets("scaleway/glm-5.2", "low", pinned=True)
+        self.assertEqual(usage, "scaleway/glm-5.2")
+        self.assertEqual(
+            [(e.provider, e.model) for e in entries], [("scaleway", "glm-5.2")]
+        )
+        self.assertIsNone(pinned_target("atlas-chat"))
+        self.assertIsNone(pinned_target("mistral/unknown-model"))
+
+    def test_pinned_plan_has_no_fallback_and_uses_the_target_price(self) -> None:
+        import json as _json
+        import dev_gateway
+        from packages.dev_request import Request
+
+        request = Request.model_validate(
+            {
+                "messages": [{"role": "user", "content": "Reply OK"}],
+                "max_tokens": 20,
+                "reasoning_effort": "low",
+            }
+        )
+        with patch.dict(
+            os.environ,
+            {"MISTRAL_API_KEY": "test-only", "SCW_GENERATIVE_API_KEY": "test-only"},
+        ):
+            plan = dev_gateway.prepare_api(
+                request, "scaleway/glm-5.2", "key-test", pinned=True
+            )
+        self.assertIsNone(plan.fallback)
+        self.assertEqual(plan.provider, "scaleway")
+        self.assertEqual(plan.model, "glm-5.2")
+        self.assertEqual(_json.loads(plan.body)["model"], "glm-5.2")
+        self.assertEqual(str(plan.input_rate), "1.8")
+        self.assertEqual(str(plan.output_rate), "5.5")
+
+    def test_fallback_false_on_an_alias_keeps_only_the_first_target(self) -> None:
+        import dev_gateway
+        from packages.dev_request import Request
+
+        request = Request.model_validate(
+            {
+                "messages": [{"role": "user", "content": "Reply OK"}],
+                "max_tokens": 20,
+                "reasoning_effort": "low",
+            }
+        )
+        with patch.dict(
+            os.environ,
+            {"MISTRAL_API_KEY": "test-only", "SCW_GENERATIVE_API_KEY": "test-only"},
+        ):
+            plan = dev_gateway.prepare_api(
+                request, "atlas-chat", "key-test", fallback=False
+            )
+        self.assertIsNone(plan.fallback)
+        assert plan.fallback is None
+        self.assertEqual((plan.provider, plan.model), ("mistral", "zai-glm-5-3"))
+
+    def test_default_alias_behaviour_keeps_the_fallback(self) -> None:
+        import dev_gateway
+        from packages.dev_request import Request
+
+        request = Request.model_validate(
+            {
+                "messages": [{"role": "user", "content": "Reply OK"}],
+                "max_tokens": 20,
+                "reasoning_effort": "low",
+            }
+        )
+        with patch.dict(
+            os.environ,
+            {"MISTRAL_API_KEY": "test-only", "SCW_GENERATIVE_API_KEY": "test-only"},
+        ):
+            plan = dev_gateway.prepare_api(request, "atlas-chat", "key-test")
+        fallback = plan.fallback
+        self.assertIsNotNone(fallback)
+        assert fallback is not None
+        self.assertEqual((fallback.provider, fallback.model), ("scaleway", "glm-5.2"))
+
+    def test_pinned_call_never_uses_the_fallback_on_429(self) -> None:
+        import asyncio
+        import dev_gateway
+        from packages.dev_request import Request
+        from provider_retry import TransientProviderError
+
+        request = Request.model_validate(
+            {
+                "messages": [{"role": "user", "content": "Reply OK"}],
+                "max_tokens": 20,
+                "reasoning_effort": "low",
+            }
+        )
+        with patch.dict(
+            os.environ,
+            {"MISTRAL_API_KEY": "test-only", "SCW_GENERATIVE_API_KEY": "test-only"},
+        ):
+            plan = dev_gateway.prepare_api(
+                request, "mistral/zai-glm-5-3", "key-test", pinned=True
+            )
+        self.assertIsNone(plan.fallback)
+        calls = 0
+
+        async def failing_transport(requested_plan: object) -> AsyncIterator[bytes]:
+            nonlocal calls
+            calls += 1
+            raise TransientProviderError(
+                "provider_error", detail="http_429", status=429, retry_after="7"
+            )
+            yield b""
+
+        async def collect() -> None:
+            with patch.object(dev_gateway, "transport", failing_transport):
+                async for _ in dev_gateway.events(plan):
+                    pass
+
+        with self.assertRaises(TransientProviderError) as raised:
+            asyncio.run(collect())
+        self.assertEqual(calls, 1)
+        self.assertEqual(raised.exception.status, 429)
+        self.assertEqual(raised.exception.retry_after, "7")

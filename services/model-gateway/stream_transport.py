@@ -1,0 +1,564 @@
+"""Cancellable upstream streaming transport; no retry after emitted deltas."""
+
+import provider_settings
+
+from collections.abc import AsyncGenerator
+from contextlib import aclosing, asynccontextmanager
+from contextvars import ContextVar
+import asyncio
+import json
+import logging
+import re
+import hashlib
+from time import monotonic
+from typing import Any, Literal
+
+import aiohttp
+from pydantic import ValidationError
+
+from agent_provider import AgentProvider, AgentRequest, Usage, classify
+from streaming import StreamDecoder
+import owned_start
+import upstream
+from provider_refusal import classify_refusal, error_envelope
+from provider_retry import (
+    ModelUnavailableError,
+    ProviderResponseError,
+    ProviderUnreached,
+    TransientProviderError,
+    RetryLedger,
+    retry_stream,
+    unbilled,
+)
+from decimal import Decimal
+from packages.limits import LimitError, ProviderLimitError
+from packages.validation import numeric_limit, malformed_tool_name
+from packages.tool_history import final_messages
+from serverless import ServerlessPolicy, classify_task
+
+
+_response_timeout: ContextVar[float | None] = ContextVar(
+    "response_timeout", default=None
+)
+
+
+@asynccontextmanager
+async def response_window(seconds: float) -> AsyncGenerator[None, None]:
+    """The quality controller owns the early retry cutoff and the hard deadline."""
+    token = _response_timeout.set(seconds)
+    try:
+        yield
+    finally:
+        _response_timeout.reset(token)
+
+
+# Decoder signals for the quality controller's deadline, never sent to a client:
+# the orchestrator rejects an event it does not know.
+INTERNAL_EVENTS = ("tool_call", "tool_progress")
+
+
+def internal(event: dict[str, object]) -> bool:
+    return any(key in event for key in INTERNAL_EVENTS)
+
+
+class StreamRequest(AgentRequest):
+    reasoning_effort: Literal["none", "low", "medium", "high"] = "none"
+
+
+async def stream(
+    provider: AgentProvider, payload: object
+) -> AsyncGenerator[dict[str, object], None]:
+    request = StreamRequest.model_validate(payload)
+    if request.privacy == "strict":
+        model = str(provider_settings.preset_value("owned-vllm", "text_model"))
+        async with aclosing(
+            retry_stream(
+                attempt,
+                request,
+                model,
+                request.timeout,
+                Decimal("0"),
+                0,
+                RetryLedger(),
+            )
+        ) as events:
+            async for event in events:
+                if internal(event):
+                    continue
+                result = event.get("result")
+                if isinstance(result, dict):
+                    # The orchestrator accepts the same answer fields as from the
+                    # quality path; the decoder's diagnostics (provider id, finish
+                    # reason, reasoning token count) stay in the gateway.
+                    usage = result["usage"]
+                    assert isinstance(usage, dict)
+                    answer: dict[str, object] = {
+                        "provider_model": model,
+                        "text": result["text"],
+                        "calls": result["calls"],
+                        "usage": {
+                            "prompt_tokens": usage["prompt_tokens"],
+                            "completion_tokens": usage["completion_tokens"],
+                        },
+                        "cost_eur": "0",
+                        "reasoning": str(result.get("reasoning") or ""),
+                        "reasoning_effort": request.reasoning_effort,
+                    }
+                    if request.observe:
+                        answer["observation"] = {
+                            "provider": "owned",
+                            "route": "simple"
+                            if classify(request.messages) == "chat_simple"
+                            else "complexe",
+                            "fallback": False,
+                        }
+                    yield {"result": answer}
+                    continue
+                yield event
+        return
+    if request.profile is not None:
+        from quality import stream_quality
+
+        async with aclosing(stream_quality(provider, request)) as events:
+            async for event in events:
+                yield event
+        return
+    policy = ServerlessPolicy()
+    plan = policy.reserve(request.messages, request.tools)
+    started = monotonic()
+    unknown = Decimal(0)
+    for index, model in enumerate((plan.primary, plan.fallback)):
+        sent = False
+        remaining = request.timeout - (monotonic() - started)
+        if remaining <= 0:
+            raise TimeoutError("timeout")
+        allotted = remaining * 0.7 if index == 0 else remaining
+        ledger = RetryLedger()
+        try:
+            async with (
+                asyncio.timeout(allotted),
+                aclosing(
+                    retry_stream(
+                        attempt,
+                        request,
+                        model,
+                        allotted,
+                        plan.reserved_eur - unknown,
+                        plan.incoming,
+                        ledger,
+                    )
+                ) as events,
+            ):
+                async for event in events:
+                    if internal(event):
+                        continue
+                    result = event.get("result")
+                    if isinstance(result, dict):
+                        if request.observe:
+                            result["observation"] = {
+                                "provider": "escalade",
+                                "route": "simple"
+                                if classify(request.messages) == "chat_simple"
+                                else "complexe",
+                                "task_type": plan.task_type,
+                                "fallback": bool(index),
+                            }
+                        usage = result["usage"]
+                        result["cost_eur"] = str(
+                            unknown
+                            + ledger.spent
+                            + policy.cost(
+                                model,
+                                usage["prompt_tokens"],
+                                usage["completion_tokens"],
+                            )
+                        )
+                        logging.getLogger(__name__).info(
+                            json.dumps(
+                                {
+                                    "event": "serverless_stream_usage",
+                                    "task_type": plan.task_type,
+                                    "tokens": usage,
+                                    "fallback": bool(index),
+                                    "cost_eur": str(
+                                        policy.cost(
+                                            model,
+                                            usage["prompt_tokens"],
+                                            usage["completion_tokens"],
+                                        )
+                                    ),
+                                    "reserved_unknown_eur": str(
+                                        plan.primary_bound if index else 0
+                                    ),
+                                }
+                            )
+                        )
+                        yield event
+                        return
+                    sent = True
+                    yield event
+        except LimitError:
+            raise
+        except (RuntimeError, TimeoutError) as exc:
+            unknown += ledger.spent + (
+                Decimal(0)
+                if unbilled(exc)
+                else plan.fallback_bound
+                if index
+                else plan.primary_bound
+            )
+            logging.getLogger(__name__).info(
+                json.dumps(
+                    {
+                        "event": "serverless_stream_failed",
+                        "task_type": plan.task_type,
+                        "attempt": index + 1,
+                        "reserved_eur": str(plan.reserved_eur),
+                    }
+                )
+            )
+            if sent or index:
+                raise
+
+
+async def provider_error_message(
+    response: aiohttp.ClientResponse,
+    request: AgentRequest,
+    key: str | None = None,
+) -> str | None:
+    # Error bodies are untrusted and may be HTML or oversized. Read a bounded
+    # JSON envelope, and retain only its message, never the body or exception.
+    return error_message(await error_envelope(response), request, key)
+
+
+def error_message(
+    value: dict[str, Any] | None,
+    request: AgentRequest,
+    key: str | None = None,
+) -> str | None:
+    if value is None:
+        return None
+    error = value.get("error", value)
+    message = error.get("message") if isinstance(error, dict) else None
+    if not isinstance(message, str):
+        return None
+    # Providers can echo credentials, URLs or rejected input in their message.
+    sensitive = [provider_settings.api_key() if key is None else key]
+    for entry in request.messages:
+        content = entry.get("content")
+        if isinstance(content, str):
+            sensitive.append(content)
+        elif isinstance(content, list):
+            sensitive.extend(
+                str(part.get("text", "")) for part in content if isinstance(part, dict)
+            )
+    if re.search(r"https?://|www\.", message, re.I) or any(
+        text and text in message for text in sensitive
+    ):
+        return "[redacted]"
+    return message[:300]
+
+
+def rejection_details(
+    status: int,
+    value: dict[str, Any] | None,
+    request: AgentRequest,
+    body: dict[str, object],
+) -> dict[str, object]:
+    details: dict[str, object] = {
+        "request_model": body["model"],
+        "request_messages": len(request.messages),
+        "request_tools": len(request.tools),
+        "request_tool_choice_type": type(request.tool_choice).__name__,
+        "request_max_tokens": request.max_tokens,
+        "request_body_keys": list(body),
+    }
+    if not 400 <= status < 500 or value is None:
+        return details
+    candidates = [value.get("error"), value.get("detail")]
+    for error in candidates:
+        if not isinstance(error, dict):
+            continue
+        for field in ("type", "code", "param"):
+            error_value = error.get(field)
+            if (
+                isinstance(error_value, str)
+                and re.fullmatch(r"[A-Za-z0-9_.\[\]-]{1,80}", error_value)
+                and f"provider_error_{field}" not in details
+            ):
+                details[f"provider_error_{field}"] = error_value
+    return details
+
+
+async def attempt(
+    request: AgentRequest, model: str, timeout: float
+) -> AsyncGenerator[dict[str, object], None]:
+    # Internal model_copy updates bypass Pydantic validation. No provider call
+    # may turn an exhausted output allowance into an HTTP failure/retry (D5).
+    if request.max_tokens < 1:
+        raise ProviderLimitError("output_budget", 1, request.max_tokens, "tokens")
+    policy = ServerlessPolicy()
+    role = next(
+        (name for name, model_ in policy.models.items() if model_ == model), None
+    )
+    routed = None if request.privacy == "strict" else policy.providers.get(model)
+    endpoint = (
+        provider_settings.owned_endpoint()
+        if request.privacy == "strict"
+        else (
+            provider_settings.validate_endpoint(
+                str(provider_settings.preset_value(routed, "base_url"))
+            )
+            if routed is not None
+            else provider_settings.endpoint()
+        )
+    )
+    key = (
+        provider_settings.owned_api_key()
+        if request.privacy == "strict"
+        else (
+            provider_settings.api_key_for(routed)
+            if routed is not None
+            else provider_settings.api_key()
+        )
+    )
+    answer_only = request.profile is not None and request.tool_choice == "none"
+    body = {
+        "model": model,
+        "messages": final_messages(request.messages)
+        if answer_only
+        else request.messages,
+        **(
+            {"tools": request.tools, "tool_choice": request.tool_choice}
+            if request.tools and not answer_only
+            else {}
+        ),
+        **provider_settings.json_options(request.response_format, routed),
+        "max_tokens": request.max_tokens,
+        "temperature": 0
+        if request.sampling_temperature is None
+        else request.sampling_temperature,
+        # Validation keeps client requests at none; only the quality controller
+        # sets a per-model configured effort on an internal attempt copy.
+        "reasoning_effort": request.reasoning_effort,
+        "stream": True,
+        "stream_options": {"include_usage": True},
+    }
+    decoder = StreamDecoder(
+        allow_length=request.profile is not None,
+        ignore_calls=answer_only,
+        max_tokens=request.max_tokens,
+    )
+    if routed is not None:
+        greedy_top_p = provider_settings.preset_value(routed, "greedy_top_p")
+        if isinstance(greedy_top_p, (int, float)):
+            body["top_p"] = greedy_top_p
+        if provider_settings.preset_value(routed, "prompt_cache_key") is True:
+            body["prompt_cache_key"] = hashlib.sha256(
+                json.dumps(
+                    request.messages[0], sort_keys=True, ensure_ascii=False
+                ).encode()
+            ).hexdigest()
+        if provider_settings.preset_value(routed, "seed_field") and "seed" in body:
+            body[str(provider_settings.preset_value(routed, "seed_field"))] = body.pop(
+                "seed"
+            )
+    started = monotonic()
+    # When the last provider bytes arrived, and whether the HTTP body then ended
+    # normally: a stream that ends without its final frame is told apart from a
+    # cut connection (which raises a transport error instead).
+    last_bytes = started
+    body_ended = False
+
+    def diagnostic(category: str, **details: object) -> None:
+        # Only the bounded, filtered error message may accompany HTTP metadata.
+        # Never log provider bodies, exception text, URLs or request content.
+        logging.getLogger(__name__).warning(
+            json.dumps(
+                {
+                    "event": "provider_stream_failure",
+                    "category": category,
+                    "elapsed_seconds": round(monotonic() - started, 3),
+                    "received_bytes": decoder.total,
+                    "frames": decoder.frames,
+                    "seconds_since_bytes": round(monotonic() - last_bytes, 3),
+                    "body_ended": body_ended,
+                    "content_chars": len(decoder.text),
+                    "reasoning_chars": len(decoder.reasoning),
+                    "tool_calls": len(decoder.calls),
+                    "finish_reason": decoder.reason,
+                    "usage_present": decoder.usage is not None,
+                    **details,
+                }
+            )
+        )
+
+    try:
+        try:
+            payload = (
+                provider_settings.request_options(
+                    body,
+                    provider=routed,
+                    configured_effort=request.reasoning_effort,
+                    reasoning_ceiling=request.reasoning_ceiling,
+                    reasoning_default=(
+                        policy.config[role]["capabilities"][model].get(
+                            "reasoning_default"
+                        )
+                        if role is not None
+                        else None
+                    ),
+                    model=model,
+                )
+                if routed is not None
+                else provider_settings.request_options(
+                    body,
+                    configured_effort=request.reasoning_effort,
+                    reasoning_ceiling=request.reasoning_ceiling,
+                    reasoning_default=(
+                        policy.config[role]["capabilities"][model].get(
+                            "reasoning_default"
+                        )
+                        if role is not None
+                        else None
+                    ),
+                    role="vision"
+                    if classify_task(request.messages) == "vision"
+                    else policy.public_profiles.get(request.profile or ""),
+                )
+            )
+        except ValueError:
+            raise TransientProviderError("provider_error", received_bytes=0) from None
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=_response_timeout.get() or timeout),
+            trust_env=False,
+        ) as session:
+            async with session.post(
+                endpoint + "/chat/completions",
+                json=payload,
+                headers={"Authorization": "Bearer " + key},
+                allow_redirects=False,
+            ) as response:
+                if response.status != 200:
+                    # The body can be read only once: the message, the request
+                    # shape details and the refusal class share one envelope.
+                    envelope = await error_envelope(response)
+                    message = error_message(envelope, request, key)
+                    refusal = classify_refusal(response.status, envelope, (key,))
+                    diagnostic(
+                        "http",
+                        status=response.status,
+                        **rejection_details(
+                            response.status, envelope, request, payload
+                        ),
+                        refusal_class=refusal.kind,
+                        **(
+                            {"refusal_type": refusal.error_type}
+                            if refusal.error_type
+                            else {}
+                        ),
+                        **(
+                            {"refusal_code": refusal.error_code}
+                            if refusal.error_code
+                            else {}
+                        ),
+                        **(
+                            {"provider_message": message} if message is not None else {}
+                        ),
+                    )
+                    if response.status in (502, 503, 504):
+                        # A refusal before any completion frame ran nothing at
+                        # the provider (provider_retry.unbilled); a 504 is a
+                        # proxy that gave up on a request the model may still
+                        # have been running, so its usage stays unknown.
+                        raise TransientProviderError(
+                            "provider_error",
+                            refusal=refusal,
+                            received_bytes=None if response.status == 504 else 0,
+                        )
+                    if (
+                        response.status in (400, 404)
+                        and message is not None
+                        and "model not found" in message.lower()
+                    ):
+                        raise ModelUnavailableError("model_unavailable")
+                    raise ProviderResponseError(response.status, refusal)
+                with upstream.abort_if_abandoned(response):
+                    async for piece in response.content.iter_chunked(16384):
+                        last_bytes = monotonic()
+                        for event in decoder.feed(piece):
+                            yield event
+                body_ended = True
+        decoder.finish()
+        assert decoder.result is not None
+        result = decoder.result
+        if decoder.ignored_calls:
+            result["ignored_calls"] = True
+        if (
+            not str(result.get("text", "")).strip()
+            and not result.get("calls")
+            and result.get("finish_reason") != "length"
+        ):
+            diagnostic("empty_completion")
+            raise TransientProviderError(
+                "empty_completion",
+                usage=Usage.model_validate(result["usage"]),
+                finish_reason=decoder.reason,
+            )
+        yield {"result": result}
+    except TimeoutError:
+        diagnostic("timeout")
+        raise
+    except aiohttp.ClientError as exc:
+        diagnostic("transport")
+        if request.privacy == "strict" and decoder.total == 0 and request.start_owned:
+            # The owned server may be powered off between uses: its starter is
+            # asked to power it on and the request gets the starter's answer.
+            await owned_start.ensure()
+        if isinstance(exc, aiohttp.ClientConnectorError):
+            # No connection, so no request reached the provider.
+            raise ProviderUnreached("provider_error") from None
+        raise RuntimeError("provider_error") from None
+    except LimitError:
+        raise
+    except ValueError as exc:
+        known = {
+            "stream_limit_or_trailing_data",
+            "invalid_sse_field",
+            "trailing_frame",
+            "invalid_usage",
+            "decreasing_usage",
+            "provider_id_changed",
+            "delta_after_finish",
+            "tool_limit",
+            "output_budget",
+            "incomplete_stream",
+            "empty_stream",
+            "duplicate_call",
+            "inconsistent_finish",
+            "invalid_reasoning_usage",
+        }
+        details: dict[str, object] = {}
+        if isinstance(exc, ValidationError):
+            malformed = malformed_tool_name(exc)
+            if malformed is not None:
+                raise malformed from None
+            measured = numeric_limit(exc)
+            if measured is not None:
+                raise measured from None
+            details["validation_types"] = [
+                error["type"]
+                for error in exc.errors(
+                    include_input=False, include_context=False, include_url=False
+                )
+            ]
+        elif str(exc) in known:
+            details["validation_code"] = str(exc)
+        diagnostic("validation", **details)
+        if isinstance(exc, json.JSONDecodeError) or str(exc) == "empty_stream":
+            raise TransientProviderError(
+                "provider_error",
+                finish_reason=decoder.reason,
+                received_bytes=decoder.total,
+            ) from None
+        raise RuntimeError("provider_error") from None

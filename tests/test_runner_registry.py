@@ -1,0 +1,825 @@
+"""REQ-RUN-02/05: real tenant database, signed runner HTTP and SSH execution."""
+
+from __future__ import annotations
+
+import base64
+import os
+from pathlib import Path
+import subprocess
+import tempfile
+import time
+from typing import Any
+import unittest
+from unittest.mock import patch
+from uuid import uuid4
+
+from fastapi.testclient import TestClient
+
+from services.orchestrator.project_forge import canonical
+from services.retrieval.project_identity import ProjectError
+from services.runner import api
+from services.runner.channel import seal
+from services.runner.ssh import fingerprint
+from test_project_work import ProjectWorkTests
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+class RunnerRegistryTests(ProjectWorkTests):
+    ssh_container: str
+    ssh_port: int
+    host_public: str
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        subprocess.run(
+            ["docker", "build", "-q", "-t", "atlas-runner-test:local", "tests/runner"],
+            cwd=ROOT,
+            check=True,
+            capture_output=True,
+            timeout=180,
+        )
+        cls.ssh_container = "atlas-runner-registry-" + uuid4().hex[:10]
+        subprocess.run(
+            [
+                "docker",
+                "run",
+                "--rm",
+                "-d",
+                "--name",
+                cls.ssh_container,
+                "-p",
+                "127.0.0.1::2222",
+                "atlas-runner-test:local",
+            ],
+            check=True,
+            capture_output=True,
+        )
+        cls.addClassCleanup(
+            subprocess.run,
+            ["docker", "rm", "-f", cls.ssh_container],
+            check=True,
+            capture_output=True,
+        )
+        reply = subprocess.run(
+            ["docker", "port", cls.ssh_container, "2222"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        cls.ssh_port = int(reply.stdout.strip().rsplit(":", 1)[1])
+        cls.host_public = subprocess.run(
+            [
+                "docker",
+                "exec",
+                cls.ssh_container,
+                "cat",
+                "/etc/ssh/ssh_host_ed25519_key.pub",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+
+    def setUp(self) -> None:
+        super().setUp()
+        temporary = tempfile.TemporaryDirectory(dir=ROOT / "BRAIN")
+        self.addCleanup(temporary.cleanup)
+        environment = patch.dict(
+            os.environ,
+            {
+                "ATLAS_RUNNER_STATE": temporary.name + "/state",
+                "ATLAS_RUNNER_KEYS": temporary.name + "/keys",
+            },
+        )
+        environment.start()
+        self.addCleanup(environment.stop)
+        api.broker.cache_clear()
+        self.addCleanup(api.broker.cache_clear)
+        self.runner = TestClient(api.app)
+        self.addCleanup(self.runner.close)
+        transport = patch("services.retrieval.project_runners.call", self.runner_call)
+        transport.start()
+        self.addCleanup(transport.stop)
+        self.admin_path = f"/api/atlas/orgs/{self.org}/runner-targets"
+        # Admin content access remains an explicit project grant.
+        granted = self.request(
+            "PUT",
+            self.project_path() + "/grants/" + self.admin,
+            "owner",
+            dict(role="editor"),
+            match=0,
+        )
+        self.assertEqual(granted.status_code, 200, granted.text)
+        import psycopg
+        from psycopg.types.json import Jsonb
+
+        for name in [key for key in self.policy["quotas"] if key.endswith("_bytes")]:
+            if name in self.policy["quotas"]:
+                self.policy["quotas"][name] = 16 * 1024 * 1024
+        with psycopg.connect(self.admin_dsn) as db:
+            db.execute(
+                "UPDATE atlas_projects.installation SET ceilings=%s",
+                (Jsonb(self.policy),),
+            )
+            db.execute(
+                "UPDATE atlas_projects.organizations SET policy=%s WHERE org_id=%s",
+                (Jsonb(self.policy), self.org),
+            )
+        self.assertEqual(self.acquire().status_code, 200)
+
+    def runner_call(
+        self, operation: str, auth: dict[str, Any], **data: Any
+    ) -> dict[str, Any]:
+        response = self.runner.post(
+            "/internal/runner/" + operation,
+            json=dict(permit=seal(operation, auth), **data),
+            headers={
+                "X-Atlas-Execution-Secret": os.environ["ATLAS_PROJECT_EXECUTION_SECRET"]
+            },
+        )
+        if response.status_code != 200:
+            raise ProjectError(response.status_code, str(response.json()["error"]))
+        return dict(response.json())
+
+    def register(self, mode: str = "ask") -> dict[str, Any]:
+        result = self.request("POST", self.admin_path + "/credentials", "admin", {})
+        self.assertEqual(result.status_code, 200, result.text)
+        key = result.json()
+        subprocess.run(
+            [
+                "docker",
+                "exec",
+                "-i",
+                self.ssh_container,
+                "sh",
+                "-c",
+                "cat >> /home/runner/.ssh/authorized_keys; chown -R runner:runner /home/runner/.ssh; chmod 700 /home/runner/.ssh; chmod 600 /home/runner/.ssh/authorized_keys",
+            ],
+            input=(key["public_key"] + "\n").encode(),
+            check=True,
+            capture_output=True,
+        )
+        value = dict(
+            name="Test Linux",
+            host="127.0.0.1",
+            port=self.ssh_port,
+            user="runner",
+            work_root="/home/runner/work",
+            credential_ref=key["credential_ref"],
+            credential_fingerprint=key["fingerprint"],
+            host_key_fingerprints=[fingerprint(self.host_public)],
+            permission_mode=mode,
+            allow_rules=["cat *"],
+            deny_rules=["sudo *"],
+        )
+        created = self.request("POST", self.admin_path, "admin", value)
+        self.assertEqual(created.status_code, 201, created.text)
+        target = created.json()
+        probe = self.request(
+            "POST", self.admin_path + "/" + target["id"] + "/probe", "admin", {}
+        )
+        self.assertEqual(probe.status_code, 200, probe.text)
+        self.assertEqual(probe.json()["status"], "available", probe.text)
+        grant = self.request(
+            "PUT",
+            self.project_path() + "/runner-targets/" + target["id"] + "/grant",
+            "admin",
+            dict(enabled=True),
+        )
+        self.assertEqual(grant.status_code, 200, grant.text)
+        return dict(target)
+
+    def remote(self, operation: str, arguments: dict[str, Any], **extra: Any) -> Any:
+        return self.broker(
+            "remote",
+            dict(self.fence(), operation=operation, arguments=arguments, **extra),
+        )
+
+    def prepare(self, target: dict[str, Any], command: str = "cat demo.txt") -> Any:
+        raw = canonical(
+            dict(
+                files=[
+                    dict(
+                        path="demo.txt",
+                        mode="100644",
+                        content=base64.b64encode(
+                            b"remote acceptance output\n"
+                        ).decode(),
+                    )
+                ]
+            )
+        )
+        return self.prepare_raw(
+            target,
+            command,
+            base64.b64encode(raw).decode(),
+        )
+
+    def prepare_raw(
+        self,
+        target: dict[str, Any],
+        command: str,
+        snapshot_content: str,
+        cwd: str = ".",
+    ) -> Any:
+        return self.remote(
+            "prepare",
+            dict(target=target["id"], command=command, cwd=cwd, wait_s=0),
+            snapshot_content=snapshot_content,
+        )
+
+    def test_runner_startup_discovery_and_actionable_switch_errors(self) -> None:
+        import asyncio
+        import json
+        from services.orchestrator.code_mode import WorkExecution
+        from services.orchestrator.code_tools import WorkTools
+        from services.orchestrator.code_workspace import Workspace
+        from services.orchestrator.loop import Call
+        from services.orchestrator.work_tool_selection import WorkToolSelection
+
+        fixture = self
+
+        class Client:
+            org = fixture.org
+            project = fixture.project
+
+            async def call(
+                self, operation: str, data: dict[str, Any]
+            ) -> dict[str, Any]:
+                response = fixture.broker(operation, data)
+                fixture.assertEqual(response.status_code, 200, response.text)
+                return dict(response.json())
+
+        session = self.request(
+            "GET",
+            self.project_path() + "/work-sessions/" + self.session["id"],
+            "editor",
+        ).json()
+        execution = WorkExecution(Client(), session, self.turn_id)
+        tools = WorkTools(Workspace(str(uuid4())), execution)
+        tools.selection = WorkToolSelection("code")
+
+        def switch(**arguments: Any) -> dict[str, Any]:
+            return asyncio.run(
+                tools.execute(
+                    Call(str(uuid4()), "switch_tool_group", json.dumps(arguments)), 10
+                )
+            )
+
+        self.assertEqual(self.remote("list", {}).json(), {"items": []})
+        unavailable = switch(group="remote")
+        self.assertEqual(unavailable["error"], "remote_unavailable")
+        self.assertEqual(unavailable["reason"], "no granted target for this project")
+        self.assertIn("next_step", unavailable)
+        self.assertIsNone(tools.selection.pending)
+
+        # The grant is committed after acquisition and before turn-start discovery.
+        target = self.register("rules")
+        listing = asyncio.run(
+            execution.broker.call(
+                "remote", dict(execution.fence(), operation="list", arguments={})
+            )
+        )
+        self.assertEqual([t["id"] for t in listing["items"]], [target["id"]])
+        if listing.get("items"):
+            tools.selection.enable_remote()
+        self.assertEqual(switch(group="remote", focus="remote_run")["group"], "remote")
+        tools.selection.declarations()
+        self.assertIn("remote_run", tools.selection.names)
+        invalid = switch(group="remote", focus="run_command")
+        self.assertEqual(invalid["error"], "invalid_tool_focus")
+        self.assertIn("remote_run", invalid["allowed_tools"])
+        self.assertIsNone(tools.selection.pending)
+        unknown = switch(group="nonexistent")
+        self.assertEqual(unknown["error"], "invalid_tool_group")
+        self.assertIn("remote", unknown["allowed_groups"])
+        malformed = switch(group="remote", unexpected="not-echoed")
+        self.assertEqual(malformed["error"], "invalid_tool_group")
+        self.assertNotIn("not-echoed", json.dumps(malformed))
+        stale = self.broker(
+            "remote",
+            dict(execution.fence(), generation=2, operation="list", arguments={}),
+        )
+        self.assertEqual(stale.status_code, 409)
+        revoked = self.request(
+            "PUT",
+            self.project_path() + "/runner-targets/" + target["id"] + "/grant",
+            "admin",
+            dict(enabled=False),
+        )
+        self.assertEqual(revoked.status_code, 200)
+        self.assertEqual(self.remote("list", {}).json(), {"items": []})
+
+    def test_runner_work_target_list_emits_valid_scoped_progress(self) -> None:
+        import asyncio
+        from services.retrieval.project_scoped_api import store
+        from services.orchestrator.code_mode import WorkExecution
+        from services.orchestrator.code_tools import WorkTools
+        from services.orchestrator.code_workspace import Workspace
+        from services.orchestrator.loop import Call
+        from services.orchestrator.work_tool_selection import WorkToolSelection
+
+        target = self.register("rules")
+        fixture = self
+
+        class Client:
+            org = fixture.org
+            project = fixture.project
+
+            async def call(
+                self, operation: str, data: dict[str, Any]
+            ) -> dict[str, Any]:
+                response = fixture.broker(operation, data)
+                fixture.assertEqual(response.status_code, 200, response.text)
+                return dict(response.json())
+
+        execution = WorkExecution(Client(), self.session, self.turn_id)
+        execution.session = self.request(
+            "GET",
+            self.project_path() + "/work-sessions/" + self.session["id"],
+            "editor",
+        ).json()
+        tools = WorkTools(Workspace(str(uuid4())), execution)
+        tools.selection = WorkToolSelection("remote")
+        result = asyncio.run(tools.execute(Call("list", "list_targets", "{}"), 10))
+        items = result["items"]
+        assert isinstance(items, list)
+        self.assertEqual(items[0]["id"], target["id"])
+        with store(self.app_dsn).scope(
+            self.identity("editor", self.project), self.org, self.project
+        ) as scope:
+            row = scope.db.execute(
+                "SELECT data FROM atlas_projects.work_progress WHERE org_id=%s AND project_id=%s AND data->>'tool'='list_targets' ORDER BY seq DESC LIMIT 1",
+                (self.org, self.project),
+            ).fetchone()
+            self.assertIsNotNone(row)
+            assert row is not None
+            self.assertIn(target["id"], row["data"]["output"]["tool_result"])
+
+    def test_runner_work_remote_run_records_approval_executes_and_archives(
+        self,
+    ) -> None:
+        import asyncio
+        import io
+        import tarfile
+        from services.orchestrator.code_mode import WorkExecution
+        from services.orchestrator.code_tools import WorkTools
+        from services.orchestrator.code_workspace import Workspace
+        from services.orchestrator.loop import Call
+        from services.orchestrator.work_tool_selection import WorkToolSelection
+        from services.retrieval.project_work_contract import validate
+
+        target = self.register("rules")
+        fixture = self
+        archive = io.BytesIO()
+        with tarfile.open(fileobj=archive, mode="w:gz") as tar:
+            data = b"remote Work adapter acceptance\n"
+            entry = tarfile.TarInfo("demo.txt")
+            entry.size = len(data)
+            tar.addfile(entry, io.BytesIO(data))
+
+        class Scratch(Workspace):
+            def metadata(self) -> dict[str, Any]:
+                return dict(baseline={})
+
+            async def invoke(
+                self, operation: str, data: dict[str, Any], timeout: float
+            ) -> dict[str, Any]:
+                fixture.assertEqual(operation, "export")
+                return dict(archive=base64.b64encode(archive.getvalue()).decode())
+
+        class Client:
+            org = fixture.org
+            project = fixture.project
+            approval: dict[str, Any] | None = None
+            calls: list[tuple[str, str]] = []
+
+            async def call(
+                self, operation: str, data: dict[str, Any]
+            ) -> dict[str, Any]:
+                response = fixture.broker(operation, data)
+                fixture.assertEqual(response.status_code, 200, response.text)
+                value = dict(response.json())
+                if operation == "remote":
+                    self.calls.append((operation, data["operation"]))
+                if (
+                    operation == "remote"
+                    and data["operation"] == "prepare"
+                    and "approval" in value
+                ):
+                    self.approval = value["approval"]
+                    validate("Approval", self.approval)
+                return value
+
+        client = Client()
+        session = self.request(
+            "GET",
+            self.project_path() + "/work-sessions/" + self.session["id"],
+            "editor",
+        ).json()
+        tools = WorkTools(
+            Scratch(str(uuid4())), WorkExecution(client, session, self.turn_id)
+        )
+        tools.selection = WorkToolSelection("remote")
+        import json
+
+        result = asyncio.run(
+            tools.execute(
+                Call(
+                    "run",
+                    "remote_run",
+                    json.dumps(
+                        dict(target=target["id"], command="cat demo.txt", wait_s=10)
+                    ),
+                ),
+                30,
+            )
+        )
+        self.assertEqual(result["state"], "awaiting_approval", result)
+        self.assertTrue(result["command_id"])
+        next_step = result["next_step"]
+        assert isinstance(next_step, str)
+        self.assertIn("do not resubmit", next_step)
+        command_id = result["command_id"]
+        duplicate = asyncio.run(
+            tools.execute(
+                Call(
+                    "run-again",
+                    "remote_run",
+                    json.dumps(
+                        dict(target=target["id"], command="cat demo.txt", wait_s=10)
+                    ),
+                ),
+                30,
+            )
+        )
+        self.assertEqual(duplicate["command_id"], command_id)
+        assert client.approval is not None
+        decision = self.request(
+            "POST",
+            self.project_path() + "/approvals/" + client.approval["id"] + "/decision",
+            "editor",
+            dict(allow=True, action_digest=client.approval["action_digest"]),
+        )
+        self.assertEqual(decision.status_code, 200, decision.text)
+        resumed = asyncio.run(
+            tools.execute(
+                Call(
+                    "approve",
+                    "remote_run",
+                    json.dumps(
+                        dict(target=target["id"], command="cat demo.txt", wait_s=10)
+                    ),
+                ),
+                30,
+            )
+        )
+        self.assertEqual(resumed["state"], "succeeded", resumed)
+        self.assertIn("remote Work adapter acceptance", str(resumed["output"]))
+        self.assertTrue(resumed["log_file_id"])
+        self.assertEqual(client.calls.count(("remote", "execute")), 1, client.calls)
+        third = asyncio.run(
+            tools.execute(
+                Call(
+                    "third",
+                    "remote_run",
+                    json.dumps(
+                        dict(target=target["id"], command="cat demo.txt", wait_s=10)
+                    ),
+                ),
+                30,
+            )
+        )
+        self.assertEqual(third["state"], "succeeded", third)
+        self.assertNotEqual(third["command_id"], command_id)
+        self.assertNotIn("approval", third)
+        self.assertEqual(client.calls.count(("remote", "prepare")), 4, client.calls)
+        self.assertEqual(client.calls.count(("remote", "execute")), 2, client.calls)
+        closed = self.remote("close", {})
+        self.assertEqual(closed.status_code, 200, closed.text)
+
+    def test_runner_cwd_normalization_and_pending_reuse_survives_code_change(
+        self,
+    ) -> None:
+        from services.retrieval.project_scoped_api import store
+
+        target = self.register()
+        folder_id = str(uuid4())
+        raw = canonical(
+            dict(
+                files=[
+                    dict(
+                        path="demo.txt",
+                        mode="100644",
+                        content=base64.b64encode(b"first\n").decode(),
+                    )
+                ]
+            )
+        )
+        first = self.prepare_raw(
+            target,
+            "cat demo.txt",
+            base64.b64encode(raw).decode(),
+            cwd=folder_id,
+        )
+        self.assertEqual(first.status_code, 200, first.text)
+        self.assertEqual(first.json()["state"], "awaiting_approval", first.text)
+        command_id = first.json()["command_id"]
+        changed = canonical(
+            dict(
+                files=[
+                    dict(
+                        path="demo.txt",
+                        mode="100644",
+                        content=base64.b64encode(b"second\n").decode(),
+                    )
+                ]
+            )
+        )
+        second = self.prepare_raw(
+            target,
+            "cat demo.txt",
+            base64.b64encode(changed).decode(),
+            cwd="/" + folder_id,
+        )
+        self.assertEqual(second.status_code, 200, second.text)
+        self.assertEqual(second.json()["command_id"], command_id, second.text)
+        with store(self.app_dsn).scope(
+            self.identity("editor", self.project), self.org, self.project
+        ) as scope:
+            row = scope.db.execute(
+                "SELECT data FROM atlas_projects.runner_commands WHERE id=%s",
+                (command_id,),
+            ).fetchone()
+            assert row is not None
+            self.assertEqual(row["data"]["cwd"], ".")
+        closed = self.remote("close", {})
+        self.assertEqual(closed.status_code, 200, closed.text)
+
+    def test_runner_registry_roles_isolation_and_no_key_disclosure(self) -> None:
+        for role in ("editor", "viewer", "owner"):
+            response = self.request("POST", self.admin_path + "/credentials", role, {})
+            self.assertEqual(response.status_code, 403)
+        target = self.register()
+        listing = self.remote("list", {})
+        self.assertEqual(listing.status_code, 200, listing.text)
+        self.assertEqual(listing.json()["items"][0]["name"], "Test Linux")
+        for hidden in ("credential_ref", "host", "user", "private_key", "public_key"):
+            self.assertNotIn(hidden, listing.json()["items"][0])
+        other = self.request(
+            "GET", f"/api/atlas/orgs/{self.other_org}/runner-targets", "admin"
+        )
+        self.assertEqual(other.status_code, 404)
+        full = self.request("GET", self.admin_path, "admin")
+        self.assertNotIn("PRIVATE KEY", full.text)
+        self.assertNotIn("public_key", full.text)
+        self.assertEqual(full.json()["items"][0]["id"], target["id"])
+        forged = self.runner.post(
+            "/internal/runner/generate",
+            json=dict(permit="forged.signature"),
+            headers={
+                "X-Atlas-Execution-Secret": os.environ["ATLAS_PROJECT_EXECUTION_SECRET"]
+            },
+        )
+        self.assertEqual(forged.status_code, 409)
+
+    def test_runner_approval_egress_rules_and_durable_log(self) -> None:
+        target = self.register("rules")
+        pending = self.prepare(target)
+        self.assertEqual(pending.status_code, 200, pending.text)
+        value = pending.json()
+        self.assertEqual(value["state"], "awaiting_approval")
+        self.assertTrue(value["approval"]["remote"]["code_egress"])
+        arguments = dict(command_id=value["command_id"], wait_s=0)
+        self.assertEqual(self.remote("execute", arguments).status_code, 403)
+        approval = value["approval"]
+        decided = self.request(
+            "POST",
+            self.project_path() + "/approvals/" + approval["id"] + "/decision",
+            "editor",
+            dict(allow=True, action_digest=approval["action_digest"]),
+        )
+        self.assertEqual(decided.status_code, 200, decided.text)
+        launched = self.remote("execute", arguments)
+        self.assertEqual(launched.status_code, 200, launched.text)
+        self.assertEqual(self.remote("execute", arguments).status_code, 410)
+        for _ in range(30):
+            state = self.remote("status", arguments)
+            self.assertEqual(state.status_code, 200, state.text)
+            if state.json()["state"] not in {"running", "unknown"}:
+                break
+            time.sleep(0.1)
+        self.assertEqual(state.json()["state"], "succeeded", state.text)
+        self.assertIn("remote acceptance output", state.json()["output"])
+        self.assertTrue(state.json()["log_file_id"])
+        next_command = self.prepare(target)
+        self.assertEqual(next_command.json()["state"], "ready", next_command.text)
+        denied = self.prepare(target, "sudo reboot")
+        self.assertEqual(denied.json()["state"], "denied", denied.text)
+        fetched = self.remote(
+            "fetch", dict(target=target["id"], path_or_glob="demo.txt")
+        )
+        self.assertEqual(fetched.status_code, 200, fetched.text)
+        self.assertEqual(
+            fetched.json()["files"][0]["size_bytes"], len(b"remote acceptance output\n")
+        )
+        closed = self.remote("close", {})
+        self.assertEqual(closed.status_code, 200, closed.text)
+
+    def test_runner_public_key_once_and_confirmed_prefix_rule(self) -> None:
+        key = str(uuid4())
+        first = self.request(
+            "POST", self.admin_path + "/credentials", "admin", {}, key=key
+        )
+        self.assertEqual(first.status_code, 200, first.text)
+        second = self.request(
+            "POST", self.admin_path + "/credentials", "admin", {}, key=key
+        )
+        self.assertEqual(second.status_code, 410, second.text)
+        self.assertNotIn(first.json()["public_key"], second.text)
+        target = self.register("ask")
+        pending = self.prepare(target).json()
+        approval = pending["approval"]
+        decided = self.request(
+            "POST",
+            self.project_path() + "/approvals/" + approval["id"] + "/decision",
+            "editor",
+            dict(
+                allow=True, always_allow=True, action_digest=approval["action_digest"]
+            ),
+        )
+        self.assertEqual(decided.status_code, 200, decided.text)
+        args = dict(command_id=pending["command_id"], wait_s=0)
+        self.assertEqual(self.remote("execute", args).status_code, 200)
+        for _ in range(60):
+            state = self.remote("status", args)
+            if state.json().get("state") not in {"running", "unknown"}:
+                break
+            time.sleep(0.1)
+        self.assertEqual(state.json()["state"], "succeeded", state.text)
+        allowed = self.prepare(target)
+        self.assertEqual(allowed.json()["state"], "ready", allowed.text)
+        different = self.prepare(target, "cat other.txt")
+        self.assertEqual(different.json()["state"], "awaiting_approval", different.text)
+        self.assertFalse(different.json()["approval"]["remote"]["code_egress"])
+        self.assertEqual(self.remote("close", {}).status_code, 200)
+
+    def test_runner_target_revision_invalidates_pending_approval(self) -> None:
+        target = self.register()
+        pending = self.prepare(target).json()
+        approval = pending["approval"]
+        # Re-probing changes the registered revision, invalidating any old binding.
+        changed = self.request(
+            "POST", self.admin_path + "/" + target["id"] + "/probe", "admin", {}
+        )
+        self.assertEqual(changed.status_code, 200, changed.text)
+        decided = self.request(
+            "POST",
+            self.project_path() + "/approvals/" + approval["id"] + "/decision",
+            "editor",
+            dict(allow=True, action_digest=approval["action_digest"]),
+        )
+        self.assertEqual(decided.status_code, 403, decided.text)
+        self.assertEqual(
+            self.remote("execute", dict(command_id=pending["command_id"])).status_code,
+            403,
+        )
+        denied = self.request(
+            "PUT",
+            self.project_path() + "/runner-targets/" + target["id"] + "/grant",
+            "editor",
+            dict(enabled=False),
+        )
+        self.assertEqual(denied.status_code, 403, denied.text)
+        revoked = self.request(
+            "PUT",
+            self.project_path() + "/runner-targets/" + target["id"] + "/grant",
+            "admin",
+            dict(enabled=False),
+        )
+        self.assertEqual(revoked.status_code, 200, revoked.text)
+        self.assertEqual(self.remote("list", {}).json()["items"], [])
+
+    def test_runner_yes_given_in_the_next_turn_runs_the_command(self) -> None:
+        """The question ends one Work turn; the person's yes starts the next one.
+
+        Every turn releases its lease, which invalidates the approvals it left
+        open. The yes reused that closed question and the command was refused
+        (403 approval_required) in the real chat (staging 2026-11-14).
+        """
+        import asyncio
+        import json
+        from services.orchestrator.code_mode import WorkExecution
+        from services.orchestrator.code_tools import WorkTools
+        from services.orchestrator.code_workspace import Workspace
+        from services.orchestrator.loop import Call
+        from services.orchestrator.work_machine_tools import approval_shown
+        from services.orchestrator.work_tool_selection import WorkToolSelection
+
+        target = self.register("ask")
+        fixture = self
+
+        class Client:
+            org = fixture.org
+            project = fixture.project
+
+            async def call(
+                self, operation: str, data: dict[str, Any]
+            ) -> dict[str, Any]:
+                response = fixture.broker(operation, data)
+                if response.status_code != 200:
+                    error = ProjectError(
+                        response.status_code, str(response.json().get("error"))
+                    )
+                    error.body = response.json()
+                    raise error
+                return dict(response.json())
+
+            async def public(
+                self, method: str, tail: str, body: bytes = b"", headers: Any = None
+            ) -> tuple[int, dict[str, Any]]:
+                reply = fixture.request(
+                    method,
+                    fixture.project_path() + "/" + tail,
+                    "editor",
+                    json.loads(body) if body else None,
+                )
+                return reply.status_code, reply.json()
+
+        def turn(approval: dict[str, Any] | None) -> tuple[Any, WorkTools]:
+            session = self.request(
+                "GET",
+                self.project_path() + "/work-sessions/" + self.session["id"],
+                "editor",
+            ).json()
+            tools = WorkTools(
+                Workspace(str(uuid4())), WorkExecution(Client(), session, self.turn_id)
+            )
+            tools.selection = WorkToolSelection("remote")
+            tools.approvals_unattended, tools.lang = True, "en"
+            tools.machine_approval = approval
+            # The test machine stands for a connected computer: the question
+            # is asked in the conversation and no workspace is sent there.
+            tools.remote_in_place = {target["id"].casefold(): "/home/runner/work"}
+            arguments = dict(target=target["id"], command="echo pushed", wait_s=10)
+            result = asyncio.run(
+                tools.execute(
+                    Call(str(uuid4()), "remote_run", json.dumps(arguments)), 30
+                )
+            )
+            return result, tools
+
+        def next_turn() -> None:
+            # The end of a Work turn, then the start of the next, as chat_work runs them.
+            released = self.turn(
+                "release", terminal_state="completed", cleanup_confirmed=True
+            )
+            self.assertEqual(released.status_code, 200, released.text)
+            generation = self.fence()["generation"] + 1
+            self.session = self.request(
+                "GET",
+                self.project_path() + "/work-sessions/" + self.session["id"],
+                "editor",
+            ).json()
+            self.turn_id = str(uuid4())
+            self.fence = lambda: dict(  # type: ignore[method-assign]
+                session_id=self.session["id"],
+                request_id=self.turn_id,
+                generation=generation,
+            )
+            self.assertEqual(self.acquire().status_code, 200)
+
+        asked, _ = turn(None)
+        self.assertEqual(asked["state"], "awaiting_approval", asked)
+        question = approval_shown(asked["approval_question"])
+        assert question is not None
+        next_turn()
+        ran, tools = turn(dict(question, allowed=True))
+        self.assertEqual(ran["state"], "succeeded", ran)
+        self.assertIn("pushed", str(ran["output"]))
+        self.assertNotEqual(ran["command_id"], asked["command_id"])
+        self.assertEqual(tools.machine_approval_failures, {})
+        self.assertEqual(tools.validation_failures, {})
+        # The question of the ended turn is closed, never started.
+        old = self.remote("status", dict(command_id=asked["command_id"], wait_s=0))
+        self.assertEqual(old.status_code, 200, old.text)
+        self.assertEqual(old.json()["state"], "denied")
+        self.assertEqual(old.json()["error"], "approval_invalidated")
+        # A yes is used once: the same command in a later turn is asked again.
+        next_turn()
+        again, _ = turn(dict(question, allowed=True, used=True))
+        self.assertEqual(again["state"], "awaiting_approval", again)
+        self.assertEqual(self.remote("close", {}).status_code, 200)
+
+
+def load_tests(
+    loader: unittest.TestLoader, tests: unittest.TestSuite, pattern: str | None
+) -> unittest.TestSuite:
+    # Parent tests are discovered in their own module; execute only this feature's additions.
+    return unittest.TestSuite(
+        RunnerRegistryTests(name)
+        for name in loader.getTestCaseNames(RunnerRegistryTests)
+        if name.startswith("test_runner_")
+    )

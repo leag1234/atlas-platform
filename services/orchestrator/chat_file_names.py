@@ -1,0 +1,162 @@
+"""Names of the files a chat turn saves in the hidden chat project.
+
+The hidden "Chats" project is shared by all of a person's chat conversations,
+so a name asked for in one of them may already be taken by another. There a
+file is never overwritten and a publication never fails on the name: a name
+already taken with other content is saved as a numbered copy
+("tracker.xlsx", then "tracker (2).xlsx", "tracker (3).xlsx"). Two chat turns
+publishing at the same time move the folder revision under each other; the
+publication is retried with the current revision (staging 2026-11-12, a
+spreadsheet and a cover letter failed with revision_conflict).
+
+Project mode keeps its own rules: this module serves the hidden chat project
+only.
+"""
+
+from __future__ import annotations
+
+import re
+from collections.abc import Awaitable, Callable, Iterable, Mapping
+from pathlib import PurePosixPath
+from typing import Any
+
+# Publications tried for one file: a taken name or a moved folder each cost one.
+MAX_ATTEMPTS = 8
+# Numbered copies looked at for one name.
+MAX_COPIES = 500
+
+
+def copy_name(relative: str, number: int) -> str:
+    """The numbered copy of a name: copy_name("a/tracker.xlsx", 2) is "a/tracker (2).xlsx"."""
+    if number < 2:
+        return relative
+    path = PurePosixPath(relative)
+    return str(path.with_name(f"{path.stem} ({number}){path.suffix}"))
+
+
+def family(relative: str, taken: Iterable[str]) -> list[str]:
+    """The name and its numbered copies that exist, in number order."""
+    names = set(taken)
+    return [
+        name
+        for name in (copy_name(relative, n) for n in range(1, MAX_COPIES + 1))
+        if name in names
+    ]
+
+
+def free_name(relative: str, taken: Iterable[str]) -> str:
+    """The name itself when free, else its first free numbered copy."""
+    names = set(taken)
+    for number in range(1, MAX_COPIES + 1):
+        name = copy_name(relative, number)
+        if name not in names:
+            return name
+    raise ValueError("No free name left for " + PurePosixPath(relative).name)
+
+
+def last_delivered(
+    names: Iterable[str], answers: Iterable[str], project: str
+) -> str | None:
+    """Of these names, the one this conversation's answers linked last.
+
+    The answers link each saved file under its name ("[Download tracker.xlsx](...)"
+    or "[tracker.xlsx](...)", to a route of this project): such a file belongs to
+    this conversation, and a change asked here updates it.
+    """
+    text = "\n".join(answers)
+    # (position of the link, named in full, without a folder): the last link
+    # wins; a link names the file only since 2026-11-21 ("deliverables/x.pptx"
+    # was shown in full), so a full match comes before a name match.
+    best: tuple[int, bool, bool, str] | None = None
+    for name in names:
+        for label in dict.fromkeys((name, PurePosixPath(name).name)):
+            pattern = re.compile(
+                r"(?:^|[\[\s])"
+                + re.escape(label)
+                + r"\]\([^)\s]*/projects/"
+                + re.escape(project)
+                + r"/"
+            )
+            for match in pattern.finditer(text):
+                found = (match.start(), label == name, "/" not in name, name)
+                if best is None or found[:3] > best[:3]:
+                    best = found
+    return best[3] if best else None
+
+
+def delivered_file(
+    existing: Mapping[str, Any],
+    folder_id: str,
+    answers: list[str],
+    project: str,
+    suffixes: Iterable[str],
+) -> str | None:
+    """The file of one of these formats this conversation's answers linked last.
+
+    A change of a delivered file updates that one (publish_revision) and
+    starts from its stored version (current_file.load): both find it here.
+    """
+    allowed = set(suffixes)
+    text = "\n".join(answers)
+    names = [
+        name
+        for name in folder_names(existing, folder_id)
+        if PurePosixPath(name).suffix.lower() in allowed
+        and PurePosixPath(name).name in text
+    ]
+    return last_delivered(names, answers, project)
+
+
+def folder_names(existing: Mapping[str, Any], folder_id: str) -> set[str]:
+    """Relative paths of the files in one folder, from work_save.project_file_paths."""
+    prefix = folder_id + "/"
+    return {key[len(prefix) :] for key in existing if key.startswith(prefix)}
+
+
+async def folder_revision(execution: Any, folder_id: str) -> int:
+    """The folder's current revision: each publication there moves it."""
+    from services.retrieval.project_identity import ProjectError
+
+    status, listing = await execution.broker.public("GET", "folders")
+    if status != 200:
+        raise ProjectError(status, str(listing.get("error", "dependency_unavailable")))
+    for folder in listing.get("items", []):
+        if str(folder["id"]) == folder_id:
+            return int(folder["revision"])
+    raise ProjectError(404, "not_found")
+
+
+async def publish_copy(
+    publish: Callable[[str, int], Awaitable[Any]],
+    relative: str,
+    taken: Iterable[str],
+    revision: Callable[[], Awaitable[int]],
+    refresh: Callable[[], Awaitable[Iterable[str]]] | None = None,
+) -> tuple[dict[str, Any], str]:
+    """Publish under the first free name; return the receipt and the name saved.
+
+    A name taken although the names read did not show it (another publication
+    meanwhile, or a listing behind) is not followed by the next number only:
+    the taken names are read again (refresh), so the next try is a free name,
+    not one more of a run of copies the listing missed (staging 2026-11-21:
+    eight refusals in a row, then no file). A folder moved meanwhile by
+    another publication is retried with its current revision.
+    """
+    from services.retrieval.project_identity import ProjectError
+
+    names = set(taken)
+    name = free_name(relative, names)
+    for attempt in range(MAX_ATTEMPTS):
+        try:
+            return dict(await publish(name, await revision())), name
+        except ProjectError as error:
+            if attempt == MAX_ATTEMPTS - 1:
+                raise
+            if "path_conflict" in error.args:
+                names.add(name)
+                if refresh is not None:
+                    names |= set(await refresh())
+                name = free_name(relative, names)
+            elif "revision_conflict" not in error.args:
+                raise
+    raise AssertionError("unreachable")

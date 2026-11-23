@@ -1,0 +1,459 @@
+"""What an app follow-up keeps: the features of the current version against the new one.
+
+Staging -142 (2026-11-21): a quiz built over five turns lost what an earlier
+turn had added when the person only said "it does not work": the model wrote
+the file again, changed parts nobody asked about, and the answer said
+everything was kept. A follow-up starts from the stored app
+(app_turn.CURRENT_SOURCE), but nothing compared the result with it.
+
+This is the app counterpart of the document comparison of PR 591
+(readback.changes, deliverable_check REVISION): code measures, on both
+versions, the markers of what an app does, and lists those of the current
+version that the new file no longer has. The model judges them against the
+request in its one repair (a removal the person asked for is kept with the
+word KEEP, without writing the file again); a version stored with losses still
+open says so in the answer (user_errors.app_lost_features).
+
+Markers, chosen to survive a rewrite that keeps the feature:
+
+- element: an id of the current version (kept when the new file has the id or
+  names it as a string, as code that creates the element does);
+- label: the text of a button, heading, label, option, legend, summary, table
+  header, the title, a placeholder or an aria-label, and short texts that the
+  script writes into textContent, innerText or value (kept when the text is
+  anywhere in the new file, letter case and spacing aside);
+- part: a kind of element the page uses (picture, canvas, SVG drawing, sound
+  or video element, slider, list box, text area, table);
+- picture / sound: the number of embedded data: images or sounds written in
+  the file (kept when the new file has at least as many, or, for pictures,
+  builds them at run time from a template), and each atlas-media file it
+  uses (app_media.py);
+- ability: what the script does (timer, animation, sound, keyboard or touch
+  controls, drawing, saving, speech, vibration, full screen, drag and drop);
+- data: the size of each data collection, an array literal the script names
+  (a question bank, a word list, records) and the list items, options and
+  table rows of the page (kept when the new file has at least as many
+  entries). Staging -181: adding a flag to each country of a quiz kept only
+  the five countries with a supplied flag, out of twenty, and every name
+  marker survived.
+"""
+
+from __future__ import annotations
+
+import html
+import html.parser
+import re
+from dataclasses import dataclass
+from typing import Literal
+
+Kind = Literal[
+    "element", "label", "part", "picture", "sound", "media", "ability", "data"
+]
+
+LABEL_TAGS = frozenset(
+    {
+        "button",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "label",
+        "option",
+        "legend",
+        "summary",
+        "th",
+        "title",
+    }
+)
+LABEL_ATTRIBUTES = ("placeholder", "aria-label")
+# A picture may be an <img>, an SVG drawing or a canvas: a version that draws
+# what the last one showed as an image keeps it.
+PART_TAGS = {
+    "img": "picture",
+    "canvas": "picture",
+    "svg": "picture",
+    "audio": "sound element",
+    "video": "video",
+    "select": "list box",
+    "textarea": "text area",
+    "table": "table",
+}
+PART_CODE = {
+    **{name: f"<{tag}>" for tag, name in PART_TAGS.items()},
+    "picture": "<img>, <svg> or <canvas>",
+    "slider": '<input type="range">',
+}
+ABILITY_CODE = {
+    "timer": "the timer (setInterval or setTimeout)",
+    "animation": "the animation (requestAnimationFrame)",
+    "sound": "the sound (Web Audio or media playback)",
+    "keyboard": "the keyboard controls (key events)",
+    "touch": "the touch or pointer controls",
+    "drawing": "the canvas drawing (getContext)",
+    "saving": "the saving in storage",
+    "speech": "the speech (speechSynthesis)",
+    "vibration": "the vibration",
+    "fullscreen": "the full screen mode",
+    "drag": "the drag and drop",
+}
+ABILITIES = {
+    "timer": re.compile(r"\bset(?:Interval|Timeout)\s*\("),
+    "animation": re.compile(r"\brequestAnimationFrame\s*\("),
+    "sound": re.compile(
+        r"\b(?:webkit)?AudioContext\b|\bnew\s+Audio\s*\(|\.play\s*\(\s*\)"
+    ),
+    "keyboard": re.compile(
+        r"""['"]key(?:down|up|press)['"]|\bonkey(?:down|up|press)\b"""
+    ),
+    "touch": re.compile(
+        r"""['"](?:touchstart|pointerdown|touchend|pointerup)['"]|\bontouchstart\b"""
+    ),
+    "drawing": re.compile(r"""\.getContext\s*\(\s*['"](?:2d|webgl2?)['"]"""),
+    "saving": re.compile(r"\b(?:localStorage|sessionStorage|indexedDB)\b"),
+    "speech": re.compile(r"\bspeechSynthesis\b|\bSpeechSynthesisUtterance\b"),
+    "vibration": re.compile(r"\bnavigator\.vibrate\b"),
+    "fullscreen": re.compile(r"\brequestFullscreen\b"),
+    "drag": re.compile(r"""['"](?:dragstart|drop)['"]|\bdraggable\b"""),
+}
+# A whole text the script writes (not the start of a sentence it completes).
+SCRIPT_TEXT = re.compile(
+    r"""\.(?:textContent|innerText|value)\s*=\s*(['"`])([^'"`\n\\$]{2,40})\1"""
+    r"""(?=\s*[;\n)}])"""
+)
+# Embedded pictures: SVG drawings written in the file (as markup, in a string
+# or in a data: URI, encoded or not) and the other data: images.
+PICTURES = re.compile(
+    r"<svg\b|%3Csvg\b|data:image/(?!svg)|data:image/svg\+xml;base64", re.I
+)
+# Pictures the script builds at run time from one template (a flag per
+# country from a colour map): the file writes one <svg> and the page shows
+# many, so the written count is no measure of what is shown.
+# A template literal (possessive: each backtick run is read once) and the
+# SVG builder the script calls.
+TEMPLATE = re.compile(r"`[^`]*+")
+SVG_ELEMENT = re.compile(
+    r"""\bcreateElementNS\s*+\(\s*+['"]http://www\.w3\.org/2000/svg['"]"""
+)
+
+
+def _runtime_pictures(document: str) -> bool:
+    """Whether the script builds SVG pictures: a template literal holding an
+    <svg> and an interpolation, or createElementNS with the SVG namespace."""
+    if SVG_ELEMENT.search(document):
+        return True
+    for literal in TEMPLATE.finditer(document):
+        body = literal.group(0)
+        lowered = body.lower()
+        starts = [i for i in (lowered.find("<svg"), lowered.find("%3csvg")) if i >= 0]
+        if starts and "${" in body[min(starts) :]:
+            return True
+    return False
+
+
+# A clock read in an animation loop: a countdown drawn with
+# requestAnimationFrame is a timer too.
+CLOCK = re.compile(r"\b(?:performance|Date)\.now\s*\(")
+SOUNDS = re.compile(r"data:audio/", re.I)
+MEDIA = re.compile(r"atlas-media:([a-z0-9][a-z0-9-]{0,63})")
+LETTER = re.compile(r"[^\W\d_]", re.U)
+MAX_LABEL = 60
+MAX_LOSSES = 12
+# Markers that never make a loss on their own (lost()).
+SECONDARY = frozenset({"element", "label"})
+
+
+@dataclass(frozen=True)
+class Feature:
+    kind: Kind
+    name: str
+    count: int = 1
+    # A lost data collection: the entries the new file has.
+    now: int = 0
+
+    def shown(self) -> str:
+        """The name the answer's note uses (user_errors.app_lost_features)."""
+        if self.kind == "data":
+            return f"{self.count} → {self.now}"
+        return self.name
+
+    def described(self) -> str:
+        """The feature as the model reads it in a repair."""
+        if self.kind == "element":
+            return f'the element with id "{self.name}"'
+        if self.kind == "label":
+            return f'the text "{self.name}"'
+        if self.kind == "part":
+            return f"a {self.name} ({PART_CODE[self.name]})"
+        if self.kind == "picture":
+            return (
+                f"{self.count} embedded pictures (SVG drawings or data: images; "
+                "this file has fewer)"
+            )
+        if self.kind == "sound":
+            return f"{self.count} embedded data: sounds (this file has fewer)"
+        if self.kind == "media":
+            return f"the file atlas-media:{self.name}"
+        if self.kind == "data":
+            return (
+                f"the {self.count} entries of {self.name} (this file has "
+                f"{self.now}): keep every entry the user did not ask to remove; "
+                "an entry a new feature cannot cover (no picture supplied for "
+                "it) stays, with a placeholder"
+            )
+        return ABILITY_CODE[self.name]
+
+
+# Data collections: an array literal assigned to a name, and repeated page
+# entries. Only collections of at least MIN_ENTRIES count.
+COLLECTION = re.compile(r"\b(?:const|let|var)\s++([A-Za-z_$][\w$]*+)\s*+=\s*+\[")
+PAGE_ENTRIES = {
+    "li": "the list items",
+    "option": "the list box options",
+    "tr": "the table rows",
+}
+MIN_ENTRIES = 3
+_OPENERS = {"[": "]", "{": "}", "(": ")"}
+
+
+def _entries(script: str, start: int) -> int | None:
+    """The entries of the array literal whose "[" is at ``start``, or None.
+
+    Strings, template literals and comments are skipped; an entry is a
+    non-empty segment between commas at the array's own depth.
+    """
+    depth = 0
+    count = 0
+    filled = False
+    index = start
+    closers: list[str] = []
+    while index < len(script):
+        char = script[index]
+        if char in "'\"`":
+            end = index + 1
+            while end < len(script) and script[end] != char:
+                end += 2 if script[end] == "\\" else 1
+            index = end + 1
+            filled = True
+            continue
+        if script.startswith("//", index):
+            newline = script.find("\n", index)
+            index = len(script) if newline < 0 else newline
+            continue
+        if script.startswith("/*", index):
+            close = script.find("*/", index + 2)
+            index = len(script) if close < 0 else close + 2
+            continue
+        if char in _OPENERS:
+            if depth == 1:
+                filled = True
+            closers.append(_OPENERS[char])
+            depth += 1
+        elif closers and char == closers[-1]:
+            closers.pop()
+            depth -= 1
+            if depth == 0:
+                return count + (1 if filled else 0)
+        elif depth == 1 and char == ",":
+            count += 1 if filled else 0
+            filled = False
+        elif depth == 1 and not char.isspace():
+            filled = True
+        index += 1
+    return None
+
+
+def collections(
+    document: str, script: str, minimum: int = MIN_ENTRIES
+) -> dict[str, int]:
+    """The data collections of an app file and their number of entries."""
+    found: dict[str, int] = {}
+    for match in COLLECTION.finditer(script):
+        size = _entries(script, match.end() - 1)
+        if size is not None and size >= minimum:
+            found[f'the array "{match.group(1)}"'] = max(
+                size, found.get(f'the array "{match.group(1)}"', 0)
+            )
+    for tag, name in PAGE_ENTRIES.items():
+        size = len(re.findall(rf"<{tag}\b", document, re.I))
+        if size >= minimum:
+            found[name] = size
+    return found
+
+
+def _norm(text: str) -> str:
+    return " ".join(html.unescape(text).split()).casefold()
+
+
+class _Reader(html.parser.HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.ids: list[str] = []
+        self.labels: list[str] = []
+        self.parts: set[str] = set()
+        self.scripts: list[str] = []
+        self._label: list[list[str]] = []
+        self._in_script = False
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        tag = tag.lower()
+        values = {name.lower(): (value or "") for name, value in attrs}
+        if values.get("id", "").strip():
+            self.ids.append(values["id"].strip())
+        for name in LABEL_ATTRIBUTES:
+            if values.get(name, "").strip():
+                self.labels.append(values[name])
+        if tag == "input":
+            kind = values.get("type", "").lower()
+            if kind in {"button", "submit", "reset"} and values.get("value"):
+                self.labels.append(values["value"])
+            if kind == "range":
+                self.parts.add("slider")
+        if tag in PART_TAGS:
+            self.parts.add(PART_TAGS[tag])
+        for name, value in values.items():
+            if name.startswith("on") and value:
+                self.scripts.append(value)
+        if tag == "script":
+            self._in_script = True
+        elif tag in LABEL_TAGS:
+            self._label.append([])
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.lower()
+        if tag == "script":
+            self._in_script = False
+        elif tag in LABEL_TAGS and self._label:
+            self.labels.append("".join(self._label.pop()))
+
+    def handle_data(self, data: str) -> None:
+        if self._in_script:
+            self.scripts.append(data)
+        for open_label in self._label:
+            open_label.append(data)
+
+
+def _script(document: str) -> str:
+    reader = _Reader()
+    try:
+        reader.feed(document)
+        reader.close()
+    except (AssertionError, ValueError):
+        pass
+    return "\n".join(reader.scripts)
+
+
+def features(document: str) -> list[Feature]:
+    """The markers of what an app file does, in a stable order."""
+    reader = _Reader()
+    try:
+        reader.feed(document)
+        reader.close()
+    except (AssertionError, ValueError):
+        pass
+    script = "\n".join(reader.scripts)
+    found: list[Feature] = []
+    for name in dict.fromkeys(reader.ids):
+        found.append(Feature("element", name))
+    labels = list(reader.labels) + [
+        match.group(2) for match in SCRIPT_TEXT.finditer(script)
+    ]
+    seen: set[str] = set()
+    for label in labels:
+        text = " ".join(html.unescape(label).split())
+        if not text or len(text) > MAX_LABEL or not LETTER.search(text):
+            continue
+        if _norm(text) not in seen:
+            seen.add(_norm(text))
+            found.append(Feature("label", text))
+    if "slider" in reader.parts:
+        found.append(Feature("part", "slider"))
+    for part in dict.fromkeys(PART_TAGS.values()):
+        if part in reader.parts:
+            found.append(Feature("part", part))
+    pictures = len(PICTURES.findall(document))
+    if pictures:
+        found.append(Feature("picture", "embedded", pictures))
+    sounds = len(SOUNDS.findall(document))
+    if sounds:
+        found.append(Feature("sound", "embedded", sounds))
+    for name in dict.fromkeys(MEDIA.findall(document)):
+        found.append(Feature("media", name))
+    for name, size in collections(document, script).items():
+        found.append(Feature("data", name, size))
+    for name, pattern in ABILITIES.items():
+        if pattern.search(script) or (
+            name == "timer"
+            and ABILITIES["animation"].search(script)
+            and CLOCK.search(script)
+        ):
+            found.append(Feature("ability", name))
+    return found
+
+
+def lost(previous: str, new: str) -> list[Feature]:
+    """The features of the current version that the new file no longer has.
+
+    Only what the person can notice counts: a part (picture, slider...), an
+    embedded picture, sound or file, or an ability of the script. A changed
+    text is most often the change asked for, and a renamed element id changes
+    nothing the person sees; both are listed only with such a loss, to help
+    the repair. Staging -145 replays: id and text changes alone sent every
+    follow-up to a second whole write (twice the waiting) for nothing the
+    person would miss.
+    """
+    now = features(new)
+    ids = {feature.name for feature in now if feature.kind == "element"}
+    parts = {feature.name for feature in now if feature.kind == "part"}
+    abilities = {feature.name for feature in now if feature.kind == "ability"}
+    media = {feature.name for feature in now if feature.kind == "media"}
+    counts = {
+        feature.kind: feature.count
+        for feature in now
+        if feature.kind in {"picture", "sound"}
+    }
+    # Every collection of the new file, small ones too (a bank cut to two).
+    data = collections(new, _script(new), minimum=0)
+    text = _norm(new)
+    runtime = _runtime_pictures(new)
+    missing: list[Feature] = []
+    for feature in features(previous):
+        if feature.kind == "element":
+            kept = feature.name in ids or bool(
+                re.search(
+                    r"""['"`#]""" + re.escape(feature.name) + r"""['"`\s.\[:>,)]""",
+                    new,
+                )
+            )
+        elif feature.kind == "label":
+            kept = _norm(feature.name) in text
+        elif feature.kind == "part":
+            # Pictures the script writes as markup (an SVG string) count.
+            kept = feature.name in parts or (
+                feature.name == "picture" and counts.get("picture", 0) > 0
+            )
+        elif feature.kind in {"picture", "sound"}:
+            kept = counts.get(feature.kind, 0) >= feature.count or (
+                feature.kind == "picture" and runtime
+            )
+        elif feature.kind == "media":
+            kept = feature.name in media
+        elif feature.kind == "data":
+            # A renamed collection keeps its entries in another one.
+            size = data.get(feature.name, max(data.values(), default=0))
+            kept = size >= feature.count
+            if not kept:
+                missing.append(Feature("data", feature.name, feature.count, now=size))
+                continue
+        else:
+            kept = feature.name in abilities
+        if not kept:
+            missing.append(feature)
+    if all(feature.kind in SECONDARY for feature in missing):
+        return []
+    # What the person notices first: what the repair must restore.
+    missing.sort(key=lambda feature: feature.kind in SECONDARY)
+    return missing[:MAX_LOSSES]
+
+
+def repair_lines(losses: list[Feature]) -> str:
+    return "\n".join("- " + feature.described() for feature in losses)

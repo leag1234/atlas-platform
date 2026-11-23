@@ -1,0 +1,7 @@
+{
+  "content": [
+    {"type": "text", "text": ".fr,2026-10-23"},
+    {"type": "reference", "reference_ids": ["0"]},
+    {"type": "thinking", "text": "internal"}
+  ]
+}

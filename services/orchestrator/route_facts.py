@@ -1,0 +1,1621 @@
+"""Route facts in a travel answer come from a page read in the turn.
+
+Staging -98 (2026-11-16, phone, device position): three real trips kept
+invented local-transit facts because the travel check read only numbers: a
+metro transfer at a station the second line does not serve, a train said to
+stop under the airport terminal when its source named only the city, an S-Bahn
+leg "from general knowledge". Atlas has no routing engine (owner decision):
+a line or train number, a platform, a stop or station on a route, a direction,
+a transfer, a "direct" service, a frequency or an operator written in a travel
+answer is a fact, and it must come from a page read in this turn.
+
+The unit checked is the sentence (a table row; a parenthesis when the rest of
+the sentence holds without it). Its route anchors (line identifiers, place
+names in route positions, "direct", a frequency, its clock times) must appear
+together in one passage of one source, within ``WINDOW`` characters: one page
+naming the line and another naming the stop do not source the transfer. A unit
+that fails is left out whole by the travel check (travel_claims), unless only
+a qualifier ("direct") or its closing clauses fail (``_cuts``); a sentence
+that only continues it ("Trains run every few minutes.") goes with it, and the
+closing note says the route details could not be verified and where to check.
+
+Names the person gave are theirs only when no source writes them (an address,
+a place written in another language); a name the sources do write must sit with
+the rest of the claim. Clock times the person gave or code computed are never
+required. Any country, any language: the words below are the closed classes of
+transit vocabulary of the five interface languages, never places or sentences.
+Every pass is linear in the size of the answer and of the sources.
+"""
+
+from __future__ import annotations
+
+import re
+import unicodedata
+from collections.abc import Iterable
+from dataclasses import dataclass, field
+
+from services.orchestrator.grounding import normalized
+from services.orchestrator.unsourced_details import (
+    COMMON,
+    CONNECTORS,
+    STOP,
+    TITLES,
+)
+
+# Characters of normalized source text that one claim may span.
+WINDOW = 500
+# The opening of a passage: a page naming a line there is about that line.
+LEAD = 400
+
+# Transit vocabulary, folded (lower case, no accents), five languages.
+TRANSIT_WORDS = frozenset(
+    (
+        "line lines ligne lignes linie linien linea lineas linee metro metros "
+        "subway underground tube s-bahn u-bahn sbahn ubahn bahn tram trams tramway "
+        "tramways strassenbahn straßenbahn tranvia tranvias tranvie bus buses busse "
+        "autobus rer ter tgv ice ic ec ir re rb rex train trains zug zuge treno treni "
+        "tren trenes voie voies quai quais platform platforms track tracks gleis "
+        "bahnsteig anden andenes binario binari"
+    ).split()
+)
+# Station-type words: dropped from a name before matching ("Gare Part-Dieu" and
+# "Lyon Part-Dieu" name one place; "Hbf" is also written "Hauptbahnhof").
+STATION_WORDS = frozenset(
+    (
+        "gare gares station stations bahnhof hauptbahnhof hbf bf estacion "
+        "estaciones stazione stazioni arret arrets stop stops haltestelle "
+        "fermata fermate parada paradas"
+    ).split()
+)
+# Place-type words: no name alone ("the airport"), part of one with another
+# word ("Geneva Airport" is not "Geneva").
+PLACE_WORDS = frozenset(
+    (
+        "aeroport airport flughafen aeropuerto aeroporto terminal port hafen "
+        "puerto porto"
+    ).split()
+)
+_ROUTE_VERBS = (
+    r"prene?z|prendre|prends|take|taking|nehmen|nimm|tome|toma|tomar|prendi|"
+    r"prenda|prendere|descende?z|descendre|get off|alight|aussteigen|steigen|"
+    r"baje|bajar|bajese|scendi|scenda|scendere|change[zr]?|changement|"
+    r"transfer\w*|umsteig\w*|umstieg|cambi\w*|correspondances?|connections?|"
+    r"connecting|anschluss\w*|coincidenc\w*|direction|towards?|richtung|"
+    r"direccion|direzione|terminus|endstation"
+)
+# Words that make a sentence about a route (with a name in it).
+_ROUTE = re.compile(
+    r"(?<![\w-])(?:"
+    + _ROUTE_VERBS
+    + "|"
+    + "|".join(
+        sorted(map(re.escape, TRANSIT_WORDS | STATION_WORDS), key=len, reverse=True)
+    )
+    + r")(?![\w-])|→|->",
+)
+_TRANSIT = re.compile(
+    r"(?<![\w-])(?:"
+    + "|".join(
+        sorted(map(re.escape, TRANSIT_WORDS | STATION_WORDS), key=len, reverse=True)
+    )
+    + r")(?![\w-])"
+)
+_LINE_WORDS = re.compile(r"(?<![\w-])(?:lines?|lignes?|linien?|lineas?|linee)(?![\w-])")
+# Words a place name follows on a route ("until Bellecour", "direction X",
+# "bis Marienplatz", "-> Geneva"), an article allowed in between.
+_SLOT = re.compile(
+    r"(?:(?<![\w-])(?:direction|directions|towards?|richtung|direccion|direzione|"
+    r"vers|jusqu|a|au|aux|at|to|from|depuis|de|du|des|via|bis|nach|ab|von|vom|"
+    r"zum|zur|am|an|in|im|hasta|desde|en|hacia|para|fino|da|dal|dalla|verso|per|"
+    r"until|till|entre|between|and|et|und|y|e|"
+    + "|".join(sorted(STATION_WORDS, key=len, reverse=True))
+    + r"|terminus|endstation)|→|->|>)"
+    r"\s+(?:(?:la|le|les|l|the|der|die|das|den|dem|el|los|las|il|lo|gli)\s+)?$"
+)
+# The answer's own words for "direct" (adjectives; adverbs count next to a
+# transit or station word, "achetez directement en ligne" is no route).
+_DIRECT = re.compile(
+    r"(?<![\w-])(?:direct|directe|directs|directes|direkt|direkte[nrs]?|directo|"
+    r"directa|directos|directas|diretto|diretta|diretti|dirette|nonstop|non-stop|"
+    r"sans (?:changement|correspondance)|without (?:changing|a change|changes)|"
+    r"ohne umsteigen|sin (?:transbordos?|cambios?)|senza cambi\w*)(?![\w-])"
+)
+_DIRECT_ADVERB = re.compile(
+    r"(?<![\w-])(?:directement|directly|direttamente|directamente)(?![\w-])"
+)
+_FREQUENCY = re.compile(
+    r"(?<![\w-])(?:every|toutes les|tous les|alle|cada|ogni)\s+(?:\d+|few|couple|"
+    r"quelques|paar|pocos|pochi|deux|two|zwei|dos|due|trois|three|drei|tres|tre|"
+    r"cinq|five|funf|cinco|cinque|dix|ten|zehn|diez|dieci|quinze|fifteen|"
+    r"funfzehn|quince|quindici|vingt|twenty|zwanzig|veinte|venti|trente|thirty|"
+    r"dreissig|treinta|trenta)\b.{0,14}?(?:min\w*|heures?|hours?|stunden?|horas?|"
+    r"ore)\b|(?<![\w-])(?:frequen\w*|frecuen\w*|takt\w*|cadenc\w*)"
+)
+# A sentence that says its own content is unsourced ("from general knowledge").
+_DISCLAIMER = re.compile(
+    r"general knowledge|from memory|not (?:been )?verified|connaissances? "
+    r"generales?|de memoire|non verifie|allgemeinwissen|aus dem gedachtnis|"
+    r"nicht (?:uberpruft|verifiziert)|conocimiento general|de memoria|"
+    r"sin verificar|conoscenz\w* general\w*|a memoria|non verificat\w*"
+)
+# A sentence that names a gap ("The connections between A and B are not given
+# by the sources", "check it in the operator's planner") states no route: the
+# places it names are what is missing, not a claim (staging -102: a rewrite
+# saying so was rejected for naming the person's own stop).
+_NEGATION = re.compile(
+    r"(?<![\w-])(?:not|no|none|cannot|never|\w+n['’]t|n|ne|pas|aucune?|jamais|"
+    r"kein\w*|nicht|nie|ningun\w*|nunca|nessun\w*|non)(?![\w-])"
+)
+_SOURCE_WORDS = re.compile(
+    r"(?<![\w-])(?:sources?|pages?|quellen?|seiten?|fuentes?|paginas?|fonti|"
+    r"pagine|precis\w*|indiqu\w*|given|stated|listed|shown|confirm\w*|"
+    r"verifi\w*|uberpruf\w*|bestatig\w*|angegeben\w*|genannt\w*|indica\w*|"
+    r"specifica\w*|detail\w*)(?![\w-])"
+)
+_CHECK = re.compile(
+    r"(?<![\w-])(?:check|verify|confirm|look up|verifiez|verifier|consultez|"
+    r"consulter|prufen|uberprufen|compruebe|comprueba|consulte|verifique|"
+    r"verifica|controlli|controlla|consulta)(?![\w-])"
+)
+_PLANNER = re.compile(
+    r"(?<![\w-])(?:planner|planificateur|calculateur|journey|itinerair\w*|"
+    r"fahrplan\w*|reiseauskunft|auskunft|planificador|pianificatore|app|"
+    r"application|site|website|operator\w*|exploitant\w*|transporteur\w*|"
+    r"verkehrsbetrieb\w*|betreiber\w*|operador\w*|operatore)(?![\w-])"
+)
+
+
+def gap(folded: str) -> bool:
+    """Whether a sentence says what could not be found or where to check it."""
+    return bool(
+        (_NEGATION.search(folded) and _SOURCE_WORDS.search(folded))
+        or (_CHECK.search(folded) and _PLANNER.search(folded))
+    )
+
+
+# A line, train or platform identifier after its word ("ligne B", "RER A",
+# "TER 3105", "Gleis 12"), or a code alone ("S8", "U3", "M14").
+_LINE_WORD = re.compile(
+    r"(?<![\w-])("
+    + "|".join(sorted(map(re.escape, TRANSIT_WORDS), key=len, reverse=True))
+    + r")\.?[  ]+(?:(?:n[°o]|nr|no)\.?[  ]*)?"
+)
+# Not a clock time or a quantity: "train 06:38", "bus 5 min".
+_LINE_ID = re.compile(
+    r"(\d{1,5}[a-z]?|[A-Z]{1,3}\d{0,4})(?![\w-])"
+    r"(?![ \u00a0]?(?::|h\b|h ?\d|min|km|m\b|%|€|\$))"
+)
+# A line number or letter in a normalized (lower-case) passage.
+_LISTED_ID = re.compile(_LINE_ID.pattern, re.I)
+# Source sentences for a listing: a mark, or a line break.
+_SOURCE_SENTENCE = re.compile(r"(?<=[.!?;])\s|\n")
+_CODE = re.compile(r"(?<![\w-])([A-Z]{1,3})(\d{1,4})[a-z]?(?![\w-])")
+_TOKEN = re.compile(r"[^\W\d_]+(?:[-‐][^\W\d_]+)*")
+_MARKERS = re.compile(r"[\s\-*+>#|.)\d_]*")
+
+# Prepositions, question words and the verbs of a trip request, five
+# languages: they open sentences ("From Landshuter Allee, take ...") and tie no
+# page to a trip (staging -102).
+FUNCTION_WORDS = frozenset(
+    (
+        "from into onto over under near next via toward towards until till need "
+        "needs want would could should will must have going get getting go come "
+        "back home where when what which how there here then "
+        "depuis vers chez jusqu dois doit devons veux voudrais faut aller venir "
+        "rentrer comment quand quel quelle quels quelles avec sans dans sous pres "
+        "von vom aus bei mit ohne uber unter neben nach zum zur bis wie wann wo "
+        "welche muss mochte will fahren kommen "
+        "desde hacia hasta para con sin cerca donde cuando cual quiero "
+        "necesito tengo debo voy llegar "
+        "dal dalla dallo verso fino con senza vicino dove quando come quale voglio "
+        "devo vado andare arrivare"
+    ).split()
+)
+_GENERIC = (
+    FUNCTION_WORDS
+    | COMMON
+    | STOP
+    | TITLES
+    | frozenset(normalized(w) for w in TRANSIT_WORDS)
+    | frozenset(
+        (
+            "direction towards toward richtung direccion direzione terminus "
+            "endstation sie ihr ihre you vous nous wir option etape step leg "
+            "abschnitt tramo tratta am im an lundi mardi mercredi jeudi vendredi samedi "
+            "dimanche monday tuesday wednesday thursday friday saturday sunday "
+            "montag dienstag mittwoch donnerstag freitag samstag sonntag"
+        ).split()
+    )
+)
+
+
+def fold(text: str) -> str:
+    """Lower case without accents, one character for one (offsets are kept)."""
+    out: list[str] = []
+    for character in text:
+        lower = character.lower()
+        if len(lower) != 1:
+            lower = character
+        base = [
+            c
+            for c in unicodedata.normalize("NFKD", lower)
+            if not unicodedata.combining(c)
+        ]
+        out.append(base[0] if base else lower)
+    return "".join(out)
+
+
+@dataclass(frozen=True)
+class Anchor:
+    kind: str  # line, name, direct, frequency, clock
+    key: str
+    text: str
+    patterns: tuple[re.Pattern[str], ...]
+    position: int = field(default=-1, compare=False)
+
+
+@dataclass
+class Unit:
+    start: int
+    end: int  # the final mark of a sentence, or the end of its text
+    row: bool = False
+    anchors: list[Anchor] = field(default_factory=list)
+    route: bool = False
+    flavour: bool = False  # transit words or a frequency, whatever the anchors
+    disclaimer: bool = False
+    gap: bool = False
+    parentheses: list[tuple[int, int, list[Anchor]]] = field(default_factory=list)
+    cells: list[tuple[int, list[Anchor]]] = field(default_factory=list)
+    computed: bool = False
+    # Names given as a line's direction ("direction X", "towards X"), each
+    # with the span of its phrase in the body.
+    directions: list[tuple[Anchor, int, int]] = field(default_factory=list)
+
+
+@dataclass
+class Finding:
+    """What the travel check leaves out: spans to remove and what they stated."""
+
+    # (start, end, what it stated); a sentence that only continued a removed
+    # one states nothing of its own.
+    spans: list[tuple[int, int, list[str]]] = field(default_factory=list)
+    # Spans left out because the pages read name another line for the route.
+    disputed: int = 0
+    # The person's own words that opened a removed first sentence ("To be
+    # at Geneva Airport tomorrow at 9:00"): the answer still opens with them.
+    opening: str = ""
+    # Openings the first sentence could keep if it goes: (end of the kept
+    # clauses in the body, their words, whether what follows states a route).
+    leads: list[tuple[int, str, bool]] = field(default_factory=list)
+    lead_start: int = -1
+    # Spans that are a part of a sentence (a qualifier, a closing clause):
+    # removed as they are, the rest of the sentence kept (``_cuts``).
+    exact: set[tuple[int, int]] = field(default_factory=set)
+
+    @property
+    def route(self) -> bool:
+        """A line, a stop, a direction or a direct service is left out."""
+        return any(labels for _, _, labels in self.spans)
+
+    @property
+    def labels(self) -> list[str]:
+        return [label for _, _, labels in self.spans for label in labels]
+
+
+def _word(token: str) -> re.Pattern[str]:
+    return re.compile(rf"(?<!\w){re.escape(token)}(?!\w)")
+
+
+_TRANSIT_N = "|".join(
+    sorted({normalized(w) for w in TRANSIT_WORDS}, key=len, reverse=True)
+)
+
+
+def _line_patterns(identifier: str) -> tuple[re.Pattern[str], ...]:
+    value = normalized(identifier).replace(" ", "")
+    code = re.fullmatch(r"([a-z]{1,3})(\d{1,4})", value)
+    if code:
+        return (re.compile(rf"(?<!\w){code[1]} ?{code[2]}(?!\w)"),)
+    escaped = re.escape(value)
+    if value.isalpha() and len(value) >= 3:
+        # A service name of three capitals ("tren AVE") is written alone or
+        # with its train number by the pages ("AVE 03183 ... Madrid Atocha -
+        # Barcelona Sants", staging -116); one or two letters ("ligne B")
+        # need their transit word.
+        return (re.compile(rf"(?<!\w){escaped}(?!\w)"),)
+    forms = [
+        rf"(?<!\w)(?:{_TRANSIT_N})(?: \w+)? {escaped}(?!\w)",
+        rf"(?<!\w){escaped} (?:{_TRANSIT_N})(?!\w)",
+    ]
+    if value.isdigit():
+        forms.append(rf"(?<!\w)[a-z]{{1,3}}{escaped}(?!\w)")
+    return (re.compile("|".join(forms)),)
+
+
+def _clock_pattern(minutes: float) -> re.Pattern[str]:
+    hours, rest = divmod(int(minutes) % 1440, 60)
+    twelve = hours % 12 or 12
+    suffix = "p" if hours >= 12 else "a"
+    return re.compile(
+        rf"(?<!\d)0?{hours} ?(?:h ?)?{rest:02d}(?!\d)"
+        rf"|(?<!\d){twelve}(?: ?{rest:02d})? ?{suffix} ?m(?!\w)"
+    )
+
+
+_DIRECT_N = re.compile(
+    r"(?<!\w)(?:direct\w*|direkt\w*|dirett\w*|nonstop|non stop|sans changement|"
+    r"sans correspondance|0 correspondance|without chang\w*|no change\w*|"
+    r"ohne umsteigen|sin transbordo\w*|sin cambio\w*|senza cambi\w*)"
+)
+_FREQUENCY_N = re.compile(
+    r"(?<!\w)(?:every|toutes les|tous les|alle|cada|ogni) \w+ (?:\w+ )?"
+    r"(?:min\w*|heures?|hours?|stunden?|horas?|ore)(?!\w)"
+    r"|(?<!\w)(?:frequen\w*|frecuen\w*|takt\w*|cadenc\w*)"
+)
+
+
+class Sources:
+    """The turn's texts, normalized once: passages, their words, anchor hits."""
+
+    def __init__(
+        self,
+        passages: Iterable[str],
+        own: Iterable[str],
+        given: Iterable[str] = (),
+    ) -> None:
+        self.passages: list[str] = []
+        # Sentence bounds in each normalized passage (a network page states
+        # each line with its stops in its own sentence or line).
+        self.sentences: list[list[tuple[int, int]]] = []
+        for text in passages:
+            passage = normalized(text)
+            if not passage:
+                continue
+            bounds: list[tuple[int, int]] = []
+            start = 0
+            for mark in _SOURCE_SENTENCE.finditer(text + "\n"):
+                end = len(normalized(text[: mark.start()]))
+                if end > start:
+                    bounds.append((start, end))
+                start = end
+            self.passages.append(passage)
+            self.sentences.append(bounds or [(0, len(passage))])
+        self.words = frozenset(" ".join(self.passages).split())
+        # The starting point the person typed or their device gave: known.
+        self.given = frozenset(normalized(" ".join(given)).split())
+        self.own = frozenset(normalized(" ".join(own)).split()) | self.given
+        self._hits: dict[str, list[list[int]]] = {}
+
+    def hits(self, pattern: re.Pattern[str]) -> list[list[int]]:
+        key = pattern.pattern
+        if key not in self._hits:
+            self._hits[key] = [
+                [m.start() for m in pattern.finditer(p)] for p in self.passages
+            ]
+        return self._hits[key]
+
+    def _positions(self, anchor: Anchor, index: int) -> list[list[int]] | None:
+        """Where the anchor's words are in a passage, None when it is absent.
+
+        A name of three words or more is found without one of its words but
+        the last (staging -106: "Madrid Puerta de Atocha" is written "Madrid
+        Atocha" on a timetable and was listed as not verified).
+        """
+        hits = [self.hits(p)[index] for p in anchor.patterns]
+        missing = [i for i, found in enumerate(hits) if not found]
+        if not missing:
+            return hits
+        if (
+            anchor.kind == "name"
+            and len(hits) >= 3
+            and len(missing) == 1
+            and missing[0] != len(hits) - 1
+        ):
+            return [found for found in hits if found]
+        return None
+
+    def together(self, anchors: list[Anchor]) -> bool:
+        """All anchors within one window of one passage (no anchor: true)."""
+        patterns = [p for a in anchors for p in a.patterns]
+        if not patterns:
+            return True
+        lines = [p for a in anchors if a.kind == "line" for p in a.patterns]
+        lead = (
+            bool(lines)
+            and all(a.kind in {"line", "name"} for a in anchors)
+            and any(a.kind == "name" for a in anchors)
+        )
+        line_hits = [self.hits(p) for p in lines]
+        for index in range(len(self.passages)):
+            located = [self._positions(a, index) for a in anchors]
+            positions = [h for found in located if found is not None for h in found]
+            if any(found is None for found in located):
+                positions = [[]]
+            if all(positions) and self._listing(index):
+                # Staging -122 (Lyon): a network page put metro A, Perrache
+                # and metro B in one window; metro B never reaches Perrache.
+                if self._served(anchors, located, index):
+                    return True
+                continue
+            if all(positions) and _window(positions):
+                return True
+            # A page about the line (it names the line in its opening) lists
+            # its stops anywhere (staging -104: the T8 article named both
+            # airport stations far below its lead).
+            if (
+                lead
+                and all(positions)
+                and all(any(h < LEAD for h in hits[index]) for hits in line_hits)
+            ):
+                return True
+        return False
+
+    def directed(
+        self,
+        direction: Anchor,
+        lines: list[Anchor],
+        stops: list[Anchor],
+        ahead: list[Anchor],
+    ) -> bool:
+        """Whether a page gives this direction for the leg.
+
+        Either a passage gives the name as a direction ("direction X",
+        "Richtung X") within one window of the leg's line and stops, or a
+        sentence naming the line lists its stops in order with the leg's
+        stop to get off between the stop it is boarded at and the direction
+        (staging -126: a page saying line A links its two termini gave no
+        direction for a leg from a stop between them). The stop to get off
+        is the leg's last stop, else the first stop of the next sentences
+        the list names.
+        """
+        words = direction.key.split()
+        if not words:
+            return True
+        name = r"(?: \w+){0,2} ".join(map(re.escape, words))
+        pattern = re.compile(rf"(?<!\w)(?:{_DIRECTION_N})(?: \w+){{0,3}}? {name}(?!\w)")
+        hits = self.hits(pattern)
+        for index, found in enumerate(hits):
+            if not found:
+                continue
+            located = [self._positions(a, index) for a in (*lines, *stops)]
+            if any(item is None for item in located):
+                continue
+            positions = [found, *(h for item in located if item for h in item)]
+            if _window(positions):
+                return True
+        if not lines or not stops:
+            return False
+        board = stops[0]
+        for index, passage in enumerate(self.passages):
+            for left, right in self.sentences[index]:
+                if not any(
+                    p.search(passage, left, right) for a in lines for p in a.patterns
+                ):
+                    continue
+                terminus = self._at(direction, passage, left, right)
+                boarded = self._at(board, passage, left, right)
+                if terminus is None or boarded is None or terminus == boarded:
+                    continue
+                off = [
+                    at
+                    for anchor in (stops[1:] if len(stops) > 1 else ahead)
+                    if (at := self._at(anchor, passage, left, right)) is not None
+                    and at != boarded
+                ]
+                if not off:
+                    continue
+                if len(stops) > 1:
+                    off = off[-1:]
+                stop = off[0]
+                if boarded < stop <= terminus or terminus <= stop < boarded:
+                    return True
+        return False
+
+    def _at(self, anchor: Anchor, passage: str, left: int, right: int) -> int | None:
+        """Where a name is in one sentence of a passage: its first word, all
+        its words in the sentence; None when it is not there."""
+        first: int | None = None
+        for pattern in anchor.patterns:
+            match = pattern.search(passage, left, right)
+            if match is None:
+                return None
+            first = match.start() if first is None else first
+        return first
+
+    def _listing(self, index: int) -> bool:
+        """A passage naming several lines (a network page, a map legend), where
+        words close together prove no line serves a stop."""
+        passage = self.passages[index]
+        lines = set()
+        for match in _LINE_WORD.finditer(passage):
+            named = _LISTED_ID.match(passage, match.end())
+            if named is not None:
+                lines.add((match[1], named[1]))
+        return len(lines) > 1
+
+    def _served(
+        self, anchors: list[Anchor], located: list[list[list[int]] | None], index: int
+    ) -> bool:
+        """In a listing, each stop shares a sentence with a line of the claim
+        and each line with a stop of the claim: a transfer between two lines
+        stays, a line at a stop it never serves does not."""
+        bounds = self.sentences[index]
+        passage = self.passages[index]
+
+        def inside(anchor: Anchor, found: list[list[int]] | None) -> set[int]:
+            if anchor.kind == "line":
+                # Searched in each sentence: "trois lignes. Ligne A" matches
+                # from "lignes", in the sentence before the line's own.
+                return {
+                    number
+                    for number, (left, right) in enumerate(bounds)
+                    if any(p.search(passage[left:right]) for p in anchor.patterns)
+                }
+            if not found:
+                return set()
+            return {
+                number
+                for number, (left, right) in enumerate(bounds)
+                if all(any(left <= hit < right for hit in hits) for hits in found)
+            }
+
+        lines = [inside(a, f) for a, f in zip(anchors, located) if a.kind == "line"]
+        stops = [inside(a, f) for a, f in zip(anchors, located) if a.kind == "name"]
+        if not lines or not stops:
+            positions = [h for found in located if found for h in found]
+            return _window(positions)
+        return all(any(stop & line for line in lines) for stop in stops) and all(
+            any(line & stop for stop in stops) for line in lines
+        )
+
+
+class Sites:
+    """The pages read, grouped by site, to weigh a line number they disagree on.
+
+    Staging -112: "The Airport Link T2 Line connects the airport to Central
+    Station" came from a job-fair directions page; the operator's page and
+    the airport's guide both give the T8 for those stations. A line stated
+    with a route (the line and two of its places together) is kept unless
+    more sites give another line of the same kind next to one of those places
+    than give this one with them; a site naming both lines is no vote (a
+    station page listing every line).
+    """
+
+    def __init__(
+        self,
+        pages: Iterable[tuple[str, str]],
+        own: Iterable[str],
+        given: Iterable[str] = (),
+    ) -> None:
+        grouped: dict[str, list[str]] = {}
+        for url, text in pages:
+            host = re.sub(r"^www\.", "", re.sub(r"^[a-z]+://", "", url.lower())).split(
+                "/"
+            )[0]
+            if host and text.strip():
+                grouped.setdefault(host, []).append(text)
+        self._texts = grouped
+        self._own = list(own)
+        self._given = list(given)
+        self._sources: dict[str, Sources] = {}
+
+    def _of(self, host: str) -> Sources:
+        if host not in self._sources:
+            self._sources[host] = Sources(self._texts[host], self._own, self._given)
+        return self._sources[host]
+
+    def disputed(self, anchors: list[Anchor]) -> bool:
+        if len(self._texts) < 2:
+            return False
+        for part in _segments(anchors):
+            lines = [a for a in part if a.kind == "line"]
+            names = [a for a in part if a.kind == "name"]
+            if len(lines) != 1 or len(names) < 2:
+                continue
+            line = lines[0]
+            code = re.fullmatch(r"([a-z]{1,3})(\d{1,4})", line.key)
+            if not code:
+                continue
+            other = re.compile(rf"(?<!\w){code[1]} ?(\d{{1,4}})(?!\w)")
+            support = 0
+            rivals: dict[str, int] = {}
+            for host in self._texts:
+                sources = self._of(host)
+                if any(found for p in line.patterns for found in sources.hits(p)):
+                    support += sources.together([line, *names])
+                    continue
+                numbers = {
+                    match[1].lstrip("0")
+                    for passage in sources.passages
+                    for match in other.finditer(passage)
+                } - {code[2].lstrip("0")}
+                for number in numbers:
+                    key = f"{code[1]}{number}"
+                    rival = Anchor("line", key, key, _line_patterns(key), line.position)
+                    # One of the route's places with the other line is a
+                    # vote: the operator's page names its own stations.
+                    if any(sources.together([name, rival]) for name in names):
+                        rivals[key] = rivals.get(key, 0) + 1
+            if any(count > support for count in rivals.values()):
+                return True
+        return False
+
+
+def _window(positions: list[list[int]]) -> bool:
+    merged = sorted((pos, i) for i, hits in enumerate(positions) for pos in hits)
+    need = len(positions)
+    counts = [0] * need
+    have = left = 0
+    for pos, index in merged:
+        counts[index] += 1
+        if counts[index] == 1:
+            have += 1
+        while have == need:
+            if pos - merged[left][0] <= WINDOW:
+                return True
+            first = merged[left][1]
+            counts[first] -= 1
+            if counts[first] == 0:
+                have -= 1
+            left += 1
+    return False
+
+
+def sentence_marks(line: str) -> list[re.Match[str]]:
+    """Where sentences end in a line: a full stop, or a semicolon outside
+    parentheses (two clauses: staging -102 lost "the fastest connection takes
+    3:57 hours" with an unsourced "direct" before its semicolon)."""
+    marks: list[re.Match[str]] = []
+    for match in re.finditer(r"[.!?;](?=\s|$)", line):
+        if match[0] == ";" and line.count("(", 0, match.start()) > line.count(
+            ")", 0, match.start()
+        ):
+            continue
+        marks.append(match)
+    return marks
+
+
+# The line under a table's header row ("|---|:---:|").
+_TABLE_RULE = re.compile(
+    r"[ \t]*+\|?(?:[ \t]*+:?-++:?[ \t]*+\|)++[ \t]*+(?::?-++:?)?+[ \t]*+"
+)
+
+
+def table_header(text: str, index: int) -> bool:
+    """True when ``index`` is in a table's header row: the row of labels
+    above its rule line. Labels are never claims (staging -115: "Depart
+    Tokyo" and "Arrive Kyoto" were left out as an unsourced route and the
+    header read "Train | — | — | Duration")."""
+    start = text.rfind("\n", 0, index) + 1
+    end = text.find("\n", index)
+    if end < 0 or not text[start:end].lstrip().startswith("|"):
+        return False
+    following = text.find("\n", end + 1)
+    rule = text[end + 1 : len(text) if following < 0 else following]
+    return bool(_TABLE_RULE.fullmatch(rule))
+
+
+def _units(body: str) -> list[Unit]:
+    """Sentences (split as the travel check splits them) and table rows; a
+    table's header row states nothing and is no unit."""
+    units: list[Unit] = []
+    offset = 0
+    for line in body.split("\n"):
+        if line.lstrip().startswith("|"):
+            if not table_header(body, offset):
+                units.append(Unit(offset, offset + len(line), row=True))
+        else:
+            start = 0
+            for match in sentence_marks(line):
+                text = line[start : match.start()]
+                if text.strip():
+                    lead = len(text) - len(text.lstrip())
+                    units.append(Unit(offset + start + lead, offset + match.start()))
+                start = match.end()
+            text = line[start:]
+            if text.strip():
+                lead = len(text) - len(text.lstrip())
+                units.append(Unit(offset + start + lead, offset + len(line)))
+        offset += len(line) + 1
+    return units
+
+
+def _names(plain: str, folded: str, start: int, end: int) -> list[Anchor]:
+    """Place names in route positions, multi-word or hyphenated names."""
+    tokens = list(_TOKEN.finditer(plain, start, end))
+    found: list[Anchor] = []
+    index = 0
+    while index < len(tokens):
+        first = tokens[index]
+        # A capital opening the sentence ("Nehmen", "Take") or a capitalised
+        # pronoun or article ("Sie", "The") starts no name.
+        opening = not _MARKERS.sub("", plain[start : first.start()])
+        if (
+            not first[0][0].isupper()
+            or normalized(first[0]) in _GENERIC
+            or (opening and not _shaped(first[0]) and _breaks(tokens, index, plain))
+        ):
+            index += 1
+            continue
+        last = index
+        following = index + 1
+        while following < len(tokens):
+            gap = plain[tokens[following - 1].end() : tokens[following].start()]
+            word = tokens[following][0]
+            if gap in {" ", " "} and word[0].isupper():
+                if normalized(word) in _GENERIC:
+                    break
+                last = following
+                following += 1
+                continue
+            connector = normalized(word) in CONNECTORS | {"sur", "sous", "am", "im"}
+            if (
+                gap in {" ", " "}
+                and connector
+                and following + 1 < len(tokens)
+                and plain[tokens[following].end() : tokens[following + 1].start()]
+                in {" ", " ", "'", "’"}
+                and tokens[following + 1][0][0].isupper()
+            ):
+                last = following + 1
+                following += 2
+                continue
+            break
+        sequence = tokens[index : last + 1]
+        index = following
+        text = plain[first.start() : tokens[last].end()]
+        # Acronyms name operators and agencies more often than places.
+        words = [
+            w
+            for token in sequence
+            if not (len(token[0]) > 1 and token[0].isupper())
+            for w in normalized(token[0]).split()
+            if w not in _GENERIC and len(w) > 1
+        ]
+        distinct = [w for w in words if w not in STATION_WORDS]
+        if not distinct or all(w in PLACE_WORDS for w in distinct):
+            continue
+        before = plain[start : first.start()]
+        initial = not _MARKERS.sub("", before)
+        shaped = any(_shaped(token[0]) for token in sequence)
+        multi = len(distinct) >= 2
+        preceding = folded[max(start, first.start() - 30) : first.start()]
+        slot = bool(_SLOT.search(preceding.replace("'", " ").replace("’", " ")))
+        if initial and not (multi or shaped):
+            continue
+        if not (multi or shaped or slot):
+            continue
+        found.append(
+            Anchor(
+                "name",
+                " ".join(distinct),
+                " ".join(text.split()),
+                tuple(_word(w) for w in distinct),
+                first.start(),
+            )
+        )
+    return found
+
+
+def _shaped(word: str) -> bool:
+    """A hyphenated name or an inner capital ("Part-Dieu", "McAllister").
+
+    A hyphenated word whose last part is lower case is a locution, not a name
+    (staging -112: a French locution for "beyond" opening a sentence was
+    listed as an unverified stop).
+    """
+    if word.isupper():
+        return False
+    if "-" in word or "‐" in word:
+        last = re.split(r"[-‐]", word)[-1]
+        return bool(last[:1].isupper())
+    return any(c.isupper() for c in word[1:])
+
+
+def _breaks(tokens: list[re.Match[str]], index: int, plain: str) -> bool:
+    """The opening capital is an ordinary word: no capitalised word follows it
+    in the same name ("Prenez un"), or a pronoun does ("Nehmen Sie")."""
+    if index + 1 >= len(tokens):
+        return True
+    gap = plain[tokens[index].end() : tokens[index + 1].start()]
+    following = tokens[index + 1][0]
+    return (
+        gap not in {" ", " "}
+        or not following[0].isupper()
+        or normalized(following) in _GENERIC
+    )
+
+
+# A line's direction in an answer, read before its name (folded, apostrophes
+# as spaces): "en direction de", "towards", "in Richtung", "en direccion a",
+# "in direzione di", "sentido". Staging -126: "line A direction Vaulx-en-Velin
+# La Soie" from a stop where the leg runs the other way was kept because a
+# page about line A named both termini.
+_DIRECTION_BEFORE = re.compile(
+    r"(?:(?<![\w-])(?:en|in|im|nella)[ \t]++)?+"
+    r"(?<![\w-])(?:direction|directions|towards?+|richtung|direccion|direzione|"
+    r"sentido|bound for)(?:[ \t]*+:)?+"
+    r"(?:[ \t]++(?:de|du|des|d|of|von|del|della|di|to|a|per))?+"
+    r"(?:[ \t]++(?:la|le|les|l|the|der|die|das|den|dem|el|los|las|il|lo|gli))?+"
+    r"[ \t*_]*+$"
+)
+# The same words in a normalized source passage ("vers", "nach" and "hacia"
+# too: a page saying "U3 nach Moosach" gives a direction).
+_DIRECTION_N = (
+    "direction|directions|towards|toward|richtung|direccion|direzione|sentido|"
+    "bound for|vers|hacia|verso|nach"
+)
+# The rest of a direction's name after its anchor ("Vaulx-en-Velin La Soie").
+_NAME_REST = re.compile(
+    r"(?:[ \u00a0]++(?:(?:de|du|des|del|di|da|la|le|les|am|im|an|sur|sous)"
+    r"[ \u00a0]++)?+[A-Z\u00c0-\u00de][\w'\u2019-]*+)*+[*_]*+"
+)
+
+
+def _directions(
+    plain: str, folded: str, start: int, names: list[Anchor]
+) -> list[tuple[Anchor, int, int]]:
+    """The names of a sentence given as a line's direction, with their phrase."""
+    found: list[tuple[Anchor, int, int]] = []
+    for name in names:
+        left = max(start, name.position - 40)
+        before = folded[left : name.position].replace("'", " ").replace("\u2019", " ")
+        match = _DIRECTION_BEFORE.search(before)
+        if match is None:
+            continue
+        end = name.position + len(name.text)
+        rest = _NAME_REST.match(plain, end)
+        found.append((name, left + match.start(), rest.end() if rest else end))
+    return found
+
+
+def _lines(plain: str, folded: str, start: int, end: int) -> list[Anchor]:
+    found: dict[str, Anchor] = {}
+    for match in _LINE_WORD.finditer(folded, start, end):
+        identifier = _LINE_ID.match(plain, match.end(), end)
+        # "train TER": a transit word after another is no line identifier.
+        if identifier is None or fold(identifier[1]) in TRANSIT_WORDS:
+            continue
+        key = normalized(identifier[1]).replace(" ", "")
+        text = plain[match.start() : identifier.end()]
+        found.setdefault(
+            key, Anchor("line", key, text, _line_patterns(key), match.start())
+        )
+    for match in _CODE.finditer(plain, start, end):
+        key = (match[1] + match[2]).lower()
+        if key not in found:
+            found[key] = Anchor(
+                "line", key, match[0], _line_patterns(key), match.start()
+            )
+    return list(found.values())
+
+
+def _read(
+    unit: Unit,
+    plain: str,
+    folded: str,
+    clocks: list[tuple[int, int, float]],
+    sources: Sources,
+    owned_clocks: list[float],
+) -> None:
+    """The unit's anchors, and whether it states a route."""
+    start, end = unit.start, unit.end
+    text = folded[start:end]
+    lines = _lines(plain, folded, start, end)
+    names = _names(plain, folded, start, end)
+    names = [
+        name
+        for name in names
+        # The starting point the person or their device gave is known (staging
+        # -102: "Gratte-Ciel" and the person's street were listed as not
+        # verified). Another name of the person's own that no source writes (a
+        # place in another language) is theirs; written by a source, it must
+        # sit with the rest of the claim.
+        if not (
+            all(w in sources.given for w in name.key.split())
+            or (
+                all(w in sources.own for w in name.key.split())
+                and not any(w in sources.words for w in name.key.split())
+            )
+        )
+    ]
+    route_words = bool(_ROUTE.search(text))
+    transit = bool(_TRANSIT.search(text))
+    # "en ligne", "online": a line word alone is no vehicle for "directement".
+    vehicle = bool(_TRANSIT.search(_LINE_WORDS.sub(" ", text)))
+    anchors: list[Anchor] = [*lines, *names]
+    direct = _DIRECT.search(text) or (vehicle and _DIRECT_ADVERB.search(text))
+    if direct:
+        anchors.append(
+            Anchor(
+                "direct",
+                "direct",
+                plain[start + direct.start() : start + direct.end()],
+                (_DIRECT_N,),
+                start + direct.start(),
+            )
+        )
+    frequency = _FREQUENCY.search(text)
+    if frequency:
+        anchors.append(
+            Anchor(
+                "frequency",
+                "frequency",
+                plain[start + frequency.start() : start + frequency.end()],
+                (_FREQUENCY_N,),
+                start + frequency.start(),
+            )
+        )
+    timed = [
+        (clock_start, clock_end, value)
+        for clock_start, clock_end, value in clocks
+        if start <= clock_start < end
+        and not any(abs(value - own) < 0.5 for own in owned_clocks)
+    ]
+    # "arrives at Geneva Airport around 8:43" (staging -100): a place reached
+    # at a time is a route fact, verb or no verb.
+    unit.route = bool(
+        lines or direct or frequency or (names and (route_words or timed))
+    )
+    unit.flavour = transit or bool(frequency)
+    unit.disclaimer = bool(_DISCLAIMER.search(text))
+    # A sentence naming what is missing, with no line, time or service of its
+    # own, states no route.
+    unit.gap = gap(text) and not (lines or direct or frequency or timed)
+    if unit.gap:
+        unit.route = False
+    unit.anchors = anchors
+    if lines:
+        unit.directions = _directions(plain, folded, start, names)
+    if not unit.route:
+        return
+    for clock_start, clock_end, value in timed:
+        anchors.append(
+            Anchor(
+                "clock",
+                f"clock:{value:g}",
+                plain[clock_start:clock_end],
+                (_clock_pattern(value),),
+                clock_start,
+            )
+        )
+    if unit.row:
+        cells: list[tuple[int, list[Anchor]]] = []
+        cell_start = start
+        for match in re.finditer(r"\|", plain[start:end]):
+            cell_end = start + match.start()
+            inside = [a for a in anchors if _in(plain, a, cell_start, cell_end)]
+            if inside and a_route(inside):
+                cells.append((cell_start, inside))
+            cell_start = start + match.end()
+        unit.cells = cells
+        return
+    for match in re.finditer(r"\(([^()]*)\)", plain[start:end]):
+        inner_start, inner_end = start + match.start(1), start + match.end(1)
+        inside = [a for a in anchors if _in(plain, a, inner_start, inner_end)]
+        if inside:
+            unit.parentheses.append((inner_start, inner_end, inside))
+
+
+def a_route(anchors: list[Anchor]) -> bool:
+    """Anchors that state a route, not only a time (times are the values check's)."""
+    return any(a.kind != "clock" for a in anchors)
+
+
+def _in(plain: str, anchor: Anchor, start: int, end: int) -> bool:
+    return bool(anchor.text) and anchor.text in " ".join(plain[start:end].split())
+
+
+def _segments(anchors: list[Anchor]) -> list[list[Anchor]]:
+    """One part per line of a transfer, the transfer stop in both.
+
+    "Line A to Charpennes, then line B to Part-Dieu": line A's page lists
+    Charpennes, line B's page lists Charpennes and Part-Dieu; no page needs to
+    hold both lines. A stop line B does not serve still fails its part.
+    """
+    ordered = sorted(anchors, key=lambda a: a.position)
+    lines = [i for i, a in enumerate(ordered) if a.kind == "line"]
+    if len(lines) < 2:
+        return [ordered]
+    cuts = [0, *lines[1:], len(ordered)]
+    parts = [ordered[a:b] for a, b in zip(cuts, cuts[1:], strict=False) if a < b]
+    for previous, part in zip(parts, parts[1:], strict=False):
+        line = next((a for a in previous if a.kind == "line"), None)
+        stops = [
+            a
+            for a in previous
+            if a.kind == "name" and (line is None or a.position > line.position)
+        ] or [a for a in previous if a.kind == "name"]
+        if stops:
+            part.append(stops[-1])
+    return parts
+
+
+# Counts a summary gives of the plan's options ("Two FlixBus coaches", "Les
+# deux TGV", "Drei ICE"), five languages: opening a sentence, the count is
+# read into the name that follows it.
+COUNTS = {
+    **dict.fromkeys(("one", "un", "une", "ein", "eine", "uno", "una"), 1),
+    **dict.fromkeys(
+        ("two", "both", "deux", "zwei", "beide", "dos", "ambos", "ambas", "due"),
+        2,
+    ),
+    **dict.fromkeys(("three", "trois", "drei", "tres", "tre"), 3),
+    **dict.fromkeys(("four", "quatre", "vier", "cuatro", "quattro"), 4),
+    **dict.fromkeys(("five", "cinq", "funf", "cinco", "cinque"), 5),
+}
+# An option heading of the rendered plan: a bold line with a clock time.
+_OPTION_HEADING = re.compile(r"^\*\*[^\n]*\d{1,2}:\d{2}", re.M)
+
+
+class Planned:
+    """The words of the turn's computed plan: what a summary of it may say."""
+
+    def __init__(self, plan: str, sources: Sources) -> None:
+        text = normalized(plan)
+        self.words = frozenset(text.split())
+        self.direct = bool(_DIRECT_N.search(text))
+        self.sources = sources
+        # The words of each option (its heading and legs), in order.
+        starts = [m.start() for m in _OPTION_HEADING.finditer(plan)]
+        ends = [*starts[1:], len(plan)] if starts else []
+        self.options = [
+            frozenset(normalized(plan[a:b]).split())
+            for a, b in zip(starts, ends, strict=True)
+        ]
+
+    def counted(self, words: list[str]) -> bool:
+        """A count of options with the other words of its name ("two flixbus"):
+        at most as many options of the plan hold those words."""
+        counts = [COUNTS[w] for w in words if w in COUNTS]
+        rest = [w for w in words if w not in COUNTS]
+        if len(counts) != 1 or not rest:
+            return False
+        named = [w for w in rest if w in self.words]
+        holding = [option for option in self.options if all(w in option for w in named)]
+        return 1 <= counts[0] <= len(holding)
+
+    def summarizes(self, anchors: list[Anchor]) -> bool:
+        """Every line, place and "direct" of a sentence is the plan's, a line
+        or place being written with the plan's words or the person's (the
+        person asked "by shinkansen", the plan names "Nozomi 11"), one word at
+        least the plan's; a time the plan does not give or a frequency (the
+        plan gives none) is no summary of it. A count read into a name ("Two
+        FlixBus coach options also get you there earlier", staging -134) is
+        the plan's when as many of its options hold the rest of the name."""
+        if not self.words or not anchors:
+            return False
+        from_plan = False
+        for anchor in anchors:
+            if anchor.kind == "direct":
+                if not self.direct:
+                    return False
+                from_plan = True
+                continue
+            if anchor.kind not in {"line", "name"}:
+                return False
+            words = anchor.key.split()
+            if not words or not (
+                all(w in self.words or w in self.sources.own for w in words)
+                or (
+                    self.counted(words)
+                    and all(
+                        w in self.words or w in self.sources.own or w in COUNTS
+                        for w in words
+                    )
+                )
+            ):
+                return False
+            from_plan = from_plan or any(w in self.words for w in words)
+        return from_plan
+
+
+def _failing(sources: Sources, anchors: list[Anchor]) -> list[list[Anchor]]:
+    return [part for part in _segments(anchors) if not sources.together(part)]
+
+
+def _mine(anchor: Anchor, sources: Sources) -> bool:
+    """A name the person gave (the question, the conversation, the device)."""
+    return anchor.kind == "name" and all(w in sources.own for w in anchor.key.split())
+
+
+def _asked(anchor: Anchor, sources: Sources) -> bool:
+    """A place of the request: the person's own name, or a name the pages
+    write that holds a word of theirs ("Paris Gare de Lyon" for "Gare de
+    Lyon", staging -114)."""
+    if _mine(anchor, sources):
+        return True
+    return (
+        anchor.kind == "name"
+        and any(w in sources.own for w in anchor.key.split())
+        and sources.together([anchor])
+    )
+
+
+_QUOTED_CHARACTERS = 90
+
+
+def quoted(text: str) -> str:
+    """A removed claim as the note quotes it: plain words, cut at a word."""
+    plain = re.sub(r"\[([^\]\n]*+)\]\([^)\s]*+\)", r"\1", text)
+    plain = " ".join(re.sub(r"[*_`#>|]+", " ", plain).split()).strip(" -–,;:")
+    if len(plain) > _QUOTED_CHARACTERS:
+        plain = plain[:_QUOTED_CHARACTERS].rsplit(" ", 1)[0].rstrip(" ,;:") + "…"
+    return f"“{plain}”" if plain else ""
+
+
+def _claim(
+    body: str,
+    start: int,
+    end: int,
+    part: list[Anchor],
+    opening: list[Anchor] | None = None,
+) -> str:
+    """The words of a sentence that state a failing part: from the clause
+    before its first anchor (of ``opening`` when given) to the end of the
+    clause of its last anchor, never a claim cut mid-phrase (staging -132
+    quoted "The Airport Link is an underground rail line that provides
+    direct")."""
+    placed = [a for a in part if a.position >= 0 and a.text]
+    if not placed:
+        return body[start:end]
+    leading = [a for a in opening or placed if a.position >= 0 and a.text]
+    first = min(a.position for a in leading or placed)
+    last = max(max(a.position + len(a.text) for a in placed), first)
+    marks = [m.end() for m in re.finditer(r"[,;:(]\s*", body[start:first])]
+    close = _CLAUSE_CLOSE.search(body, last, max(end, last))
+    return body[start + (marks[-1] if marks else 0) : close.start() if close else end]
+
+
+# The end of a clause: a mark followed by a space or the end, or a new line.
+_CLAUSE_CLOSE = re.compile(r"[,;:.!?](?=\s|$)|\n")
+
+
+def _labels(
+    anchors: list[Anchor],
+    sources: Sources,
+    body: str = "",
+    span: tuple[int, int] = (0, 0),
+) -> list[str]:
+    """What the note lists: the claims of the parts no passage holds, quoted
+    from the sentence when it is known.
+
+    Without the sentence, a name no page writes is listed; a name the person gave never is (staging
+    -102 listed the person's own stop as not verified). When every name is
+    known on its own, what is not verified is the connection the sentence
+    states: the note quotes it (staging -109 listed "Barcelona Sants – Madrid
+    Puerta de Atocha – Almudena Grandes – Cercanías", stations the pages do
+    name, as if they were the unverified claim). Without the sentence, its
+    names then its times are joined.
+    """
+    failing = _failing(sources, anchors) or [anchors]
+    if body and span[1] > span[0]:
+        # The note quotes claims, never a lone word cut from one (staging
+        # -112 listed a locution after a quoted claim).
+        part = [a for p in failing for a in p]
+        # The claim starts at what is not the person's own: a sentence that
+        # restates the request before an unverified leg is quoted from the
+        # leg (staging -113 quoted "To be at Geneva Airport ... from").
+        theirs = [a for a in part if not _asked(a, sources)] or part
+        if claim := quoted(_claim(body, span[0], span[1], part, theirs)):
+            return [claim]
+    stated = [a for part in failing for a in part if a.kind != "clock"]
+    alone = [
+        a.text for a in stated if not _mine(a, sources) and not sources.together([a])
+    ]
+    if alone:
+        return alone
+    joined = [a for part in failing for a in sorted(part, key=lambda a: a.position)]
+    names = list(dict.fromkeys(a.text for a in joined if a.kind != "clock"))
+    times = list(dict.fromkeys(a.text for a in joined if a.kind == "clock"))
+    if not names:
+        return times
+    return [" – ".join(names) + (f" ({', '.join(times)})" if times else "")]
+
+
+def _restated(body: str, unit: Unit, sources: Sources) -> list[tuple[int, str, bool]]:
+    """The opening clauses of a sentence that only restate the request.
+
+    "Afin d'arriver à l'aéroport de Genève jeudi à 9h00 depuis le Gratte-Ciel,
+    prenez ..." (staging -113): the clauses before a comma hold only the
+    person's places, day and time; when the rest of the sentence goes, they
+    still open the answer, which never starts mid-thought. None when the
+    clauses state anything else (a line, a time no one gave, "direct"); the
+    longest first, each with the end of its clauses in ``body`` and whether
+    the rest states a route.
+    """
+    text = body[unit.start : unit.end]
+    depth = 0
+    commas: list[int] = []
+    for index, character in enumerate(text):
+        depth += character == "("
+        depth -= character == ")"
+        if character == "," and depth == 0:
+            commas.append(index)
+    found: list[tuple[int, str, bool]] = []
+    for comma in reversed(commas):
+        prefix = text[:comma]
+        inside = [
+            a for a in unit.anchors if unit.start <= a.position < unit.start + comma
+        ]
+        rest = [a for a in unit.anchors if a.position >= unit.start + comma]
+        if (
+            len(prefix.split()) >= 3
+            and len(text[comma:].split()) >= 2
+            and (inside or re.search(r"\d", prefix))
+            and all(_asked(a, sources) for a in inside)
+            and not re.search(r"[\[\]()*`|]", prefix)
+        ):
+            found.append((unit.start + comma, " ".join(prefix.split()), a_route(rest)))
+    return found
+
+
+# Verbs of being, five languages, folded: a "direct" after one is what its
+# sentence states ("suelen ser directos"), never a qualifier that goes alone.
+_COPULA = frozenset(
+    (
+        "is are was were be been being est sont etait etaient etre ist sind war "
+        "waren sein es son era eran ser sera seran sono erano essere"
+    ).split()
+)
+
+
+def _qualifier(body: str, unit: Unit, anchor: Anchor) -> tuple[int, int] | None:
+    """The span of a "direct" that only qualifies its sentence ("which runs
+    directly to the airport", "un tren directo a Sants"), with one space;
+    None for a predicate ("son directos") or a word closing its clause."""
+    start = anchor.position
+    end = start + len(anchor.text)
+    if anchor.kind != "direct" or start < unit.start or end >= unit.end:
+        return None
+    following = re.match(r"\s++([^\W\d_]++)", body[end : unit.end])
+    if following is None:
+        return None
+    before = re.findall(r"[^\W\d_]++", fold(body[unit.start : start]))
+    previous = before[-1] if before else ""
+    if previous in _COPULA:
+        return None
+    if previous == "a" and fold(following[1][:1]) in "aeiou":
+        # "a direct AVE" would leave "a AVE".
+        return None
+    if start > unit.start and body[start - 1] == " ":
+        return start - 1, end
+    return start, end + len(following[0]) - len(following[0].lstrip())
+
+
+def _closings(body: str, unit: Unit) -> list[int]:
+    """The commas that open the closing clauses of a sentence, last first:
+    outside parentheses and links, followed by a space, after a first clause
+    of three words or more."""
+    commas: list[int] = []
+    depth = 0
+    for index in range(unit.start, unit.end):
+        character = body[index]
+        if character in "([":
+            depth += 1
+        elif character in ")]":
+            depth = max(0, depth - 1)
+        elif (
+            character == ","
+            and depth == 0
+            and body[index + 1 : index + 2].isspace()
+            and len(body[unit.start : index].split()) >= 3
+        ):
+            commas.append(index)
+    return commas[::-1]
+
+
+def _cuts(
+    body: str, unit: Unit, sources: Sources, sites: Sites
+) -> list[tuple[int, int]]:
+    """The fewest parts of a failing sentence whose removal leaves a route the
+    pages support: its "direct", a run of closing clauses, or both.
+
+    Staging -116: "Take the T8 Airport & South Line train, which runs
+    directly to Sydney Airport, stopping ..." went whole although the page
+    read named the T8 with Sydney Airport: no page wrote "direct" next to
+    them. Only such a part goes now; a sentence whose kept part would state
+    nothing but the request, or nothing a page holds, still goes whole.
+    """
+    if unit.row:
+        return []
+    words = [
+        span
+        for anchor in unit.anchors
+        if (span := _qualifier(body, unit, anchor)) is not None
+    ][:2]
+    # A closing clause naming a line is another leg (a transfer): never a
+    # detail, its sentence goes whole (a first leg alone misleads).
+    clauses = [
+        (comma, unit.end)
+        for comma in _closings(body, unit)
+        if not any(a.kind == "line" and a.position >= comma for a in unit.anchors)
+    ][:4]
+    options: list[list[tuple[int, int]]] = [[word] for word in words]
+    options += [[clause] for clause in clauses]
+    options += [
+        [word, clause]
+        for clause in clauses
+        for word in words
+        if not clause[0] <= word[0] < clause[1]
+    ]
+    # The least text removed first: "directly" and the last clause before
+    # every clause after the line.
+    options.sort(key=lambda option: sum(end - start for start, end in option))
+    for option in options:
+        kept = [
+            a
+            for a in unit.anchors
+            if not any(start <= a.position < end for start, end in option)
+        ]
+        if not any(a.kind != "clock" and not _asked(a, sources) for a in kept):
+            continue
+        if _failing(sources, kept) or sites.disputed(kept):
+            continue
+        return sorted(option)
+    return []
+
+
+def _directed(
+    sources: Sources, unit: Unit, direction: Anchor, ahead: list[Anchor]
+) -> bool:
+    """Whether a page gives this direction for the leg (``Sources.directed``):
+    the leg is the part of the sentence on the direction's line."""
+    named = {anchor for anchor, _, _ in unit.directions}
+    part = next((p for p in _segments(unit.anchors) if direction in p), unit.anchors)
+    lines = [a for a in part if a.kind == "line"]
+    if not lines:
+        return True
+    stops = sorted(
+        (a for a in part if a.kind == "name" and a not in named),
+        key=lambda a: a.position,
+    )
+    return sources.directed(direction, lines, stops, ahead)
+
+
+def _ahead(units: list[Unit], unit: Unit, plain: str, folded: str) -> list[Anchor]:
+    """The place names of the two sentences after ``unit``, in order: where
+    a leg with no stop to get off goes next."""
+    index = units.index(unit)
+    return [
+        name
+        for following in units[index + 1 : index + 3]
+        for name in _names(plain, folded, following.start, following.end)
+    ]
+
+
+def _phrase(body: str, left: int, right: int) -> tuple[int, int]:
+    """A direction phrase as it is cut: with its parentheses, its commas or
+    the space before it, so the sentence still reads."""
+    if body[left - 1 : left] == "(" and body[right : right + 1] == ")":
+        left, right = left - 1, right + 1
+        return (left - 1 if body[left - 1 : left] == " " else left), right
+    before = body[:left].rstrip(" ")
+    if before.endswith(",") and body[right:].lstrip(" ").startswith(
+        (",", ".", ";", ")")
+    ):
+        return len(before) - 1, right
+    return (left - 1 if body[left - 1 : left] == " " else left), right
+
+
+# A sentence that only says whether a route fact holds is not known is no
+# claim of one (unlike _DISCLAIMER: a claim said to be unsourced): cut as an
+# unsourced route, it was then quoted back in the note as left out. Five
+# languages, folded.
+_UNKNOWN_ONLY = re.compile(
+    r"(?<![\w-])(?:no verified information|"
+    r"(?:could not|cannot) be (?:verified|confirmed) whether|"
+    r"it is not known whether|"
+    r"aucune information verifiee|on ne sait pas si|"
+    r"keine (?:bestatigten|verifizierten|gesicherten) (?:informationen|angaben)|"
+    r"no hay informacion verificada|no (?:se ha podido|se pudo) (?:verificar|confirmar) si|"
+    r"nessuna informazione verificata|non e stato possibile (?:verificare|confermare) se)"
+    r"(?![\w-])"
+)
+
+
+def review(
+    body: str,
+    plain: str,
+    clocks: list[tuple[int, int, float]],
+    passages: Iterable[str],
+    own: Iterable[str],
+    computed: Iterable[str],
+    owned_clocks: list[float],
+    given: Iterable[str] = (),
+    pages: Iterable[tuple[str, str]] = (),
+    plan: str = "",
+) -> Finding:
+    """The route units no source of the turn supports, and what follows them.
+
+    ``plain`` is ``body`` with code and link targets blanked (same offsets);
+    ``clocks`` are the clock times read in ``body`` (start, end, minutes);
+    ``pages`` are the texts read with their address (``Sites``); ``plan`` is
+    the journey plan code computed for the turn (never a doubtful one).
+    """
+    sources = Sources(passages, own, given)
+    planned = Planned(plan, sources)
+    sites = Sites(pages, own, given)
+    folded = fold(plain)
+    computed_text = "\n".join(computed)
+    finding = Finding()
+    units = _units(body)
+    removed: list[bool] = []
+    # Direction phrases no page gives for the leg: cut from sentences that
+    # otherwise stay (index of the unit, spans).
+    directions: dict[int, list[tuple[int, int]]] = {}
+    for unit in units:
+        line_start = body.rfind("\n", 0, unit.start) + 1
+        line_end = body.find("\n", unit.start)
+        line = body[line_start : len(body) if line_end < 0 else line_end].strip()
+        if len(line) > 10 and line in computed_text:
+            # The journey plan code wrote it (journey.py).
+            unit.computed = True
+            removed.append(False)
+            continue
+        _read(unit, plain, folded, clocks, sources, owned_clocks)
+        if _UNKNOWN_ONLY.search(folded[unit.start : unit.end]):
+            # It claims nothing: it says what is not known.
+            removed.append(False)
+            continue
+        if unit.route and not unit.row and planned.summarizes(unit.anchors):
+            # The model's summary of the computed plan (staging -132: "three
+            # direct Nozomi Shinkansen options get you to Kyoto Station").
+            unit.computed = True
+            removed.append(False)
+            continue
+        if unit.start == len(body) - len(body.lstrip()) and not unit.row:
+            finding.lead_start = unit.start
+            finding.leads = _restated(body, unit, sources)
+        undirected = (
+            [
+                d
+                for d in unit.directions
+                if not _directed(
+                    sources, unit, d[0], _ahead(units, unit, plain, folded)
+                )
+            ]
+            if unit.route
+            else []
+        )
+        if undirected and not unit.row:
+            cut = [anchor for anchor, _, _ in undirected]
+            unit.anchors = [a for a in unit.anchors if a not in cut]
+            unit.parentheses = [
+                (left, right, [a for a in inside if a not in cut])
+                for left, right, inside in unit.parentheses
+            ]
+            directions[len(removed)] = [
+                _phrase(body, left, right) for _, left, right in undirected
+            ]
+        if not unit.route or not a_route(unit.anchors):
+            removed.append(False)
+            continue
+        if not _failing(sources, unit.anchors) and not (unit.row and undirected):
+            if unit.row or not sites.disputed(unit.anchors):
+                removed.append(False)
+                continue
+            finding.disputed += 1
+            finding.spans.append(
+                (
+                    unit.start,
+                    unit.end,
+                    [quoted(body[unit.start : unit.end])],
+                )
+            )
+            removed.append(True)
+            continue
+        if unit.row:
+            labels = _labels(unit.anchors, sources, body, (unit.start, unit.end))
+            for cell_start, _ in unit.cells:
+                finding.spans.append((cell_start, cell_start + 1, labels))
+                labels = []
+            removed.append(False)
+            continue
+        outside = [
+            a
+            for a in unit.anchors
+            if not any(a in inside for _, _, inside in unit.parentheses)
+        ]
+        alone = [
+            (inner_start, inner_end, inside)
+            for inner_start, inner_end, inside in unit.parentheses
+            if a_route(inside) and _failing(sources, outside + inside)
+        ]
+        if alone and (not a_route(outside) or not _failing(sources, outside)):
+            # The rest of the sentence holds: only its unsourced parentheses go.
+            for inner_start, inner_end, inside in alone:
+                finding.spans.append(
+                    (
+                        inner_start,
+                        inner_end,
+                        _labels(inside, sources, body, (inner_start, inner_end)),
+                    )
+                )
+            removed.append(False)
+            continue
+        cuts = _cuts(body, unit, sources, sites)
+        if cuts:
+            # The rest of the sentence holds: only the parts no page gives go.
+            for cut_start, cut_end in cuts:
+                label = quoted(body[cut_start:cut_end])
+                finding.spans.append((cut_start, cut_end, [label] if label else []))
+                finding.exact.add((cut_start, cut_end))
+            removed.append(False)
+            continue
+        finding.spans.append(
+            (
+                unit.start,
+                unit.end,
+                _labels(unit.anchors, sources, body, (unit.start, unit.end)),
+            )
+        )
+        if unit.start == finding.lead_start:
+            finding.opening = next(
+                (text for _, text, route in finding.leads if route), ""
+            )
+        removed.append(True)
+    for index, spans in directions.items():
+        if removed[index]:
+            continue
+        for left, right in spans:
+            label = quoted(body[left:right])
+            finding.spans.append((left, right, [label] if label else []))
+            finding.exact.add((left, right))
+    if not finding.spans:
+        return finding
+    # A sentence that only continues a removed one ("Trains run every few
+    # minutes.", "This leg is from general knowledge.") goes with it, and a
+    # sentence saying its content is unsourced is replaced by the note.
+    previous_removed = False
+    for unit, gone in zip(units, removed, strict=True):
+        # A heading, markdown or bold-only ("**2. Train**"), heads what
+        # follows; it never continues the sentence before it.
+        line_start = body.rfind("\n", 0, unit.start) + 1
+        line_end = body.find("\n", unit.start)
+        line = body[line_start : len(body) if line_end < 0 else line_end].strip()
+        heading = line.startswith("#") or bool(
+            re.fullmatch(r"(\*\*|__)[^*_]+(\*\*|__)\s*:?", line)
+        )
+        if gone:
+            previous_removed = True
+            continue
+        if unit.computed or unit.row:
+            previous_removed = False
+            continue
+        if not body[unit.start : unit.end].strip(" \n*_-.0123456789)"):
+            continue
+        # Its own lines, places or times: a sentence of its own, not a
+        # continuation (staging -102: sourced ICE times went with a removed
+        # "direct" before them).
+        own_facts = any(a.kind in {"line", "name"} for a in unit.anchors) or any(
+            unit.start <= start < unit.end for start, _, _ in clocks
+        )
+        if unit.disclaimer or (
+            previous_removed
+            and not heading
+            and unit.flavour
+            and not own_facts
+            and not unit.gap
+        ):
+            finding.spans.append((unit.start, unit.end, []))
+            previous_removed = True
+            continue
+        previous_removed = False
+    return finding
+
+
+def mentions(body: str, plain: str) -> list[str]:
+    """Line identifiers and place names of the route sentences of ``body``.
+
+    The unsourced details review leaves them to the travel check, so a route
+    fact is checked (and left out) once.
+    """
+    sources = Sources([], [])
+    folded = fold(plain)
+    texts: list[str] = []
+    for unit in _units(body):
+        _read(unit, plain, folded, [], sources, [])
+        if unit.route:
+            texts += [a.text for a in unit.anchors if a.kind in {"line", "name"}]
+    return texts

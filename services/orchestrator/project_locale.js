@@ -1,0 +1,609 @@
+/* REQ-PROJ-08: UI locale only; content and server diagnostics retain their language. */
+(() => {
+  'use strict';
+  const keys = 'projects organization project conversations newProject newSession name create cancel close ordinary chat work send stop message upload server environment context results ledger local onServer model produced instructions memory files coverage connectors imagePolicy approvals accept deny expires download preview jobs scheduled unavailable unknown empty loading failure fallback selected limits seconds cost sourceBytes payloadBytes uniqueBytes calls asOf repository device workspace status refresh session allSessions saved stopped failed completed running ready cancelled awaiting_approval possibly_sent acknowledged not_sent selectionError version validation format bytes approveRecorded shellFailure signIn selectedFiles'.split(' ');
+  const rows = {
+    en: ['Projects','Organization','Project','Conversations','New project','New session','Name','Create','Cancel','Close','Ordinary chat','Chat','Work','Send','Stop','Message','Upload to server','Server','Environment','Context','Results','Data ledger','Local','On server','Sent to model','Produced','Instructions version','Memory','Files','Coverage','Connectors','Image policy','Pending approvals','Accept','Deny','Expires','Download','Preview','Jobs','Scheduled tasks — unavailable until P1','Unavailable','Unknown','None','Loading…','Operation failed','Open project workspace','Selected','Limits','seconds','Cost EUR','Source bytes','Payload bytes','Unique source bytes','Calls','As of','Repository','Device unavailable','Workspace','Status','Refresh','Work session','All sessions','Saved','Stopped','Failed','Completed','Running','Ready','Cancelled','Awaiting approval','Possibly sent','Acknowledged','Not sent','Select an authorized project and conversation','Version','Validation','Format','Bytes','Decision recorded; execution is separate','Project shell could not be mounted','Sign in','Selected file versions'],
+    fr: ['Projets','Organisation','Projet','Conversations','Nouveau projet','Nouvelle session','Nom','Créer','Annuler','Fermer','Discussion ordinaire','Discuter','Travailler','Envoyer','Arrêter','Message','Téléverser sur le serveur','Serveur','Environnement','Contexte','Résultats','Registre des données','Local','Sur le serveur','Envoyé au modèle','Produit','Version des instructions','Mémoire','Fichiers','Couverture','Connecteurs','Politique des images','Approbations en attente','Accepter','Refuser','Expiration','Télécharger','Aperçu','Tâches','Tâches planifiées — indisponibles avant P1','Indisponible','Inconnu','Aucun','Chargement…','Échec de l’opération','Ouvrir l’espace projet','Sélectionné','Limites','secondes','Coût EUR','Octets sources','Octets transmis','Octets sources uniques','Appels','À la date de','Dépôt','Appareil indisponible','Espace de travail','État','Actualiser','Session de travail','Toutes les sessions','Enregistré','Arrêté','Échec','Terminé','En cours','Prêt','Annulé','Approbation en attente','Peut-être envoyé','Confirmé','Non envoyé','Sélectionnez un projet et une conversation autorisés','Version','Validation','Format','Octets','Décision enregistrée ; exécution séparée','Impossible d’afficher le projet dans cette interface','Se connecter','Versions de fichiers sélectionnées'],
+    de: ['Projekte','Organisation','Projekt','Unterhaltungen','Neues Projekt','Neue Sitzung','Name','Erstellen','Abbrechen','Schließen','Normaler Chat','Besprechen','Arbeiten','Senden','Stoppen','Nachricht','Auf Server hochladen','Server','Umgebung','Kontext','Ergebnisse','Datenprotokoll','Lokal','Auf dem Server','An das Modell gesendet','Erstellt','Anweisungsversion','Gedächtnis','Dateien','Abdeckung','Konnektoren','Bildrichtlinie','Ausstehende Genehmigungen','Erlauben','Ablehnen','Ablauf','Herunterladen','Vorschau','Aufträge','Geplante Aufgaben — erst ab P1 verfügbar','Nicht verfügbar','Unbekannt','Keine','Wird geladen…','Vorgang fehlgeschlagen','Projektbereich öffnen','Ausgewählt','Grenzen','Sekunden','Kosten EUR','Quellbytes','Übertragene Bytes','Eindeutige Quellbytes','Aufrufe','Stand','Repository','Gerät nicht verfügbar','Arbeitsbereich','Status','Aktualisieren','Arbeitssitzung','Alle Sitzungen','Gespeichert','Gestoppt','Fehlgeschlagen','Abgeschlossen','Läuft','Bereit','Abgebrochen','Wartet auf Genehmigung','Möglicherweise gesendet','Bestätigt','Nicht gesendet','Berechtigtes Projekt und Unterhaltung auswählen','Version','Validierung','Format','Bytes','Entscheidung gespeichert; Ausführung folgt separat','Projektoberfläche konnte nicht eingebunden werden','Anmelden','Ausgewählte Dateiversionen'],
+    es: ['Proyectos','Organización','Proyecto','Conversaciones','Nuevo proyecto','Nueva sesión','Nombre','Crear','Cancelar','Cerrar','Chat normal','Conversar','Trabajar','Enviar','Detener','Mensaje','Subir al servidor','Servidor','Entorno','Contexto','Resultados','Registro de datos','Local','En el servidor','Enviado al modelo','Producido','Versión de instrucciones','Memoria','Archivos','Cobertura','Conectores','Política de imágenes','Aprobaciones pendientes','Aceptar','Denegar','Caduca','Descargar','Vista previa','Trabajos','Tareas programadas — no disponibles hasta P1','No disponible','Desconocido','Ninguno','Cargando…','La operación falló','Abrir espacio del proyecto','Seleccionado','Límites','segundos','Coste EUR','Bytes de origen','Bytes transmitidos','Bytes de origen únicos','Peticiones','A fecha de','Repositorio','Dispositivo no disponible','Espacio de trabajo','Estado','Actualizar','Sesión de trabajo','Todas las sesiones','Guardado','Detenido','Fallido','Completado','En curso','Listo','Cancelado','Esperando aprobación','Posiblemente enviado','Confirmado','No enviado','Seleccione un proyecto y una conversación autorizados','Versión','Validación','Formato','Bytes','Decisión registrada; ejecución por separado','No se pudo integrar la interfaz del proyecto','Iniciar sesión','Versiones de archivos seleccionadas'],
+    it: ['Progetti','Organizzazione','Progetto','Conversazioni','Nuovo progetto','Nuova sessione','Nome','Crea','Annulla','Chiudi','Chat normale','Discuti','Lavora','Invia','Ferma','Messaggio','Carica sul server','Server','Ambiente','Contesto','Risultati','Registro dei dati','Locale','Sul server','Inviato al modello','Prodotto','Versione istruzioni','Memoria','File','Copertura','Connettori','Politica immagini','Approvazioni in attesa','Accetta','Rifiuta','Scadenza','Scarica','Anteprima','Lavori','Attività pianificate — non disponibili fino a P1','Non disponibile','Sconosciuto','Nessuno','Caricamento…','Operazione fallita','Apri spazio del progetto','Selezionato','Limiti','secondi','Costo EUR','Byte sorgente','Byte trasmessi','Byte sorgente unici','Chiamate','Aggiornato al','Repository','Dispositivo non disponibile','Spazio di lavoro','Stato','Aggiorna','Sessione di lavoro','Tutte le sessioni','Salvato','Fermato','Fallito','Completato','In corso','Pronto','Annullato','In attesa di approvazione','Possibilmente inviato','Confermato','Non inviato','Seleziona un progetto e una conversazione autorizzati','Versione','Validazione','Formato','Byte','Decisione registrata; esecuzione separata','Impossibile integrare l’interfaccia del progetto','Accedi','Versioni di file selezionate']
+  };
+  keys.push('previewUnavailable');
+  const previewMessages = {en:'Preview unavailable; download the original file.',fr:'Aperçu indisponible ; téléchargez le fichier original.',de:'Vorschau nicht verfügbar; Originaldatei herunterladen.',es:'Vista previa no disponible; descargue el archivo original.',it:'Anteprima non disponibile; scarica il file originale.'};
+  for (const language of Object.keys(rows)) rows[language].push(previewMessages[language]);
+  const stateKeys = 'allow ask pending approved denied expired active proposed excluded partial passed created regenerated edited_in_place delete overwrite queued succeeded cancelling'.split(' ');
+  const states = {
+    en: ['Allowed','Ask first','Pending','Approved','Denied','Expired','Active','Proposed','Excluded','Partial','Passed','Created','Regenerated','Edited in place','Delete','Overwrite','Queued','Succeeded','Cancelling'],
+    fr: ['Autorisé','Demander','En attente','Approuvé','Refusé','Expiré','Actif','Proposé','Exclu','Partiel','Validé','Créé','Régénéré','Modifié sur place','Supprimer','Écraser','En file','Réussi','Annulation'],
+    de: ['Erlaubt','Nachfragen','Ausstehend','Genehmigt','Abgelehnt','Abgelaufen','Aktiv','Vorgeschlagen','Ausgeschlossen','Teilweise','Geprüft','Erstellt','Neu erzeugt','Direkt bearbeitet','Löschen','Überschreiben','In Warteschlange','Erfolgreich','Wird abgebrochen'],
+    es: ['Permitido','Preguntar','Pendiente','Aprobado','Denegado','Caducado','Activo','Propuesto','Excluido','Parcial','Validado','Creado','Regenerado','Editado en el original','Eliminar','Sobrescribir','En cola','Completado','Cancelando'],
+    it: ['Consentito','Chiedi prima','In attesa','Approvato','Rifiutato','Scaduto','Attivo','Proposto','Escluso','Parziale','Verificato','Creato','Rigenerato','Modificato sul posto','Elimina','Sovrascrivi','In coda','Riuscito','Annullamento']
+  };
+  keys.push(...stateKeys);
+  for (const language of Object.keys(rows)) rows[language].push(...states[language]);
+  keys.push('extractBytes', 'imageBytes');
+  const byteLabels = {en:['Extract bytes','Image bytes'],fr:['Octets extraits','Octets images'],de:['Extrahierte Bytes','Bildbytes'],es:['Bytes extraídos','Bytes de imágenes'],it:['Byte estratti','Byte immagini']};
+  for (const language of Object.keys(rows)) rows[language].push(...byteLabels[language]);
+  keys.push('unknownCost', 'reservedCost');
+  const costLabels = {en:['Unknown usage reservation EUR','Active reservation EUR'],fr:['Réserve pour usage inconnu EUR','Réserve active EUR'],de:['Reservierung für unbekannte Nutzung EUR','Aktive Reservierung EUR'],es:['Reserva por uso desconocido EUR','Reserva activa EUR'],it:['Riserva per utilizzo sconosciuto EUR','Riserva attiva EUR']};
+  for (const language of Object.keys(rows)) rows[language].push(...costLabels[language]);
+  keys.push('details','characters','text','page','pages','paragraph','paragraphs','sheet','table','row','column','of','units','accessFailure','limitFailure','serviceFailure');
+  const displayLabels = {
+    en:['Details','characters','text','page','pages','paragraph','paragraphs','sheet','table','row','column','of','units','Access is unavailable. Sign in or select another project.','This request reached a limit.','The service is temporarily unavailable.'],
+    fr:['Détails','caractères','texte','page','pages','paragraphe','paragraphes','feuille','tableau','ligne','colonne','sur','unités','Accès indisponible. Connectez-vous ou sélectionnez un autre projet.','Cette demande a atteint une limite.','Le service est temporairement indisponible.'],
+    de:['Details','Zeichen','Text','Seite','Seiten','Absatz','Absätze','Blatt','Tabelle','Zeile','Spalte','von','Einheiten','Zugriff nicht verfügbar. Anmelden oder anderes Projekt wählen.','Diese Anfrage hat ein Limit erreicht.','Der Dienst ist vorübergehend nicht verfügbar.'],
+    es:['Detalles','caracteres','texto','página','páginas','párrafo','párrafos','hoja','tabla','fila','columna','de','unidades','Acceso no disponible. Inicie sesión o seleccione otro proyecto.','Esta solicitud alcanzó un límite.','El servicio no está disponible temporalmente.'],
+    it:['Dettagli','caratteri','testo','pagina','pagine','paragrafo','paragrafi','foglio','tabella','riga','colonna','di','unità','Accesso non disponibile. Accedi o seleziona un altro progetto.','Questa richiesta ha raggiunto un limite.','Il servizio è temporaneamente non disponibile.']
+  };
+  for (const language of Object.keys(rows)) rows[language].push(...displayLabels[language]);
+  keys.push('contextUsed','contextTokens','contextEstimate','system','project_instructions','pinned_memory','tool_declarations','session_state','recent_turns','tool_results','document_passages');
+  const contextLabels = {
+    en: ['Context used','tokens','Estimated using','System','Project instructions','Pinned memory','Tool declarations','Session state','Recent turns','Tool results','Document passages'],
+    fr: ['Contexte utilisé','tokens','Estimation','Système','Instructions du projet','Mémoire épinglée','Déclarations des outils','État de session','Tours récents','Résultats des outils','Passages documentaires'],
+    de: ['Verwendeter Kontext','Tokens','Schätzmethode','System','Projektanweisungen','Angehefteter Speicher','Werkzeugdefinitionen','Sitzungszustand','Letzte Beiträge','Werkzeugergebnisse','Dokumentpassagen'],
+    es: ['Contexto usado','tokens','Estimación','Sistema','Instrucciones del proyecto','Memoria fijada','Declaraciones de herramientas','Estado de sesión','Turnos recientes','Resultados de herramientas','Pasajes de documentos'],
+    it: ['Contesto utilizzato','token','Stima','Sistema','Istruzioni del progetto','Memoria fissata','Dichiarazioni degli strumenti','Stato della sessione','Turni recenti','Risultati degli strumenti','Passaggi dei documenti']
+  };
+  for (const language of Object.keys(rows)) rows[language].push(...contextLabels[language]);
+  keys.push('contextCleared');
+  for (const language of Object.keys(rows)) rows[language].push({en:'Tool results cleared',fr:'Résultats des outils allégés',de:'Werkzeugergebnisse gekürzt',es:'Resultados de herramientas reducidos',it:'Risultati degli strumenti ridotti'}[language]);
+  const projectLabels = {
+  "yourProjects": [
+    "Your projects",
+    "Vos projets",
+    "Ihre Projekte",
+    "Tus proyectos",
+    "I tuoi progetti"
+  ],
+  "sharedProjects": [
+    "Shared with you",
+    "Partagé avec vous",
+    "Mit Ihnen geteilt",
+    "Compartidos contigo",
+    "Condivisi con te"
+  ],
+  "searchProjects": [
+    "Search projects",
+    "Rechercher un projet",
+    "Projekte suchen",
+    "Buscar proyectos",
+    "Cerca progetti"
+  ],
+  "sortProjects": [
+    "Sort projects",
+    "Trier les projets",
+    "Projekte sortieren",
+    "Ordenar proyectos",
+    "Ordina progetti"
+  ],
+  "recentActivity": [
+    "Recent activity",
+    "Activité récente",
+    "Letzte Aktivität",
+    "Actividad reciente",
+    "Attività recente"
+  ],
+  "privateProject": [
+    "Private project",
+    "Projet privé",
+    "Privates Projekt",
+    "Proyecto privado",
+    "Progetto privato"
+  ],
+  "noSharedProjects": [
+    "No shared projects yet",
+    "Aucun projet partagé pour le moment",
+    "Noch keine geteilten Projekte",
+    "Todavía no hay proyectos compartidos",
+    "Nessun progetto condiviso per ora"
+  ],
+  "noProjects": [
+    "Your projects start here",
+    "Vos projets commencent ici",
+    "Hier beginnen Ihre Projekte",
+    "Tus proyectos empiezan aquí",
+    "I tuoi progetti iniziano qui"
+  ],
+  "noSearchResults": [
+    "Try another name.",
+    "Essayez un autre nom.",
+    "Versuchen Sie einen anderen Namen.",
+    "Prueba con otro nombre.",
+    "Prova un altro nome."
+  ],
+  "projectIntro": [
+    "Bring your conversations and files together in a project.",
+    "Réunissez vos conversations et vos fichiers dans un projet.",
+    "Bündeln Sie Unterhaltungen und Dateien in einem Projekt.",
+    "Reúne tus conversaciones y archivos en un proyecto.",
+    "Riunisci conversazioni e file in un progetto."
+  ],
+  "file": [
+    "File",
+    "Fichier",
+    "Datei",
+    "Archivo",
+    "File"
+  ],
+  "conversation": [
+    "Conversation",
+    "Conversation",
+    "Unterhaltung",
+    "Conversación",
+    "Conversazione"
+  ],
+  "renameProject": [
+    "Rename project",
+    "Renommer le projet",
+    "Projekt umbenennen",
+    "Renombrar proyecto",
+    "Rinomina progetto"
+  ],
+  "noConversations": [
+    "Start your first conversation above.",
+    "Commencez votre première conversation ci-dessus.",
+    "Beginnen Sie oben Ihre erste Unterhaltung.",
+    "Inicia tu primera conversación arriba.",
+    "Inizia la prima conversazione qui sopra."
+  ],
+  "composerPlaceholder": [
+    "How can Atlas help with this project?",
+    "Comment Atlas peut-il vous aider sur ce projet ?",
+    "Wie kann Atlas bei diesem Projekt helfen?",
+    "¿Cómo puede Atlas ayudarte con este proyecto?",
+    "Come può Atlas aiutarti con questo progetto?"
+  ],
+  "instructionsPlaceholder": [
+    "Add context and preferences for Atlas.",
+    "Ajoutez le contexte et vos préférences pour Atlas.",
+    "Kontext und Präferenzen für Atlas hinzufügen.",
+    "Añade contexto y preferencias para Atlas.",
+    "Aggiungi contesto e preferenze per Atlas."
+  ],
+  "dropFiles": [
+    "Drop files here or choose files",
+    "Déposez des fichiers ici ou sélectionnez-les",
+    "Dateien hier ablegen oder auswählen",
+    "Arrastra archivos aquí o selecciónalos",
+    "Trascina i file qui o selezionali"
+  ],
+  "editInConversation": [
+    "Request change",
+    "Demander la modification",
+    "Änderung anfordern",
+    "Solicitar cambio",
+    "Richiedi modifica"
+  ],
+  "save": [
+    "Save",
+    "Enregistrer",
+    "Speichern",
+    "Guardar",
+    "Salva"
+  ],
+  "remove": [
+    "Remove",
+    "Retirer",
+    "Entfernen",
+    "Quitar",
+    "Rimuovi"
+  ],
+  "confirmRemove": [
+    "Remove this item?",
+    "Retirer cet élément ?",
+    "Diesen Eintrag entfernen?",
+    "¿Quitar este elemento?",
+    "Rimuovere questo elemento?"
+  ]
+};
+  for (const [key, values] of Object.entries(projectLabels)) { keys.push(key); Object.keys(rows).forEach((language,index) => rows[language].push(values[index])); }
+  for (const [key, values] of Object.entries({instructions:['Instructions','Instructions','Anweisungen','Instrucciones','Istruzioni'],upload:['Add files','Ajouter des fichiers','Dateien hinzufügen','Añadir archivos','Aggiungi file'],ordinary:['New chat','Nouvelle discussion','Neuer Chat','Nuevo chat','Nuova chat']})) Object.keys(rows).forEach((language,index) => rows[language][keys.indexOf(key)] = values[index]);
+  const changeLabels = {"changeInstructions": ["Update the project instructions", "Modifier les instructions du projet", "Projektanweisungen ändern", "Modificar las instrucciones del proyecto", "Modifica le istruzioni del progetto"], "removeFile": ["Remove this project file", "Retirer ce fichier du projet", "Diese Projektdatei entfernen", "Quitar este archivo del proyecto", "Rimuovi questo file dal progetto"], "removeMemory": ["Delete this project memory entry", "Supprimer cette entrée de mémoire du projet", "Diesen Projektspeichereintrag löschen", "Eliminar esta entrada de memoria del proyecto", "Elimina questa voce di memoria del progetto"], "changeApproval": ["Request approval before changing the original.", "Demander mon approbation avant de modifier l’original.", "Vor Änderung des Originals meine Genehmigung einholen.", "Pedir mi aprobación antes de modificar el original.", "Chiedi la mia approvazione prima di modificare l’originale."]};
+  for (const [key,values] of Object.entries(changeLabels)) {keys.push(key); Object.keys(rows).forEach((language,index) => rows[language].push(values[index]));}
+  const adminLabels = {
+  "Repository URL": [
+    "Repository URL",
+    "URL du dépôt",
+    "Repository-URL",
+    "URL del repositorio",
+    "URL del repository"
+  ],
+  "Connector": [
+    "Connector",
+    "Connecteur",
+    "Connector",
+    "Conector",
+    "Connettore"
+  ],
+  "Folder": [
+    "Folder",
+    "Dossier",
+    "Ordner",
+    "Carpeta",
+    "Cartella"
+  ],
+  "Import approval": [
+    "Import approval",
+    "Approbation d’importation",
+    "Importgenehmigung",
+    "Aprobación de importación",
+    "Approvazione di importazione"
+  ],
+  "Approve import": [
+    "Approve import",
+    "Approuver l’importation",
+    "Import genehmigen",
+    "Aprobar importación",
+    "Approva importazione"
+  ],
+  "connectorNotAllowed": [
+    "Connector not allowed",
+    "Connecteur non autorisé",
+    "Connector nicht erlaubt",
+    "Conector no permitido",
+    "Connettore non consentito"
+  ],
+  "revisionConflict": [
+    "Revision conflict",
+    "Conflit de révision",
+    "Revisionskonflikt",
+    "Conflicto de revisión",
+    "Conflitto di revisione"
+  ],
+  "forgeUnavailable": [
+    "Forge unavailable",
+    "Forge indisponible",
+    "Forge nicht verfügbar",
+    "Forge no disponible",
+    "Forge non disponibile"
+  ],
+  "testsNotVerified": [
+    "Tests not verified",
+    "Tests non vérifiés",
+    "Tests nicht verifiziert",
+    "Pruebas no verificadas",
+    "Test non verificati"
+  ],
+  "Tests": [
+    "Tests",
+    "Tests",
+    "Tests",
+    "Pruebas",
+    "Test"
+  ],
+  "not run": [
+    "not run",
+    "non exécutés",
+    "nicht ausgeführt",
+    "no ejecutadas",
+    "non eseguiti"
+  ],
+  "Remote targets": [
+    "Remote targets",
+    "Cibles distantes",
+    "Remote-Ziele",
+    "Destinos remotos",
+    "Destinazioni remote"
+  ],
+  "Remote execution targets": [
+    "Remote execution targets",
+    "Exécution à distance",
+    "Remote-Ausführung",
+    "Ejecución remota",
+    "Esecuzione remota"
+  ],
+  "Register a dedicated Linux or macOS account. Host key fingerprints must be verified independently. Private keys stay in the runner broker.": [
+    "Register a dedicated Linux or macOS account. Verify the host key independently. Private keys stay in the runner broker.",
+    "Enregistrez un compte Linux ou macOS dédié. Vérifiez la clé de l’hôte séparément. Les clés privées restent dans le service d’exécution.",
+    "Registrieren Sie ein dediziertes Linux- oder macOS-Konto. Prüfen Sie den Hostschlüssel unabhängig. Private Schlüssel bleiben im Ausführungsdienst.",
+    "Registra una cuenta Linux o macOS dedicada. Verifica la clave del host por separado. Las claves privadas permanecen en el servicio de ejecución.",
+    "Registra un account Linux o macOS dedicato. Verifica la chiave host separatamente. Le chiavi private restano nel servizio di esecuzione."
+  ],
+  "Probe": [
+    "Check connection",
+    "Tester la connexion",
+    "Verbindung prüfen",
+    "Probar conexión",
+    "Verifica connessione"
+  ],
+  "Grant to this project": [
+    "Grant to this project",
+    "Autoriser pour ce projet",
+    "Für dieses Projekt erlauben",
+    "Autorizar para este proyecto",
+    "Autorizza per questo progetto"
+  ],
+  "Revoke from this project": [
+    "Revoke from this project",
+    "Révoquer pour ce projet",
+    "Für dieses Projekt widerrufen",
+    "Revocar para este proyecto",
+    "Revoca per questo progetto"
+  ],
+  "Command audit": [
+    "Command history",
+    "Historique des commandes",
+    "Befehlsverlauf",
+    "Historial de comandos",
+    "Cronologia comandi"
+  ],
+  "Target granted to this project.": [
+    "Target granted to this project.",
+    "Cible autorisée pour ce projet.",
+    "Ziel für dieses Projekt erlaubt.",
+    "Destino autorizado para este proyecto.",
+    "Destinazione autorizzata per questo progetto."
+  ],
+  "Grant and egress permission revoked.": [
+    "Grant and transfer permission revoked.",
+    "Autorisations d’accès et de transfert révoquées.",
+    "Zugriffs- und Übertragungsrechte widerrufen.",
+    "Permisos de acceso y transferencia revocados.",
+    "Permessi di accesso e trasferimento revocati."
+  ],
+  "Name": [
+    "Name",
+    "Nom",
+    "Name",
+    "Nombre",
+    "Nome"
+  ],
+  "Host": [
+    "Host",
+    "Hôte",
+    "Host",
+    "Host",
+    "Host"
+  ],
+  "SSH port": [
+    "SSH port",
+    "Port SSH",
+    "SSH-Port",
+    "Puerto SSH",
+    "Porta SSH"
+  ],
+  "SSH user": [
+    "SSH user",
+    "Utilisateur SSH",
+    "SSH-Benutzer",
+    "Usuario SSH",
+    "Utente SSH"
+  ],
+  "Working root": [
+    "Working root",
+    "Répertoire de travail",
+    "Arbeitsverzeichnis",
+    "Directorio de trabajo",
+    "Directory di lavoro"
+  ],
+  "Pinned host key SHA256 fingerprints (one per line)": [
+    "Host key SHA256 fingerprints (one per line)",
+    "Empreintes SHA256 des clés hôtes (une par ligne)",
+    "SHA256-Hostschlüssel (einer pro Zeile)",
+    "Huellas SHA256 de claves host (una por línea)",
+    "Impronte SHA256 delle chiavi host (una per riga)"
+  ],
+  "Credential reference": [
+    "Credential reference",
+    "Référence des identifiants",
+    "Zugangsdatenreferenz",
+    "Referencia de credenciales",
+    "Riferimento credenziali"
+  ],
+  "Credential public key fingerprint": [
+    "Public key fingerprint",
+    "Empreinte de clé publique",
+    "Fingerabdruck des öffentlichen Schlüssels",
+    "Huella de clave pública",
+    "Impronta della chiave pubblica"
+  ],
+  "Allow command rules (one per line)": [
+    "Allowed commands (one per line)",
+    "Commandes autorisées (une par ligne)",
+    "Erlaubte Befehle (einer pro Zeile)",
+    "Comandos permitidos (uno por línea)",
+    "Comandi consentiti (uno per riga)"
+  ],
+  "Deny command rules (one per line)": [
+    "Denied commands (one per line)",
+    "Commandes interdites (une par ligne)",
+    "Verbotene Befehle (einer pro Zeile)",
+    "Comandos prohibidos (uno por línea)",
+    "Comandi vietati (uno per riga)"
+  ],
+  "Target operating system": [
+    "Operating system",
+    "Système d’exploitation",
+    "Betriebssystem",
+    "Sistema operativo",
+    "Sistema operativo"
+  ],
+  "Permission mode": [
+    "Permission mode",
+    "Mode d’autorisation",
+    "Berechtigungsmodus",
+    "Modo de permisos",
+    "Modalità autorizzazioni"
+  ],
+  "Generate a key pair": [
+    "Generate a key pair",
+    "Générer une paire de clés",
+    "Schlüsselpaar erzeugen",
+    "Generar un par de claves",
+    "Genera una coppia di chiavi"
+  ],
+  "Register target": [
+    "Register target",
+    "Enregistrer la cible",
+    "Ziel registrieren",
+    "Registrar destino",
+    "Registra destinazione"
+  ],
+  "Install this public key in the target account. It is shown once:": [
+    "Install this public key in the target account. It is shown once:",
+    "Installez cette clé publique sur le compte cible. Elle ne sera affichée qu’une fois :",
+    "Installieren Sie diesen öffentlichen Schlüssel im Zielkonto. Er wird nur einmal angezeigt:",
+    "Instala esta clave pública en la cuenta de destino. Solo se muestra una vez:",
+    "Installa questa chiave pubblica nell’account di destinazione. Viene mostrata una sola volta:"
+  ]
+};
+  for (const [key,values] of Object.entries(adminLabels)) {keys.push(key); Object.keys(rows).forEach((language,index) => rows[language].push(values[index]));}
+  const approvalLabels = {
+  "verification": [
+    "Verification",
+    "Vérification",
+    "Prüfung",
+    "Verificación",
+    "Verifica"
+  ],
+  "exited": [
+    "exited",
+    "code de sortie",
+    "Beendigungscode",
+    "código de salida",
+    "codice di uscita"
+  ],
+  "directory": [
+    "Directory",
+    "Répertoire",
+    "Verzeichnis",
+    "Directorio",
+    "Directory"
+  ],
+  "target": [
+    "Target",
+    "Cible",
+    "Ziel",
+    "Destino",
+    "Destinazione"
+  ],
+  "codeDigest": [
+    "Code digest",
+    "Empreinte du code",
+    "Code-Prüfsumme",
+    "Huella del código",
+    "Impronta del codice"
+  ],
+  "timeout": [
+    "timeout",
+    "délai",
+    "Zeitlimit",
+    "tiempo límite",
+    "tempo limite"
+  ],
+  "codeTransfer": [
+    "This sends the selected workspace to this target. Approval permits code transfer for this project.",
+    "L’espace de travail sélectionné sera envoyé à cette cible. L’approbation autorise le transfert du code pour ce projet.",
+    "Der ausgewählte Arbeitsbereich wird an dieses Ziel gesendet. Die Genehmigung erlaubt den Codetransfer für dieses Projekt.",
+    "El espacio seleccionado se enviará a este destino. La aprobación permite transferir código para este proyecto.",
+    "Lo spazio selezionato verrà inviato a questa destinazione. L’approvazione consente il trasferimento del codice per questo progetto."
+  ],
+  "alwaysAllow": [
+    "Always allow commands starting with this command and its arguments (project rule)",
+    "Toujours autoriser les commandes commençant par cette commande et ses arguments (règle du projet)",
+    "Befehle mit diesem Befehl und diesen Argumenten immer erlauben (Projektregel)",
+    "Permitir siempre comandos que empiecen por este comando y sus argumentos (regla del proyecto)",
+    "Consenti sempre i comandi che iniziano con questo comando e i suoi argomenti (regola del progetto)"
+  ],
+  "Branch": [
+    "Branch",
+    "Branche",
+    "Branch",
+    "Rama",
+    "Ramo"
+  ],
+  "Target": [
+    "Target",
+    "Cible",
+    "Ziel",
+    "Destino",
+    "Destinazione"
+  ],
+  "Commit message": [
+    "Commit message",
+    "Message de commit",
+    "Commit-Nachricht",
+    "Mensaje de commit",
+    "Messaggio di commit"
+  ],
+  "PR title": [
+    "PR title",
+    "Titre de la PR",
+    "PR-Titel",
+    "Título de la PR",
+    "Titolo della PR"
+  ],
+  "PR body": [
+    "PR description",
+    "Description de la PR",
+    "PR-Beschreibung",
+    "Descripción de la PR",
+    "Descrizione della PR"
+  ],
+  "Base commit": [
+    "Base commit",
+    "Commit de base",
+    "Basis-Commit",
+    "Commit base",
+    "Commit di base"
+  ],
+  "rules": [
+    "Rules",
+    "Règles",
+    "Regeln",
+    "Reglas",
+    "Regole"
+  ],
+  "auto": [
+    "Automatic",
+    "Automatique",
+    "Automatisch",
+    "Automático",
+    "Automatico"
+  ]
+};
+  for (const [key,values] of Object.entries(approvalLabels)) {keys.push(key); Object.keys(rows).forEach((language,index) => rows[language].push(values[index]));}
+  const resultLabels = {"steps": ["Steps", "Étapes", "Schritte", "Pasos", "Passaggi"],"not_run": ["Not run", "Non exécuté", "Nicht ausgeführt", "Sin ejecutar", "Non eseguito"], "added": ["Added", "Ajouté", "Hinzugefügt", "Añadido", "Aggiunto"], "modified": ["Modified", "Modifié", "Geändert", "Modificado", "Modificato"], "deleted": ["Deleted", "Supprimé", "Gelöscht", "Eliminado", "Eliminato"]};
+  for (const [key,values] of Object.entries(resultLabels)) {keys.push(key); Object.keys(rows).forEach((language,index) => rows[language].push(values[index]));}
+  const scheduledLabels = {"taskHeading": ["Scheduled tasks", "Tâches planifiées", "Geplante Aufgaben", "Tareas programadas", "Attività pianificate"], "taskCreate": ["New scheduled task", "Nouvelle tâche planifiée", "Neue geplante Aufgabe", "Nueva tarea programada", "Nuova attività pianificata"], "taskEmpty": ["No scheduled tasks yet.", "Aucune tâche planifiée.", "Noch keine geplanten Aufgaben.", "Aún no hay tareas programadas.", "Nessuna attività pianificata."], "taskDaily": ["Every day", "Chaque jour", "Jeden Tag", "Cada día", "Ogni giorno"], "taskWeekly": ["Every {day}", "Chaque {day}", "Jeden {day}", "Cada {day}", "Ogni {day}"], "taskEvery": ["Every {n} days", "Tous les {n} jours", "Alle {n} Tage", "Cada {n} días", "Ogni {n} giorni"], "taskFrequency_daily": ["Daily", "Tous les jours", "Täglich", "Diaria", "Giornaliera"], "taskFrequency_every": ["Every N days", "Tous les N jours", "Alle N Tage", "Cada N días", "Ogni N giorni"], "taskFrequency_weekly": ["Weekly", "Chaque semaine", "Wöchentlich", "Semanal", "Settimanale"], "taskPaused": ["Paused", "En pause", "Pausiert", "En pausa", "In pausa"], "taskNext": ["Next run", "Prochaine exécution", "Nächste Ausführung", "Próxima ejecución", "Prossima esecuzione"], "taskLast": ["Last result", "Dernier résultat", "Letztes Ergebnis", "Último resultado", "Ultimo risultato"], "taskConfirm": ["Confirm schedule", "Confirmer la planification", "Zeitplan bestätigen", "Confirmar programación", "Conferma pianificazione"], "taskPause": ["Pause", "Mettre en pause", "Pausieren", "Pausar", "Pausa"], "taskResume": ["Resume", "Reprendre", "Fortsetzen", "Reanudar", "Riprendi"], "taskEdit": ["Edit task", "Modifier la tâche", "Aufgabe bearbeiten", "Editar tarea", "Modifica attività"], "taskRun": ["Run now", "Exécuter maintenant", "Jetzt ausführen", "Ejecutar ahora", "Esegui ora"], "taskDelete": ["Delete this task?", "Supprimer cette tâche ?", "Diese Aufgabe löschen?", "¿Eliminar esta tarea?", "Eliminare questa attività?"], "taskInstruction": ["Instruction", "Consigne", "Anweisung", "Instrucción", "Istruzione"], "taskFrequency": ["Frequency", "Fréquence", "Häufigkeit", "Frecuencia", "Frequenza"], "taskDays": ["Number of days", "Nombre de jours", "Anzahl Tage", "Número de días", "Numero di giorni"], "taskWeekday": ["Day of the week", "Jour de la semaine", "Wochentag", "Día de la semana", "Giorno della settimana"], "taskTime": ["Time", "Heure", "Uhrzeit", "Hora", "Ora"], "taskZone": ["Owner time zone", "Fuseau horaire du créateur", "Zeitzone des Erstellers", "Zona horaria del creador", "Fuso orario del creatore"], "taskTarget": ["Target file (optional)", "Fichier cible (facultatif)", "Zieldatei (optional)", "Archivo de destino (opcional)", "File di destinazione (facoltativo)"], "taskCap": ["Daily cap (EUR)", "Plafond quotidien (EUR)", "Tageslimit (EUR)", "Límite diario (EUR)", "Limite giornaliero (EUR)"], "taskCapReached": ["Daily spending cap reached", "Plafond quotidien atteint", "Tageslimit erreicht", "Límite diario alcanzado", "Limite giornaliero raggiunto"], "taskReason_access_lost": ["Paused: the creator no longer has Work access to this project.", "En pause : le créateur n’a plus accès au travail dans ce projet.", "Pausiert: Der Ersteller hat keinen Arbeitszugriff mehr auf dieses Projekt.", "En pausa: el creador ya no tiene acceso de trabajo a este proyecto.", "In pausa: il creatore non ha più accesso al lavoro in questo progetto."], "taskReason_three_failures": ["Paused after three consecutive failures. Review the last conversation before resuming.", "En pause après trois échecs consécutifs. Consultez la dernière conversation avant de reprendre.", "Nach drei aufeinanderfolgenden Fehlern pausiert. Prüfen Sie vor dem Fortsetzen die letzte Unterhaltung.", "En pausa tras tres fallos consecutivos. Revise la última conversación antes de reanudar.", "In pausa dopo tre errori consecutivi. Consulta l’ultima conversazione prima di riprendere."]};
+  for (const [key,values] of Object.entries(scheduledLabels)) {keys.push(key); Object.keys(rows).forEach((language,index) => rows[language].push(values[index]));}
+  const globalTaskLabels = {
+    taskYours:['Yours','Les vôtres','Ihre','Tus tareas','Le tue'], taskTemplates:['Templates','Modèles','Vorlagen','Plantillas','Modelli'], taskSearch:['Search tasks','Rechercher des tâches','Aufgaben suchen','Buscar tareas','Cerca attività'], taskFilterProject:['Project','Projet','Projekt','Proyecto','Progetto'], taskFilterStatus:['Status','État','Status','Estado','Stato'], taskAll:['All','Toutes','Alle','Todas','Tutte'], taskActive:['Active','Active','Aktiv','Activa','Attiva'], taskFailing:['Failing','En échec','Fehlgeschlagen','Con errores','Non riuscita'], taskSort:['Sort tasks','Trier les tâches','Aufgaben sortieren','Ordenar tareas','Ordina attività'], taskSortNext:['Next run','Prochaine exécution','Nächste Ausführung','Próxima ejecución','Prossima esecuzione'], taskSortName:['Name','Nom','Name','Nombre','Nome'], taskSortLast:['Last run','Dernière exécution','Letzte Ausführung','Última ejecución','Ultima esecuzione'], taskNew:['New task','Nouvelle tâche','Neue Aufgabe','Nueva tarea','Nuova attività'], taskChooseProject:['Project','Projet','Projekt','Proyecto','Progetto'], taskTemplateDigest:['Weekly news digest','Veille hebdomadaire','Wöchentlicher Nachrichtenüberblick','Resumen semanal de noticias','Rassegna settimanale'], taskTemplateReport:['Weekly report update','Mise à jour hebdomadaire du rapport','Wöchentliches Berichtsupdate','Actualización semanal del informe','Aggiornamento settimanale del rapporto'], taskTemplateFiles:['Daily file summary','Résumé quotidien des fichiers','Tägliche Dateizusammenfassung','Resumen diario de archivos','Riepilogo giornaliero dei file'], taskTemplateDigestInstruction:['Prepare a weekly digest about a fictional topic.','Préparez une veille hebdomadaire sur un sujet fictif.','Erstellen Sie einen wöchentlichen Überblick zu einem fiktiven Thema.','Prepare un resumen semanal sobre un tema ficticio.','Prepara una rassegna settimanale su un argomento fittizio.'], taskTemplateReportInstruction:['Update the fictional weekly report with new project progress.','Mettez à jour le rapport hebdomadaire fictif avec les avancées du projet.','Aktualisieren Sie den fiktiven Wochenbericht mit dem Projektfortschritt.','Actualice el informe semanal ficticio con el progreso del proyecto.','Aggiorna il rapporto settimanale fittizio con i progressi del progetto.'], taskTemplateFilesInstruction:['Summarize new files added to this fictional project today.','Résumez les nouveaux fichiers ajoutés aujourd’hui à ce projet fictif.','Fassen Sie die heute zu diesem fiktiven Projekt hinzugefügten Dateien zusammen.','Resuma los nuevos archivos añadidos hoy a este proyecto ficticio.','Riassumi i nuovi file aggiunti oggi a questo progetto fittizio.'], taskPausedBanner:['Some tasks are paused after failures. Review them before resuming.','Certaines tâches sont en pause après des échecs. Vérifiez-les avant de les reprendre.','Einige Aufgaben sind nach Fehlern pausiert. Prüfen Sie sie vor dem Fortsetzen.','Algunas tareas están pausadas tras errores. Revísalas antes de reanudarlas.','Alcune attività sono in pausa dopo errori. Esaminale prima di riprenderle.'], taskNewOutput:['New output','Nouveau résultat','Neues Ergebnis','Nuevo resultado','Nuovo risultato'], taskConversation:['Open last conversation','Ouvrir la dernière conversation','Letzte Unterhaltung öffnen','Abrir la última conversación','Apri l’ultima conversazione'],
+    taskChooseProjectPlaceholder:['Choose a project','Choisissez un projet','Projekt auswählen','Elija un proyecto','Scegli un progetto'],
+    taskZoneInvalid:['Choose a time zone from the list.','Choisissez un fuseau horaire dans la liste.','Wählen Sie eine Zeitzone aus der Liste.','Elija una zona horaria de la lista.','Scegli un fuso orario dall’elenco.'],
+    taskResult_completed:['Completed','Terminée','Abgeschlossen','Completada','Completata'],
+    taskResult_failed:['Failed','Échec','Fehlgeschlagen','Fallida','Non riuscita'],
+    taskResult_running:['Running','En cours','Läuft','En curso','In corso']
+  };
+  for (const [key,values] of Object.entries(globalTaskLabels)) {keys.push(key); Object.keys(rows).forEach((language,index) => rows[language].push(values[index]));}
+  const additional = {
+    allProjects: ['All projects','Tous les projets','Alle Projekte','Todos los proyectos','Tutti i progetti'],
+    thinking: ['Atlas is thinking…','Atlas réfléchit…','Atlas denkt nach…','Atlas está pensando…','Atlas sta pensando…'],
+    archived: ['Archived','Archivés','Archiviert','Archivados','Archiviati'],
+    archive: ['Archive','Archiver','Archivieren','Archivar','Archivia'],
+    restore: ['Restore','Restaurer','Wiederherstellen','Restaurar','Ripristina'],
+    deleteConversation: ['Delete','Supprimer','Löschen','Eliminar','Elimina'],
+    searchConversations: ['Search conversations','Rechercher dans les conversations','Unterhaltungen durchsuchen','Buscar en las conversaciones','Cerca nelle conversazioni'],
+    noConversationMatch: ['No matching conversation.','Aucune conversation ne correspond.','Keine passende Unterhaltung.','Ninguna conversación coincide.','Nessuna conversazione corrispondente.'],
+    conversationActions: ['Conversation actions','Actions sur la conversation','Aktionen für die Unterhaltung','Acciones de la conversación','Azioni sulla conversazione'],
+    renameConversation: ['Rename','Renommer','Umbenennen','Cambiar nombre','Rinomina'],
+    confirmDeleteConversation: ['Delete this conversation and all its messages? Published deliverables stay in the project.','Supprimer cette conversation et tous ses messages ? Les livrables publiés restent dans le projet.','Diese Unterhaltung mit allen Nachrichten löschen? Veröffentlichte Ergebnisse bleiben im Projekt.','¿Eliminar esta conversación y todos sus mensajes? Los entregables publicados permanecen en el proyecto.','Eliminare questa conversazione e tutti i suoi messaggi? I documenti pubblicati restano nel progetto.'],
+    deleteProject: ['Delete','Supprimer','Löschen','Eliminar','Elimina'],
+    confirmDeleteProject: ['Delete this project and its files, conversations, memory, access grants, and tasks?','Supprimer ce projet et ses fichiers, conversations, mémoire, accès et tâches ?','Dieses Projekt samt Dateien, Unterhaltungen, Speicher, Zugriffsrechten und Aufgaben löschen?','¿Eliminar este proyecto y sus archivos, conversaciones, memoria, accesos y tareas?','Eliminare questo progetto e file, conversazioni, memoria, accessi e attività?'],
+    confirmArchiveProject: ['Archive this project? You can restore it later.','Archiver ce projet ? Vous pourrez le restaurer plus tard.','Dieses Projekt archivieren? Es kann später wiederhergestellt werden.','¿Archivar este proyecto? Podrá restaurarlo después.','Archiviare questo progetto? Potrai ripristinarlo in seguito.'],
+    quotaProjectAdvice: ['Your active-project limit has been reached. Archive or delete a project to create another.','Votre limite de projets actifs est atteinte. Archivez ou supprimez un projet pour en créer un autre.','Ihr Limit aktiver Projekte ist erreicht. Archivieren oder löschen Sie ein Projekt, um ein weiteres zu erstellen.','Se alcanzó el límite de proyectos activos. Archive o elimine un proyecto para crear otro.','Hai raggiunto il limite di progetti attivi. Archivia o elimina un progetto per crearne un altro.'],
+    viewProjects: ['View projects','Voir les projets','Projekte ansehen','Ver proyectos','Vedi progetti'],
+    projectActions: ['Project actions','Actions sur le projet','Aktionen für das Projekt','Acciones del proyecto','Azioni sul progetto'],
+    rename: ['Rename','Renommer','Umbenennen','Cambiar nombre','Rinomina'],
+    dictate: ['Dictate','Dicter','Diktieren','Dictar','Dettare'],
+    voiceUnavailable: ['Voice is not available on this installation.','La voix n’est pas disponible sur cette installation.','Sprache ist auf dieser Installation nicht verfügbar.','La voz no está disponible en esta instalación.','La voce non è disponibile su questa installazione.']
+  };
+  for (const [key, values] of Object.entries(additional)) { keys.push(key); Object.keys(rows).forEach((language, index) => rows[language].push(values[index])); }
+  window.atlasProjectLocale = { keys, rows, language() {
+    return (localStorage.getItem('locale') || localStorage.getItem('atlas-ui-language') || navigator.language || 'en').replaceAll('"', '').split('-')[0];
+  }, text(key) {
+    const index = keys.indexOf(key), row = rows[this.language()] || rows.en;
+    return index < 0 ? key : row[index];
+  }};
+})();

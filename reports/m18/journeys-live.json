@@ -1,0 +1,33 @@
+{
+  "mode": "live",
+  "resumed_same_session_exchanges": true,
+  "image_mode": "live",
+  "web_mode": "live",
+  "J1_plain_answer": true,
+  "J1_language_match": true,
+  "J2_citation_resolvable": true,
+  "J3_image_described": true,
+  "J3_language_match": true,
+  "J4_image_returned": true,
+  "J5_memory_shared": true,
+  "J5_projects_isolated": true,
+  "J6_tools_used": true,
+  "J6_final_answer": true,
+  "J7_auxiliary_ok": true,
+  "J9_followup_after_rag": true,
+  "j14_prompt": "Cr\u00e9e une image d'un lapin qui saute avec un h\u00e9risson, tous deux portant des bottes orange et des bonnets violets.",
+  "j14_rewritten_prompt": "Subjects: A rabbit and a hedgehog jumping together.\nAttributes: Both subjects are wearing orange boots and purple beanies.\nScene: A dynamic setting suitable for jumping.\nStyle: Vibrant and playful illustration.",
+  "j14_seed": 1079227799,
+  "j14_image": "http://localhost:8020/images/000000000000000000000000000003e9",
+  "j14_constraints_detail": {
+    "animals_jumping": true,
+    "orange_boots": true,
+    "purple_beanies": true
+  },
+  "j14_constraints_met": 3,
+  "J14_settings_applied": true,
+  "J10_iterate_on_image": true,
+  "J11_edit_intent_honest": true,
+  "J12_web_retry": true,
+  "J13_labels_fixed": true
+}

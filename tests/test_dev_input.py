@@ -1,0 +1,320 @@
+"""Stateless history translations preserve user code and reject unsupported features."""
+
+import json
+from typing import Any
+import unittest
+from services.orchestrator.dev_input import responses, messages
+
+
+class DevInputTests(unittest.TestCase):
+    def test_responses_history_functions_and_metadata(self) -> None:
+        payload: dict[str, Any] = {
+            "model": "atlas-code",
+            "instructions": "Read code.",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "developer",
+                    "content": [{"type": "input_text", "text": "héllo"}],
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "c1",
+                    "name": "read",
+                    "arguments": "{}",
+                },
+                {"type": "function_call_output", "call_id": "c1", "output": "code"},
+            ],
+            "tools": [
+                {"type": "function", "name": "read", "parameters": {"type": "object"}}
+            ],
+            "tool_choice": {"type": "function", "name": "read"},
+            "store": False,
+            "reasoning": {"effort": "none"},
+            "client_metadata": {"user_id": "untrusted"},
+        }
+        request = responses(payload)
+        self.assertEqual(request.messages[1].content, "héllo")
+        self.assertEqual(request.messages[-1].tool_call_id, "c1")
+        self.assertEqual(request.messages[-1].content, "code")
+        self.assertNotIn("untrusted", request.model_dump_json())
+        # Codex grows a turn description in client_metadata during long sessions.
+        long_turn = {"x-codex-turn-metadata": "t" * 4096}
+        self.assertNotIn(
+            "tttt",
+            responses(payload | {"client_metadata": long_turn}).model_dump_json(),
+        )
+        with self.assertRaises(ValueError):
+            responses(payload | {"metadata": {"note": "m" * 1025}})
+        with self.assertRaises(ValueError):
+            responses(payload | {"client_metadata": {"turn": "t" * 65537}})
+        extra: dict[str, Any]
+        # Nothing is stored (owner decision 2026-11-02): chaining, conversations and
+        # background runs are refused by name; store: true and include are accepted.
+        from services.orchestrator.dev_input import StorageRefusal
+
+        for extra in (
+            {"previous_response_id": "private"},
+            {"conversation": "conv_1"},
+            {"background": True},
+        ):
+            with self.assertRaises(StorageRefusal):
+                responses(payload | extra)
+        # Stored prompt templates and item references need storage too.
+        for extra in (
+            {"prompt": {"id": "pmpt_fictional", "version": "2"}},
+            {"input": [{"type": "item_reference", "id": "msg_fictional"}]},
+        ):
+            with self.assertRaises(StorageRefusal) as refused:
+                responses(payload | extra)
+            self.assertIn("does not store", str(refused.exception))
+        # Hosted tools Atlas does not run are refused by name, never dropped.
+        from services.orchestrator.dev_input import SemanticFieldError
+
+        for kind in (
+            "file_search",
+            "image_generation",
+            "mcp",
+            "computer_use_preview",
+        ):
+            with self.assertRaises(SemanticFieldError) as tool_refused:
+                responses(payload | {"tools": [{"type": kind}]})
+            self.assertIn("unsupported tool: " + kind, str(tool_refused.exception))
+            self.assertNotIsInstance(tool_refused.exception, StorageRefusal)
+        # Code interpreter runs per call: a stored or missing container is refused by name.
+        for container in (None, {"type": "existing", "id": "cntr_x"}, "cntr_x"):
+            with self.assertRaises(SemanticFieldError) as container_refused:
+                responses(
+                    payload
+                    | {"tools": [{"type": "code_interpreter", "container": container}]}
+                )
+            self.assertIn("container", str(container_refused.exception))
+        for extra in ({"store": True}, {"include": ["web_search_call.action.sources"]}):
+            self.assertEqual(responses(payload | extra).model, "atlas-code")
+        with self.assertRaises(ValueError):
+            responses(payload | {"include": "not-a-list"})
+        self.assertEqual(
+            responses({"model": "atlas-code", "input": "short"}).messages[0].content,
+            "short",
+        )
+        self.assertEqual(
+            responses(payload | {"reasoning": {"summary": "auto"}}).reasoning_effort,
+            "none",
+        )
+
+    def test_long_agent_history_fits_the_raw_message_limit(self) -> None:
+        # Measured 2026-10-30: a Codex session of about 1250 small tool turns was
+        # refused with "measured length 1025; max_length 1024" on the message list.
+        from services.orchestrator.dev_chat import RawChatInput
+
+        items: list[dict[str, Any]] = [
+            {"type": "message", "role": "user", "content": "Start."}
+        ]
+        for index in range(1500):
+            items += [
+                {
+                    "type": "function_call",
+                    "call_id": f"c{index}",
+                    "name": "read",
+                    "arguments": "{}",
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": f"c{index}",
+                    "output": "ok",
+                },
+            ]
+        tools = [{"type": "function", "name": "read", "parameters": {"type": "object"}}]
+        parsed = responses({"model": "atlas-code", "input": items, "tools": tools})
+        raw = RawChatInput.model_validate(
+            parsed.model_dump(by_alias=True, exclude_none=True)
+            | {"model": "raw/public-routing"}
+        )
+        self.assertGreater(len(raw.messages), 1024)
+
+    def test_image_in_a_tool_output_becomes_a_text_placeholder(self) -> None:
+        # Reported 2026-10-31: a Codex worker printed a PNG screenshot into its tool
+        # output and the request failed with "invalid field; value_error".
+        from services.orchestrator.dev_input import IMAGE_OMITTED
+
+        items: list[dict[str, Any]] = [
+            {"type": "message", "role": "user", "content": "Check the page."},
+            {
+                "type": "function_call",
+                "call_id": "c1",
+                "name": "view",
+                "arguments": "{}",
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "c1",
+                "output": [
+                    {"type": "input_text", "text": "Screenshot saved."},
+                    {
+                        "type": "input_image",
+                        "image_url": "data:image/png;base64,iVBORw0KGgo=",
+                    },
+                ],
+            },
+        ]
+        tools = [{"type": "function", "name": "view", "parameters": {"type": "object"}}]
+        parsed = responses({"model": "atlas-code", "input": items, "tools": tools})
+        self.assertEqual(
+            parsed.messages[-1].content, "Screenshot saved.\n" + IMAGE_OMITTED
+        )
+        with self.assertRaises(ValueError):
+            responses(
+                {
+                    "model": "atlas-code",
+                    "input": items[:2]
+                    + [
+                        {
+                            "type": "function_call_output",
+                            "call_id": "c1",
+                            "output": [{"type": "audio"}],
+                        }
+                    ],
+                    "tools": tools,
+                }
+            )
+
+    def test_responses_drops_unknown_tools_and_invalid_namespaces(self) -> None:
+        payload: dict[str, Any] = {
+            "model": "atlas-code",
+            "input": "fictional",
+            "tools": [{"type": "web_search", "fictional_option": True}],
+        }
+        self.assertEqual(responses(payload).tools, [])
+        self.assertEqual(
+            responses(
+                payload
+                | {
+                    "tools": [
+                        {
+                            "type": "namespace",
+                            "name": "multi_agent_v1",
+                            "tools": [{"type": "custom", "name": "not_a_function"}],
+                        }
+                    ]
+                }
+            ).tools,
+            [],
+        )
+
+    def test_messages_history_errors_and_cache_hints(self) -> None:
+        payload: dict[str, Any] = {
+            "model": "atlas-code",
+            "max_tokens": 512,
+            "system": [
+                {
+                    "type": "text",
+                    "text": "Read code.",
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "tool_use", "id": "c1", "name": "read", "input": {}}
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "c1",
+                            "content": [{"type": "text", "text": "missing"}],
+                            "is_error": True,
+                        }
+                    ],
+                },
+            ],
+            "tools": [{"name": "read", "input_schema": {"type": "object"}}],
+            "tool_choice": {
+                "type": "tool",
+                "name": "read",
+                "disable_parallel_tool_use": True,
+            },
+            "output_config": {"effort": "high"},
+        }
+        request = messages(payload)
+        self.assertEqual(
+            json.loads(request.messages[-1].content or ""), {"tool_error": "missing"}
+        )
+        self.assertFalse(request.parallel_tool_calls)
+        # output_config.effort is applied; thinking budgets map to an effort level.
+        self.assertEqual(request.reasoning_effort, "high")
+        without = {k: v for k, v in payload.items() if k != "output_config"}
+        for thinking, effort in (
+            ({"type": "disabled"}, "none"),
+            ({"type": "adaptive"}, "medium"),
+            ({"type": "enabled", "budget_tokens": 1024}, "low"),
+            ({"type": "enabled", "budget_tokens": 10000}, "medium"),
+            ({"type": "enabled", "budget_tokens": 20000}, "high"),
+        ):
+            body = without | {"thinking": thinking, "max_tokens": 32000}
+            self.assertEqual(messages(body).reasoning_effort, effort)
+        extra: dict[str, Any]
+        for extra in (
+            {"thinking": {"type": "enabled", "budget_tokens": 512}},
+            {"thinking": {"type": "enabled", "budget_tokens": 10**6}},
+            {"thinking": {"type": "sometimes"}},
+            {"output_config": {"format": {}}},
+            {"metadata": {"tenant": "outside"}},
+            {"system": [{"type": "image"}]},
+            {"tool_choice": {"type": "other"}},
+            {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "tool_use", "id": "c", "name": "read", "input": {}}
+                        ],
+                    }
+                ]
+            },
+        ):
+            with self.assertRaises(ValueError):
+                messages(payload | extra)
+        self.assertEqual(
+            messages(
+                {
+                    "model": "atlas-code",
+                    "max_tokens": 1,
+                    "messages": [{"role": "user", "content": "hi"}],
+                }
+            )
+            .messages[0]
+            .content,
+            "hi",
+        )
+
+
+class NullOptionalFieldTests(unittest.TestCase):
+    def test_null_optional_fields_are_absent(self) -> None:
+        # Shape sent by Codex CLI 0.98: unset optional fields arrive as null.
+        chat = responses(
+            {
+                "model": "atlas-code",
+                "input": [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "Fictional task."}],
+                    }
+                ],
+                "reasoning": None,
+                "prompt_cache_key": None,
+                "tool_choice": "auto",
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "exec_command",
+                        "parameters": {"type": "object", "properties": {}},
+                    }
+                ],
+            }
+        )
+        self.assertEqual([t.function.name for t in chat.tools], ["exec_command"])

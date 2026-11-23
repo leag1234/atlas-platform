@@ -1,0 +1,129 @@
+# ATLAS_PROVIDER opts into providers.yaml through provider_settings.py; unset preserves these routes.
+# Routing source of truth. Identifiers come from the environment (.env),
+# never hard-coded elsewhere (docs/02 AC-ARC-4).
+task_classes:
+  chat_simple:
+    primary:  { provider: local,    model: "${LOCAL_MODEL}" }
+    fallback: { provider: scaleway, model: "${ESCALATION_MODEL}" }
+    max_cost_eur_per_call: 0.01
+  reasoning:
+    primary:  { provider: scaleway, model: "${ESCALATION_MODEL}" }
+    fallback: { provider: scaleway, model: "${ESCALATION_MODEL}" }
+    max_cost_eur_per_call: 0.05
+providers:
+  local:    { base_url: "${LOCAL_API_BASE}" }
+  scaleway: { base_url: "${SCW_GENERATIVE_BASE_URL}", api_key_env: "SCW_GENERATIVE_API_KEY" }
+# Source: Scaleway supported-models and pricing, consulted 2026-09-10.
+serverless:
+  text:
+    env: ESCALATION_MODEL
+    model: qwen3.5-397b-a17b
+    fallback: code
+    capabilities:
+      qwen3.5-397b-a17b: {context: 262144, tools: true, vision: true}
+  code:
+    env: CODE_MODEL
+    model: glm-5.2
+    fallback: text
+    capabilities:
+      glm-5.2: {context: 262144, tools: true, vision: false}
+  vision:
+    env: VISION_MODEL
+    model: gemma-4-26b-a4b-it
+    fallback: visionprevious
+    capabilities:
+      gemma-4-26b-a4b-it: {context: 262144, tools: true, vision: true, reasoning: false}
+      pixtral-12b-2409: {context: 131072, tools: true, vision: true, reasoning: false}
+  visionprevious:
+    env: VISION_PREVIOUS_MODEL
+    model: pixtral-12b-2409
+    fallback: vision
+    capabilities:
+      pixtral-12b-2409: {context: 131072, tools: true, vision: true, reasoning: false}
+  # Where named parts are drawn in a picture (labels of a CPU diagram, services/orchestrator/
+  # pictures): a call with an image and vision_role "locate". Spike round 25, 2026-11-13: this
+  # model placed every part of the test diagrams; the Mistral models returned guessed centres.
+  # Source: Scaleway supported models (Text, Code, Vision; 256k), read 2026-11-14.
+  locate:
+    env: LOCATE_MODEL
+    model: qwen3.6-35b-a3b
+    fallback: vision
+    capabilities:
+      qwen3.6-35b-a3b: {context: 262144, tools: false, vision: true, reasoning: false}
+  fast:
+    env: FAST_MODEL
+    model: deepseek-v4-flash-0731
+    fallback: text
+    capabilities:
+      deepseek-v4-flash-0731: {context: 256000, tools: true, vision: false}
+  embedding:
+    env: EMBEDDING_SERVERLESS_MODEL
+    model: qwen3-embedding-8b
+    capabilities:
+      qwen3-embedding-8b: {context: 32768, dimensions: 1024}
+
+public_profiles:
+  atlas-qwen: text
+  atlas-glm: code
+  atlas-deepseek: fast
+
+# Roles bound to their own provider preset (providers.yaml), merged into the serverless
+# policy only for profiles enabled by ATLAS_HIDDEN_PROFILES. Source: Mistral models API and
+# https://docs.mistral.ai/models/mistral-large-4-0, consulted 2026-11-06.
+hidden_roles:
+  mistral:
+    provider: mistral
+    env: MISTRAL_PROFILE_MODEL
+    model: mistral-large-4
+    fallback: code
+    capabilities:
+      mistral-large-4: {context: 1048576, tools: true, vision: false, reasoning_effort: low}
+
+hidden_profiles:
+  atlas-mistral: mistral
+
+# Pictures by code (services/orchestrator/pictures): the profile each step runs on, read by
+# the orchestrator so that no model name appears there. The painter writes four SVG drafts in
+# parallel (round 10 to 23 measurements: the hidden profile at reasoning "low"); the checklist
+# is one short JSON call on the fast public profile. A painter profile that is not enabled
+# (ATLAS_HIDDEN_PROFILES) leaves the picture chain off.
+picture_roles:
+  picture_painter: atlas-mistral
+  picture_checklist: atlas-deepseek
+  # Pictures on CPU (ATLAS_PICTURES_CPU=1): one JSON call turns the request into the fixed
+  # illustration prompt; the label anchors of a diagram use this profile with vision_role "locate".
+  picture_rewrite: atlas-deepseek
+  # A requested file (work_pictures.plan, deliverable_check): the pictures it needs and
+  # its check against the request, short JSON calls, reasoning off.
+  deliverable_plan: atlas-deepseek
+  # The routing decision of a plain chat turn (services/orchestrator/request_router.py):
+  # one short JSON call, reasoning off, on the fast profile; when it has not answered by
+  # half the bound (staging 2026-11-16: 6 of 107 calls got no first byte in 8 s), the
+  # retry profile is asked as well and the first decision wins.
+  request_router: atlas-deepseek
+  request_router_retry: atlas-qwen
+  # An answer or a file derived from a provided source, checked against it
+  # (services/orchestrator/source_faithfulness.py). The judge reads the whole source;
+  # faithfulness pilot of 2026-11-17 on this profile's model (routing default reasoning):
+  # 42/42 injected faults found, 0/72 false alarms, p50 27 s. A profile not enabled here
+  # falls back to the turn's own profile.
+  # The rewrite of the flagged sentences (2026-11-19, 27 confirmed findings of the larger set
+  # and of 6 long answers, each rewrite checked again by the judge): on the judge's profile
+  # (reasoning "low", the provider's least) p50 27 s, p95 73 s, 8 of 27 over its 45 s, 22
+  # corrected (17 within 45 s: a staging turn's rewrite timed out the same day); on this
+  # profile, reasoning off, p50 1.5 s, p95 2.6 s, 25 corrected, the 2 others still flagged
+  # by the judge. On the fast profile 23 corrected: it returned 2 added causal links unchanged.
+  source_faithfulness: atlas-mistral
+  source_faithfulness_rewrite: atlas-qwen
+  # The judge's model reasons at "low" at least (no "none" on this provider), p50 25-35 s.
+  # The same prompt on this profile, reasoning off, answers in p50 1-1.5 s and is the screen:
+  # a clean answer is done, a flagged one goes to the judge above, whose verdict is used.
+  # Since 2026-11-19 the judge confirms the flagged statements instead of reading the whole
+  # answer again: p50 9 s instead of 69 s on 48 outputs, 35/35 faults, 0/13 false alarms; on
+  # 6 long answers 12/12 faults in p50 12 s where the whole reading went over 60 s on all 6.
+  # The other public profiles, reasoning off, confirmed in p50 2-3 s but kept 2 and 4 of 13
+  # faithful outputs flagged. The cascade before that change (measurement 2026-11-17, pilot
+  # 66 outputs and 98 of the 264 of the larger set): screen alone 8 false alarms in 112
+  # faithful readings; screen then judge 0/80 false alarms, 41-42/42 and 39/42 faults found
+  # where the judge alone finds 42 and 40; faithful answers p50 1.0-1.6 s.
+  source_faithfulness_screen: atlas-glm

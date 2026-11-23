@@ -1,0 +1,374 @@
+/* REQ-PROJ-08: the host sidebar remains the navigation for both chat and projects. */
+.atlas-project {
+  --project-bg:#faf9f6; --project-card:#fffefa; --project-line:#e3e1db;
+  --project-ink:#1a1a18; --project-muted:#73716a; --project-accent:#c2410c; --project-hover:#f0eee8;
+  position:fixed; inset:0 0 0 260px; z-index:35; display:grid;
+  grid-template-columns:minmax(0,1fr) 310px; grid-template-rows:minmax(0,1fr) auto;
+  color:var(--project-ink); background:var(--project-bg); font:14px/1.55 Inter,ui-sans-serif,system-ui,sans-serif;
+}
+.atlas-project *, .atlas-project-dialog * {box-sizing:border-box;}
+.atlas-project [hidden] {display:none!important;}
+.atlas-project[data-view=projects] {grid-template-columns:minmax(0,1fr);}
+.atlas-project[data-view=projects] > .atlas-project-right {display:none;}
+.atlas-project-left {display:none;}
+.atlas-project[data-owned=true] {left:0; grid-template-columns:230px minmax(0,1fr) 310px;}
+.atlas-project[data-owned=true][data-view=projects] {grid-template-columns:230px minmax(0,1fr);}
+.atlas-project[data-owned=true] > .atlas-project-left {display:block; padding:24px 16px; background:var(--project-hover);border-right:1px solid var(--project-line);}
+.atlas-project-logo {width:115px;height:38px;object-fit:contain;margin-bottom:28px;}
+.atlas-project-center {min-width:0;min-height:0;overflow:auto;display:flex;flex-direction:column;padding:32px clamp(24px,4vw,64px);}
+.atlas-project[data-view=projects] .atlas-project-center {padding:64px clamp(24px,5vw,80px);}
+.atlas-project h1 {font-size:30px;line-height:1.2;letter-spacing:-.8px;font-weight:550;margin:0;}
+.atlas-project h2 {font-size:15px;font-weight:600;margin:0;}
+.atlas-project p {margin:8px 0;}
+.atlas-project button,.atlas-project select,.atlas-project input,.atlas-project textarea,.atlas-project-dialog input,.atlas-project-dialog button {
+  color:inherit;font:inherit;background:transparent;border:1px solid var(--project-line,#ddd);border-radius:9px;padding:8px 12px;
+}
+.atlas-project button {cursor:pointer;text-align:left;}
+.atlas-project button:hover {background:var(--project-hover);}
+.atlas-project button:disabled {opacity:.5;cursor:default;}
+.atlas-project :focus-visible,.atlas-project-nav-row :focus-visible {outline:2px solid var(--project-accent,#c2410c);outline-offset:3px;}
+.atlas-project .atlas-project-primary,.atlas-project [data-send] {background:var(--project-ink);color:var(--project-bg);border-color:var(--project-ink);font-weight:500;}
+.atlas-project .atlas-project-primary:hover,.atlas-project [data-send]:hover {background:var(--project-accent);border-color:var(--project-accent);color:white;}
+.atlas-project-page-heading {display:flex;align-items:center;justify-content:space-between;gap:20px;margin-bottom:32px;}
+.atlas-project-list-toolbar {display:flex;align-items:center;gap:12px;margin-bottom:28px;flex-wrap:wrap;}
+.atlas-project-tabs {display:flex;gap:24px;margin-right:auto;}
+.atlas-project-tabs button {border:0;border-radius:0;padding:10px 0;color:var(--project-muted);border-bottom:2px solid transparent;}
+.atlas-project-tabs [aria-selected=true] {color:var(--project-ink);border-bottom-color:var(--project-accent);}
+.atlas-project-list-toolbar select {font-size:13px;max-width:185px;}
+.atlas-project-grid {display:grid;grid-template-columns:repeat(auto-fill,minmax(min(260px,100%),1fr));gap:18px;align-content:start;}
+.atlas-project .atlas-project-card {background:var(--project-card);border:1px solid var(--project-line);border-radius:14px;padding:24px;min-height:185px;display:flex;flex-direction:column;gap:12px;box-shadow:0 2px 3px #00000002;transition:border-color .15s,box-shadow .15s;}
+.atlas-project .atlas-project-card:hover {border-color:var(--project-muted);box-shadow:0 5px 18px #00000006;}
+.atlas-project-card-top {display:flex;justify-content:space-between;gap:12px;width:100%;}
+.atlas-project-card h2 {font-size:18px;letter-spacing:-.2px;overflow-wrap:anywhere;}
+.atlas-project-card-menu {display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap;}
+.atlas-project-card-menu button {font-size:12px;padding:6px 9px;}
+.atlas-project-card p {font-size:14px;color:var(--project-muted);margin:0;}
+.atlas-project-card small {color:var(--project-muted);margin-top:auto;font-size:12px;}
+.atlas-project-lock {width:14px;height:12px;border:1.5px solid currentColor;border-radius:3px;font-size:0;position:relative;margin-top:7px;color:var(--project-muted);flex-shrink:0;}
+.atlas-project-lock:before {content:'';position:absolute;width:8px;height:7px;border:1.5px solid currentColor;border-bottom:0;border-radius:6px 6px 0 0;left:1.5px;top:-7px;}
+.atlas-project-empty {grid-column:1/-1;text-align:center;padding:60px 16px;color:var(--project-muted);}
+.atlas-project-heading {margin-bottom:28px;flex-shrink:0;}
+.atlas-project .atlas-project-breadcrumb {border:0;padding:0;color:var(--project-muted);font-size:13px;margin-bottom:28px;}
+.atlas-project-heading .atlas-project-page-heading {margin-bottom:12px;justify-content:flex-start;}
+.atlas-project-heading .atlas-project-page-heading button {border:0;padding:4px 8px;opacity:.6;}
+.atlas-project-description {color:var(--project-muted);}
+.atlas-project-composer {flex-shrink:0;border:1px solid var(--project-line);border-radius:18px;padding:16px;background:var(--project-card);box-shadow:0 3px 12px #00000006;}
+.atlas-project-composer textarea {width:100%;min-height:88px;max-height:240px;resize:vertical;border:0;padding:0;background:transparent;}
+.atlas-project-composer-tools {display:flex;align-items:center;gap:10px;}
+.atlas-project-composer-tools > button:first-child {border:0;font-size:22px;padding:0 6px;}
+.atlas-project-composer-tools .atlas-project-detail {margin-right:auto;}
+.atlas-project-detail {color:var(--project-muted);font-size:12px;overflow-wrap:anywhere;}
+.atlas-project-conversations {margin-top:48px;}
+.atlas-project-conversations h2 {margin-bottom:18px;}
+.atlas-project .atlas-project-conversation {display:flex;justify-content:space-between;align-items:center;gap:20px;border:0;border-bottom:1px solid var(--project-line);border-radius:0;width:100%;padding:18px 0;}
+.atlas-project-conversation small {color:var(--project-muted);font-size:12px;white-space:nowrap;}
+.atlas-project-conversations-heading {display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:18px;}
+.atlas-project-conversations .atlas-project-conversations-heading h2 {margin:0 auto 0 0;}
+.atlas-project-conversations-heading input {flex:1 1 180px;max-width:320px;min-width:0;}
+.atlas-project-conversation-row {display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;column-gap:12px;border-bottom:1px solid var(--project-line);}
+.atlas-project .atlas-project-conversation-row .atlas-project-conversation {border-bottom:0;}
+.atlas-project-conversation-snippet {grid-column:1 / -1;margin:-10px 0 14px;}
+.atlas-project-conversation-menu {position:relative;}
+.atlas-project-conversation-menu summary {list-style:none;cursor:pointer;padding:4px 10px;border-radius:8px;color:var(--project-muted);}
+.atlas-project-conversation-menu summary::-webkit-details-marker {display:none;}
+.atlas-project-conversation-menu .atlas-project-card-menu {position:absolute;right:0;top:100%;z-index:5;flex-direction:column;align-items:stretch;min-width:150px;padding:6px;background:var(--project-card);border:1px solid var(--project-line);border-radius:10px;box-shadow:0 3px 12px #00000014;}
+.atlas-project-right {border-left:1px solid var(--project-line);padding:32px 22px;overflow:auto;min-width:0;}
+.atlas-project-panels {display:grid;grid-template-columns:minmax(0,1fr);gap:20px;}
+.atlas-project-panel {min-width:0;padding-bottom:24px;border-bottom:1px solid var(--project-line);}
+.atlas-project-panel-heading {display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;}
+.atlas-project-panel-heading button {border:0;font-size:20px;padding:0 6px;}
+.atlas-project-panel textarea {width:100%;min-height:130px;resize:vertical;font-size:13px;border:0;padding:12px 0;}
+.atlas-project .atlas-project-drop {width:100%;border:1px dashed var(--project-line);padding:20px 12px;text-align:center;font-size:12px;color:var(--project-muted);margin-bottom:14px;}
+.atlas-project .atlas-project-drop.dragging {border-color:var(--project-accent);background:var(--project-hover);}
+.atlas-project-file {display:flex;align-items:center;gap:6px;min-width:0;margin-top:8px;}
+.atlas-project-file > button:first-child {border:0;padding:8px 0;overflow-wrap:anywhere;font-size:13px;flex:1;}
+.atlas-project-file-card {border:1px solid var(--project-line);border-radius:12px;padding:14px;display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin:14px 0;background:var(--project-card);}
+.atlas-project-file-card strong {font-weight:500;overflow-wrap:anywhere;flex:1;min-width:80px;}
+.atlas-project-file-type {font-size:10px;border:1px solid var(--project-line);padding:10px 5px;border-radius:5px;color:var(--project-accent);}
+.atlas-project-file-card > div {display:flex;gap:16px;align-items:center;}
+.atlas-project-file-card button,.atlas-project-file-card a {font-size:12px;text-decoration:none;}
+.atlas-project-file-card a:hover {text-decoration:underline;}
+.atlas-project-memory {font-size:13px;overflow-wrap:anywhere;}
+.atlas-project-history {flex:1;min-height:0;overflow:auto;overscroll-behavior:contain;margin-bottom:20px;}
+.atlas-project-turn {margin:0 auto 28px;max-width:800px;overflow-wrap:anywhere;}
+.atlas-project-turn > small {font-size:11px;color:var(--project-muted);}
+.atlas-project-turn pre,.atlas-project-event pre {white-space:pre-wrap;font:inherit;}
+.atlas-project-turn .question {background:var(--project-hover);padding:14px 18px;border-radius:14px;margin:12px 0 24px;}
+.atlas-project-turn a {text-decoration:underline;}
+.atlas-project-event {overflow-wrap:anywhere;font-size:13px;color:var(--project-muted);margin:10px 0;}
+.atlas-project-event > small {font-size:12px;}
+.atlas-project-approval {background:var(--project-card);border:1px solid var(--project-accent);border-radius:12px;padding:18px;color:var(--project-ink);margin:12px 0;}
+.atlas-project-approval button {margin:12px 8px 0 0;}
+.atlas-project-approval button:first-of-type {background:var(--project-ink);color:var(--project-bg);}
+.atlas-project-notice {grid-column:1/-1;color:var(--project-accent);font-size:13px;}
+.atlas-project-notice:not(:empty) {padding:8px 24px;border-top:1px solid var(--project-line);}
+/* Dialogs are appended to document.body, outside .atlas-project, so they carry their own theme variables. */
+.atlas-project-dialog {--project-bg:#faf9f6;--project-card:#fffefa;--project-line:#e3e1db;--project-ink:#1a1a18;--project-muted:#73716a;--project-accent:#c2410c;--project-hover:#f0eee8;position:fixed;inset:0;margin:auto;width:min(460px,90vw);height:fit-content;border:1px solid var(--project-line);border-radius:16px;padding:28px;background:var(--project-bg);color:var(--project-ink);}
+.atlas-project-dialog::backdrop {background:#0005;}
+.atlas-project-dialog label,.atlas-project-dialog input {display:block;width:100%;margin:14px 0;}
+.atlas-project-dialog button {margin-right:8px;cursor:pointer;}
+.atlas-project-move-menu {position:fixed;z-index:80;display:grid;gap:2px;min-width:220px;max-width:min(360px,90vw);max-height:70vh;overflow:auto;padding:6px;border:1px solid var(--project-line);border-radius:12px;background:var(--project-bg);color:var(--project-ink);box-shadow:0 12px 32px #0003;}
+.atlas-project-move-menu h2,.atlas-project-move-dialog h2 {font-size:13px;padding:6px 8px;color:var(--project-muted);}
+.atlas-project-move-menu input,.atlas-project-move-dialog input[type=search] {width:100%;margin:0 0 4px;padding:6px 8px;font-size:13px;}
+.atlas-project-move-menu button,.atlas-project-move-dialog form button {display:block;width:100%;border:0;border-radius:8px;padding:7px 8px;font-size:14px;text-align:left;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.atlas-project-move-menu button:hover,.atlas-project-move-dialog form button:hover {background:var(--project-hover);}
+.atlas-project-nav-row {display:flex;flex-wrap:wrap;align-items:center;gap:2px 6px;padding:4px 12px;}
+.atlas-project-nav-row button {background:transparent;color:inherit;border:0;cursor:pointer;border-radius:8px;padding:8px;font:inherit;}
+.atlas-project-nav-row button:first-child {flex:1;text-align:left;}
+/* Projects and + share the first line; Scheduled tasks takes its own line so no label is cut. */
+.atlas-project-nav-row button {white-space:nowrap;min-width:0;}
+.atlas-project-nav-row button:nth-child(3) {flex:1 0 100%;text-align:left;}
+.atlas-project-nav-row button:hover {background:#8882;}
+.atlas-project-sidebar-projects {margin-top:24px;}
+.atlas-project-host-projects {padding:4px 12px 10px;}
+.atlas-project-host-projects h2 {margin:8px 0 6px;padding:0 8px;color:var(--project-muted,#73716a);font-size:12px;text-transform:uppercase;letter-spacing:.04em;}
+.atlas-project-host-conversation {margin-left:12px;width:calc(100% - 12px)!important;font-size:13px;}
+.atlas-project-sidebar-projects h2 {margin:0 0 6px;padding:0 8px;color:var(--project-muted);font-size:12px;text-transform:uppercase;letter-spacing:.04em;}
+.atlas-project .atlas-project-sidebar-row,.atlas-project .atlas-project-sidebar-all {display:block;width:100%;border:0;padding:8px;border-radius:8px;overflow:hidden;text-align:left;text-overflow:ellipsis;white-space:nowrap;}
+.atlas-project .atlas-project-sidebar-row[aria-current=true] {background:var(--project-card);font-weight:600;}
+.atlas-project-sidebar-conversations {margin:2px 0 5px 12px;border-left:1px solid var(--project-line);}
+.atlas-project-sidebar-conversations .atlas-project-sidebar-row {font-size:13px;padding-left:10px;}
+.atlas-project .atlas-project-sidebar-all {margin-top:6px;color:var(--project-muted);}
+.atlas-project-thinking {display:flex;align-items:center;gap:7px;color:var(--project-muted);font-size:13px;margin:0 0 10px;}
+.atlas-project-thinking strong {color:var(--project-ink);}
+.atlas-project-thinking::before {content:'';width:8px;height:8px;border:2px solid var(--project-accent);border-right-color:transparent;border-radius:50%;animation:atlas-project-spin .8s linear infinite;}
+@keyframes atlas-project-spin {to {transform:rotate(360deg);}}
+.atlas-project-open .atlas-code-shell {display:none;}
+.atlas-project-failure {position:fixed;inset:auto 20px 20px;z-index:100;background:#fff5e9;color:#683315;padding:20px;border-radius:12px;}
+body.atlas-project-open.atlas-side-open .atlas-project {right:var(--atlas-side-width,45vw);grid-template-columns:minmax(0,1fr);}
+body.atlas-project-open.atlas-side-open .atlas-project-right {display:none;}
+body.atlas-project-open .atlas-side-pane {z-index:80;}
+html.dark .atlas-project {--project-bg:#242422;--project-card:#2c2c29;--project-line:#41413b;--project-ink:#edece8;--project-muted:#aaa99e;--project-accent:#e05a2b;--project-hover:#343430;}
+@media(prefers-color-scheme:dark) {html:not(.light) .atlas-project {--project-bg:#242422;--project-card:#2c2c29;--project-line:#41413b;--project-ink:#edece8;--project-muted:#aaa99e;--project-accent:#e05a2b;--project-hover:#343430;}}
+@media(max-width:1100px) {.atlas-project {grid-template-columns:minmax(0,1fr) 260px;} .atlas-project-center {padding:28px 24px;} .atlas-project[data-owned=true] {grid-template-columns:190px minmax(0,1fr) 260px;}}
+@media(max-width:760px) {
+  .atlas-project,.atlas-project[data-owned=true],.atlas-project[data-owned=true][data-view=projects] {left:0!important;top:56px;grid-template-columns:minmax(0,1fr);grid-template-rows:auto auto auto;overflow:auto;display:block;}
+  .atlas-project[data-owned=true] {top:0;}
+  .atlas-project[data-owned=true] > .atlas-project-left {display:none;}
+  .atlas-project-left .atlas-project-logo {width:100px;height:32px;margin:0 auto 0 0;}
+  .atlas-project-left > button {font-size:0;}
+  .atlas-project-center,.atlas-project[data-view=projects] .atlas-project-center {overflow:visible;padding:28px 20px;}
+  .atlas-project-page-heading {gap:12px;margin-bottom:24px;}
+  .atlas-project h1 {font-size:26px;}
+  .atlas-project-primary {font-size:12px!important;white-space:nowrap;padding:10px!important;}
+  .atlas-project-tabs {gap:20px;width:100%;}
+  .atlas-project-list-toolbar {gap:8px;}
+  .atlas-project-list-toolbar input {max-width:180px;}
+  .atlas-project-grid {grid-template-columns:minmax(0,1fr);}
+  .atlas-project .atlas-project-card {min-height:160px;padding:22px;}
+  .atlas-project-right {border-left:0;border-top:1px solid var(--project-line);overflow:visible;padding:24px 20px;}
+  .atlas-project-history {overflow:visible;}
+  .atlas-project[data-view=conversation] .atlas-project-composer {position:sticky;bottom:12px;}
+  .atlas-project-conversation {align-items:flex-start!important;flex-direction:column;gap:6px!important;}
+  body.atlas-project-open.atlas-side-open .atlas-project {right:0;}
+}
+body.atlas-project-open [data-atlas-project-host-main] {visibility:hidden;overflow:hidden;}
+body.atlas-project-enabled a[href^="/notes"],body.atlas-project-enabled a[href^="/workspace"],body.atlas-project-enabled #sidebar-folders-content {display:none!important;}
+/* Projects replace Open WebUI folders: the whole folders header row goes, its "+" included. The toggle sits in the row (Open WebUI 0.11) or in a heading inside it (0.13). */
+body.atlas-project-enabled :is(div:has(> [aria-controls="sidebar-folders-content"]),div:has(> * > [aria-controls="sidebar-folders-content"])) {display:none!important;}
+#sidebar [data-project-rail] {margin:6px auto;border:0;background:transparent;font-size:20px;cursor:pointer;}
+body.atlas-project-enabled #chat-container div:has(> div > [role=list] > button.waterfall) {display:none!important;}
+.atlas-project-admin {position:fixed;bottom:24px;right:24px;z-index:45;--project-bg:var(--atlas-bg,#faf9f6);--project-ink:var(--atlas-text,#1a1a18);--project-line:var(--atlas-border,#e3e1db);}
+.atlas-project-admin > button {border:1px solid var(--project-line);border-radius:9px;padding:10px 16px;background:var(--project-bg);color:var(--project-ink);cursor:pointer;}
+.atlas-project-admin .atlas-project-dialog {max-height:85vh;overflow:auto;}
+/* Override the host's generic rounded-form and composer rules in this surface. */
+#atlas-project .atlas-project-composer {border-radius:18px;background:var(--project-card);}
+#atlas-project .atlas-project-composer-tools {background:transparent;}
+/* Inside the chat host, project pages use the conversation panel colour. */
+#atlas-project {--project-bg:var(--atlas-chat-panel,#faf9f6);}
+html.dark #atlas-project {--project-bg:var(--atlas-chat-panel,#242422);}
+@media(prefers-color-scheme:dark) {html:not(.light) #atlas-project {--project-bg:var(--atlas-chat-panel,#242422);}}
+#atlas-project .atlas-project-right {background:var(--project-bg);}
+#atlas-project .atlas-project-mobile-header {display:none;}
+body.atlas-project-open #atlas-ui-selector {display:none;}
+@media(max-width:760px) {
+  #atlas-project {top:0;}
+  #atlas-project .atlas-project-mobile-header {position:sticky;top:0;z-index:3;display:flex;align-items:center;justify-content:space-between;height:56px;padding:10px 20px;background:var(--project-bg);border-bottom:1px solid var(--project-line);}
+  .atlas-project-mobile-header button {border:0;padding:0;}
+  .atlas-project-mobile-header img {width:100px;height:32px;object-fit:contain;}
+}
+.atlas-project-turn .answer {line-height:1.7;}
+.atlas-project-turn .answer :is(ul,ol) {padding-left:24px;list-style:revert;}
+.atlas-project-turn .answer li {margin:6px 0;}
+.atlas-project-turn .answer :is(h1,h2,h3) {font-size:1.15em;margin:20px 0 10px;font-weight:600;letter-spacing:0;}
+.atlas-project-turn .answer pre:has(code) {white-space:pre;overflow:auto;background:var(--project-hover);border-radius:10px;padding:16px;font:13px/1.6 ui-monospace,monospace;}
+.atlas-project-turn .answer table {display:block;overflow:auto;border-collapse:collapse;}
+.atlas-project-turn .answer :is(th,td) {border:1px solid var(--project-line);padding:8px 12px;}
+
+/* A single visible focus ring surrounds the composer, including keyboard focus. */
+.atlas-project .atlas-project-composer:focus-within {outline:2px solid var(--project-accent);outline-offset:2px;}
+.atlas-project .atlas-project-composer textarea:focus-visible {outline:none;box-shadow:none;}
+.atlas-project-list-toolbar input[type=search] {display:block;min-width:210px;flex:1;}
+#sidebar a[href="/"] {white-space:nowrap;}
+#sidebar a[href="/"] :is(span,div) {white-space:nowrap;}
+.atlas-project .atlas-project-search-button {width:44px;height:44px;font-size:24px;display:grid;place-items:center;padding:0;}
+
+/* Owner release 0.7: compact file controls and a single composer focus. */
+#atlas-project .atlas-project-file > button:first-child,
+#atlas-project .atlas-project-file-card strong {
+  min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; overflow-wrap:normal;
+}
+#atlas-project .atlas-project-right .atlas-project-file-card {display:grid;grid-template-columns:auto minmax(0,1fr);}
+#atlas-project .atlas-project-right .atlas-project-file-card > div {grid-column:1/-1;justify-content:flex-end;}
+#atlas-project [data-remove] {border:0;padding:3px 6px;flex:none;font-size:18px;opacity:0;}
+#atlas-project :is(.atlas-project-file,.atlas-project-file-card,.atlas-project-memory):hover [data-remove],
+#atlas-project [data-remove]:focus-visible {opacity:1;}
+@media(hover:none) {#atlas-project [data-remove] {opacity:1;}}
+#atlas-project .atlas-project-composer textarea,
+#atlas-project .atlas-project-composer textarea:focus,
+#atlas-project .atlas-project-composer textarea:focus-visible {outline:none!important;box-shadow:none!important;border:0!important;}
+#atlas-project .atlas-project-composer {box-shadow:none;}
+#atlas-project .atlas-project-disclosure {color:var(--project-muted);font-size:12px;font-weight:400;margin:12px 0;}
+#atlas-project .atlas-project-disclosure summary {cursor:pointer;font-weight:400;}
+#atlas-project .atlas-project-conversation span {overflow-wrap:normal;}
+
+/* Project summaries and deliverables share the host's spacing and link colour. */
+.atlas-project-card-description {display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;}
+#atlas-project .atlas-project-file-card {min-height:0;height:auto;align-content:start;align-self:start;}
+#atlas-project .atlas-project-file-card a {color:var(--atlas-accent,#1f7534);font-weight:500;}
+html.dark #atlas-project .atlas-project-file-card a {color:var(--atlas-accent,#8bd49a);}
+
+#atlas-project .atlas-project-right .atlas-project-file-card {grid-template-columns:auto minmax(0,1fr) auto;gap:8px;padding:12px;}
+#atlas-project .atlas-project-file-card > [data-remove] {grid-column:3;grid-row:1;}
+
+/* Scheduled tasks retain the panel's compact mobile flow. */
+.atlas-project-scheduled-task { padding: 12px 0; border-top: 1px solid var(--project-line); overflow-wrap: anywhere; }
+.atlas-project-task-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.atlas-project-task-actions button { min-height: 36px; }
+.atlas-project-task-dialog { width: min(520px, calc(100vw - 24px)); max-height: calc(100dvh - 24px); overflow-y: auto; box-sizing: border-box; }
+.atlas-project-task-dialog form { display: grid; gap: 12px; margin: 0; padding: 0; background: transparent; }
+.atlas-project-task-dialog h2 { margin: 0 0 4px; font-size: 18px; }
+.atlas-project-scheduled-task a { color: var(--project-accent); }
+.atlas-project-task-dialog button[type=submit] { background: var(--project-ink); color: var(--project-bg); }
+.atlas-project-task-dialog label { display: grid; gap: 5px; min-width: 0; margin: 0; }
+.atlas-project-task-dialog label[hidden] { display: none; }
+.atlas-project-task-dialog input, .atlas-project-task-dialog select, .atlas-project-task-dialog textarea { width: 100%; box-sizing: border-box; min-width: 0; margin: 0; }
+
+/* Global scheduled tasks use the same compact card rhythm as project cards. */
+#atlas-project[data-view=tasks] {grid-template-columns:minmax(0,1fr);}
+#atlas-project[data-view=tasks] > .atlas-project-right {display:none;}
+.atlas-project-task-grid {grid-template-columns:repeat(2,minmax(0,1fr));}
+.atlas-project-task-card {min-width:0;display:flex;flex-direction:column;align-items:flex-start;gap:10px;padding:20px;border:1px solid var(--project-line);border-radius:14px;background:var(--project-card);}
+.atlas-project-task-card h2 {font-size:17px;overflow-wrap:anywhere;}
+.atlas-project-task-card p {margin:0;}
+.atlas-project-task-title {border:0!important;padding:0!important;font-size:17px;font-weight:650;overflow-wrap:anywhere;}
+.atlas-project-task-project {max-width:100%;padding:3px 8px;border-radius:999px;background:var(--project-hover);font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.atlas-project-task-excerpt {display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2;overflow:hidden;color:var(--project-muted);line-height:1.45;}
+.atlas-project-task-card .atlas-project-task-actions {margin-top:auto;}
+.atlas-project-task-dot {display:inline-block;width:7px;height:7px;margin-right:6px;border-radius:50%;background:var(--project-accent);vertical-align:middle;}
+.atlas-project-task-banner {padding:10px 14px;border:1px solid var(--project-line);border-radius:10px;background:var(--project-hover);font-size:13px;}
+@media(max-width:760px) {.atlas-project-task-grid {grid-template-columns:minmax(0,1fr);}}
+/* Owner request 2026-11-10: the project UI uses the chat's design tokens (colours, font, bubbles), not a palette of its own. */
+.atlas-project, #atlas-project, html.dark .atlas-project, html.dark #atlas-project {
+  --project-bg:var(--atlas-chat-panel,var(--atlas-bg)); --project-card:var(--atlas-chat-panel,var(--atlas-bg)); --project-line:var(--atlas-border);
+  --project-ink:var(--atlas-text); --project-muted:var(--atlas-muted); --project-accent:var(--atlas-accent); --project-hover:var(--atlas-side);
+  font-family:var(--atlas-body-font); font-size:var(--atlas-ui-size);
+}
+/* Same frame as the chat's main panel: a rounded card with the same margins next to the sidebar. */
+#atlas-project { inset:14px 14px 14px calc(var(--atlas-sidebar-width,250px) + 28px); border-radius:var(--atlas-radius); overflow:hidden; }
+/* Conversation turns use the chat's message size; chrome keeps the interface size. */
+.atlas-project-turn { font-size:var(--atlas-body-size); }
+/* System dark mode follows the same tokens as the chat's dark theme. */
+@media(prefers-color-scheme:dark) { html:not(.light) .atlas-project, html:not(.light) #atlas-project { --project-bg:var(--atlas-chat-panel,var(--atlas-bg)); --project-card:var(--atlas-chat-panel,var(--atlas-bg)); --project-line:var(--atlas-border); --project-ink:var(--atlas-text); --project-muted:var(--atlas-muted); --project-accent:var(--atlas-accent); --project-hover:var(--atlas-side); } }
+/* Headings use the chat font instead of Inter. */
+.atlas-project :is(h1,h2,h3) { font-family:var(--atlas-font); }
+/* The user's message in a project looks like the chat's user bubble. */
+.atlas-project-turn .question { background:var(--atlas-user-bg)!important; color:var(--atlas-text); border-radius:var(--atlas-radius); }
+/* The project composer looks like the chat composer: same surface, border and radius. */
+#atlas-project .atlas-project-composer, .atlas-project-composer { background:var(--atlas-surface)!important; border-color:var(--atlas-border); border-radius:var(--atlas-composer-radius,26px); box-shadow:none; }
+/* Focus rings use the chat accent rather than the former project orange. */
+.atlas-project :focus-visible { outline-color:var(--atlas-accent); }
+/* Project dialogs live outside the project view (appended to the page body): they take the chat tokens too. */
+.atlas-project-dialog, html.dark .atlas-project-dialog { --project-bg:var(--atlas-bg); --project-card:var(--atlas-bg); --project-line:var(--atlas-border); --project-ink:var(--atlas-text); --project-muted:var(--atlas-muted); --project-accent:var(--atlas-accent); --project-hover:var(--atlas-side); background:var(--atlas-bg)!important; color:var(--atlas-text)!important; font-family:var(--atlas-body-font); }
+/* The project list in the chat sidebar sits outside the project view: one row per project, like the chat rows. */
+.atlas-project-host-projects .atlas-project-sidebar-row, .atlas-project-host-projects .atlas-project-sidebar-all { display:block; width:100%; border:0; margin:0; padding:7px 8px; border-radius:var(--atlas-radius-sm,8px); background:transparent; color:var(--atlas-text); font:inherit; font-size:14px; text-align:left; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; cursor:pointer; }
+.atlas-project-host-projects .atlas-project-sidebar-all { color:var(--atlas-muted); font-size:13px; }
+.atlas-project-host-projects .atlas-project-sidebar-row:hover, .atlas-project-host-projects .atlas-project-sidebar-all:hover { background:color-mix(in srgb, var(--atlas-text) 8%, transparent); }
+/* The open project, project conversation or task page is the selected row, exactly like a selected chat (same tokens as #sidebar a.selected in chat-ui.css);
+   !important wins over the sidebar's "#sidebar button { color:inherit }", which left black text on the accent (owner report 2026-11-13). */
+.atlas-project-host-projects .atlas-project-sidebar-row[aria-current=page] { background:var(--atlas-row-selected-bg,var(--atlas-accent))!important; color:var(--atlas-row-selected-fg,var(--atlas-on-accent))!important; font-weight:inherit; }
+/* A project whose conversation is open is the current location: bold, not a second selected pill. */
+.atlas-project-host-projects .atlas-project-sidebar-row[aria-current=true] { font-weight:600; }
+/* Dark dialogs take the raised chat surface, not the page black. */
+html.dark .atlas-project-dialog { background:var(--atlas-surface)!important; }
+html.dark .atlas-project-dialog input, html.dark .atlas-project-dialog button { background:var(--atlas-bg); color:var(--atlas-text); border-color:var(--atlas-border); }
+/* With a project page open, the last native chat is no longer current: it loses its highlight. */
+body:has(> #atlas-project) #sidebar :is(a.selected,.selected:has(> a)) { background:transparent!important; color:var(--atlas-text)!important; }
+body:has(> #atlas-project) #sidebar :has(> a.selected,> .selected > a) :is(button,button svg) { color:var(--atlas-muted)!important; }
+/* The project send control matches the chat composer: a round arrow button; Stop only shows while a turn runs. */
+#atlas-project .atlas-project-composer-tools [data-send] { width:34px; height:34px; min-width:34px; padding:0; border:0; border-radius:50%; display:inline-flex; align-items:center; justify-content:center; background:var(--atlas-text); color:var(--atlas-bg); }
+#atlas-project .atlas-project-composer-tools [data-send] svg { width:18px; height:18px; }
+#atlas-project .atlas-project-composer-tools [data-send]:disabled { opacity:.3; cursor:default; }
+#atlas-project .atlas-project-composer-tools [data-stop]:disabled { display:none; }
+/* Phone project header: the sidebar button sits before the logo, like the chat header; the opened sidebar stays above the project view. */
+.atlas-project-mobile-header .atlas-project-sidebar-open { display:inline-flex; align-items:center; justify-content:center; width:36px; height:36px; margin-right:6px; padding:0; border:0; border-radius:10px; background:transparent; color:var(--atlas-text); }
+@media (max-width: 767px) { body:has(> #atlas-project) #sidebar[aria-hidden="false"] { z-index:60!important; } }
+/* Project title row on a phone: the title wraps, the action buttons never break inside a word. */
+#atlas-project .atlas-project-page-heading { flex-wrap:wrap; row-gap:6px; }
+#atlas-project .atlas-project-page-heading > button { white-space:nowrap; flex-shrink:0; }
+/* With the side view open, the project view ends where the side view starts (the earlier frame rule pinned its right edge under it, hiding the send button). */
+body.atlas-project-open.atlas-side-open #atlas-project { right:calc(var(--atlas-side-width,45vw) + 14px); grid-template-columns:minmax(0,1fr); }
+/* Notices are plain information; only failures take the accent colour. */
+.atlas-project-notice { color:var(--atlas-muted); }
+.atlas-project-notice span { color:var(--atlas-accent); }
+/* The project microphone is the same round control as the chat composer's. */
+#atlas-project .atlas-project-composer-tools [data-voice] { width:34px; height:34px; min-width:34px; padding:0; border:0; border-radius:50%; display:inline-flex; align-items:center; justify-content:center; background:var(--atlas-border); color:var(--atlas-text); }
+#atlas-project .atlas-project-composer-tools [data-voice][hidden] { display:none; }
+#atlas-project .atlas-project-composer-tools [data-voice][aria-pressed=true] { background:var(--atlas-accent); color:var(--atlas-on-accent); }
+/* Confirmation dialog: the question, what it applies to, then the two answers. */
+.atlas-project-confirm h2 { margin:0 0 8px; font-size:16px; font-weight:600; line-height:1.4; }
+.atlas-project-confirm p { margin:0 0 4px; color:var(--atlas-muted); overflow-wrap:anywhere; }
+.atlas-project-dialog-actions { display:flex; gap:8px; margin-top:20px; }
+.atlas-project-dialog-actions [data-confirm] { background:var(--atlas-text)!important; color:var(--atlas-bg)!important; border-color:var(--atlas-text)!important; }
+/* A failure raised from a dialog is shown inside it. */
+.atlas-project-dialog-error { margin:12px 0 0; color:var(--atlas-accent); font-size:13px; }
+/* Dark move dialog on a phone: its project rows are list entries, not filled buttons (they showed as black bars). */
+html.dark .atlas-project-move-dialog form button, html.dark .atlas-project-move-menu button { background:transparent; border-color:transparent; }
+html.dark .atlas-project-move-dialog form button:hover, html.dark .atlas-project-move-menu button:hover { background:color-mix(in srgb, var(--atlas-text) 8%, transparent); }
+/* The project composer has no resize grip, like the chat composer (Firefox and WebKit drew one). */
+#atlas-project .atlas-project-composer textarea { resize:none; }
+/* Project surfaces appended to the page body (the move menu, row menus, dialogs) sit outside .atlas-project and #atlas-project:
+   the project tokens are defined on the root too, so none of them resolves to an empty value. The move menu had no
+   background at all and the conversation behind it showed through its entries (owner report 2026-11-13). */
+html { --project-bg:var(--atlas-bg); --project-card:var(--atlas-bg); --project-line:var(--atlas-border); --project-ink:var(--atlas-text); --project-muted:var(--atlas-muted); --project-accent:var(--atlas-accent); --project-hover:var(--atlas-side); }
+/* Menus over the chat use the raised surface in dark mode, like the native menus. */
+html.dark .atlas-project-move-menu, html.dark .atlas-project-row-menu { background:var(--atlas-surface); }
+/* The move menu is a column: its heading stays in place and only the project list scrolls. */
+.atlas-project-move-menu { display:flex; flex-direction:column; gap:0; overflow:hidden; }
+.atlas-project-move-menu h2 { flex:none; margin:0; line-height:1.4; }
+.atlas-project-move-menu .atlas-project-move-form { flex:1 1 auto; min-height:0; overflow:auto; display:flex; flex-direction:column; gap:2px; margin:0; padding:0; }
+.atlas-project-move-menu .atlas-project-move-form > * { flex:none; }
+/* A project row in the chat sidebar holds its "..." control at its right end, like a chat row. */
+.atlas-project-host-projects .atlas-project-sidebar-item { position:relative; }
+.atlas-project-host-projects .atlas-project-sidebar-item > .atlas-project-sidebar-row { padding-right:34px; }
+.atlas-project-host-projects .atlas-project-sidebar-menu-button { position:absolute; top:50%; right:4px; transform:translateY(-50%); display:inline-flex; align-items:center; justify-content:center; width:26px; height:26px; margin:0; padding:0; border:0; border-radius:6px; background:transparent; color:var(--atlas-muted)!important; opacity:0; cursor:pointer; }
+/* Shown on hover, keyboard focus, while its menu is open, and on the selected row. */
+.atlas-project-host-projects .atlas-project-sidebar-item:is(:hover,:focus-within) .atlas-project-sidebar-menu-button, .atlas-project-host-projects .atlas-project-sidebar-menu-button[aria-expanded=true] { opacity:1; }
+.atlas-project-host-projects .atlas-project-sidebar-menu-button:hover { background:color-mix(in srgb, var(--atlas-text) 8%, transparent); }
+.atlas-project-host-projects .atlas-project-sidebar-item:has(> [aria-current=page]) .atlas-project-sidebar-menu-button { opacity:1; color:var(--atlas-row-selected-fg,var(--atlas-on-accent))!important; }
+/* Touch screens have no hover: the control stays visible. */
+@media (hover:none),(pointer:coarse) { .atlas-project-host-projects .atlas-project-sidebar-menu-button { opacity:1; } }
+/* The project row menu looks like the native chat row menu. */
+.atlas-project-row-menu { position:fixed; z-index:80; display:flex; flex-direction:column; gap:1px; min-width:180px; max-width:min(320px,90vw); padding:4px; border:1px solid var(--atlas-border); border-radius:12px; background:var(--atlas-bg); color:var(--atlas-text); box-shadow:0 12px 32px #0003; font-family:var(--atlas-body-font); font-size:14px; }
+.atlas-project-row-menu button { display:block; width:100%; margin:0; padding:7px 10px; border:0; border-radius:8px; background:transparent; color:inherit; font:inherit; text-align:left; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; cursor:pointer; }
+.atlas-project-row-menu button:is(:hover,:focus-visible) { background:color-mix(in srgb, var(--atlas-text) 8%, transparent); outline:none; }
+/* Generated images of a conversation moved from the chat stay inline in the project, within the reading column. */
+.atlas-project-turn .answer img { display:block; max-width:100%; height:auto; margin:10px 0; border-radius:var(--atlas-radius-sm,8px); }
+/* A project's conversations sit one step in under it, like the chats of an Open WebUI folder (the generic row margin removed the indent). */
+.atlas-project-host-projects .atlas-project-host-conversation { margin-left:12px; }
+/* The project pane shows its loading state at once, centred in the empty pane, until the content arrives. */
+.atlas-project-loading { display:flex; align-items:center; justify-content:center; gap:10px; flex:1; min-height:160px; color:var(--atlas-muted); font-size:var(--atlas-ui-size,14px); }
+.atlas-project-loading-mark { width:16px; height:16px; border:2px solid var(--atlas-border); border-top-color:var(--atlas-accent); border-radius:50%; animation:atlas-project-spin .8s linear infinite; }
+@media (prefers-reduced-motion:reduce) { .atlas-project-loading-mark { animation:none; } }
+/* The phone move dialog is a menu: the same rows as the desktop menu, the heading fixed, only the list scrolling. */
+.atlas-project-dialog.atlas-project-move-dialog { display:flex; flex-direction:column; width:min(360px,calc(100vw - 32px)); max-height:min(70dvh,560px); padding:6px; border-radius:14px; overflow:hidden; }
+.atlas-project-dialog.atlas-project-move-dialog:not([open]) { display:none; }
+.atlas-project-move-dialog h2 { flex:none; margin:0; line-height:1.4; }
+.atlas-project-move-dialog .atlas-project-move-form { flex:1 1 auto; min-height:0; overflow:auto; display:flex; flex-direction:column; gap:2px; margin:0; padding:0; border:0; border-radius:0; box-shadow:none; }
+.atlas-project-move-dialog .atlas-project-move-form > * { flex:none; }
+.atlas-project-move-dialog .atlas-project-move-form button { margin:0; min-height:44px; }
+.atlas-project-move-dialog input[type=search] { margin:0 0 4px; border:0; border-bottom:1px solid var(--atlas-border); border-radius:0; background:transparent; }
+.atlas-project-move-dialog > button { flex:none; align-self:flex-end; margin:6px; }
+/* Before the project view is mounted, the same frame holds its loading state over the starting chat shell. */
+.atlas-project-pending { position:fixed; z-index:35; inset:14px 14px 14px calc(var(--atlas-sidebar-width,250px) + 28px); display:flex; border-radius:var(--atlas-radius,20px); background:var(--atlas-chat-panel,var(--atlas-bg)); color:var(--atlas-text); }
+@media (max-width:767px) { .atlas-project-pending { inset:0; border-radius:0; } }

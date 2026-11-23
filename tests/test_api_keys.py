@@ -1,0 +1,1225 @@
+"""REQ-KEY-01..06: credentials, atomic quotas, membership and browser separation."""
+
+import concurrent.futures
+from collections.abc import AsyncIterator
+from datetime import datetime, timezone
+from decimal import Decimal
+import json
+import os
+from pathlib import Path
+import sqlite3
+import tempfile
+import unittest
+from unittest.mock import patch
+from typing import Any
+
+from fastapi.testclient import TestClient
+from services.orchestrator.api_keys import (
+    MAX_CALL_RESERVATION,
+    Store,
+    KeyQuotaError,
+)
+from packages.limits import LimitError
+from services.orchestrator.api_key_edge import key_call, ModelAccounting
+from services.orchestrator.api_key_admin import app as admin_app
+from services.orchestrator.chat_api import app
+from services.orchestrator.daily_budget import BudgetRefusal, DailyLedger
+from services.orchestrator.dev_auth import Store as DeveloperStore, provision
+from services.orchestrator.devapi import app as dev_app
+
+
+class KeyTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.now = [1800000000.0]
+        self.store = Store(
+            self.root / "keys.sqlite", "test-pepper-" * 4, lambda: self.now[0]
+        )
+        self.enterContext(
+            patch.dict(
+                os.environ,
+                {
+                    "ATLAS_API_KEYS_DB": str(self.store.path),
+                    "ATLAS_API_KEY_PEPPER": "test-pepper-" * 4,
+                    "ATLAS_API_KEY_ADMIN_TOKEN": "test-admin-" * 4,
+                    "ATLAS_DATA_DIR": str(self.root),
+                    "ATLAS_INTERACTION_DIR": str(self.root / "chat-log"),
+                    "ATLAS_USER_DAILY_EUR": "10",
+                    "ATLAS_GLOBAL_DAILY_EUR": "20",
+                    "ATLAS_PROJECT_MODE": "0",
+                    "ATLAS_PROJECT_DSN": "",
+                },
+            )
+        )
+        self.enterContext(
+            patch(
+                "services.orchestrator.api_key_edge.configured_store",
+                return_value=self.store,
+            )
+        )
+        self.enterContext(
+            patch(
+                "services.orchestrator.api_key_admin.configured_store",
+                return_value=self.store,
+            )
+        )
+
+    def create(self, **overrides: Any) -> tuple[dict[str, Any], str]:
+        return self.store.create(
+            **(
+                dict(
+                    org_id="test-org",
+                    member_id="test-member",
+                    subject="tester@example.invalid",
+                    budget_user="webui-test-id",
+                    name="integration",
+                    scopes=["assistant"],
+                    created_by="operator",
+                )
+                | overrides
+            )
+        )
+
+    def test_policy_defaults_by_instance_type(self) -> None:
+        self.assertEqual(
+            self.store.policy("test-org"),
+            {
+                "mode": "admin_only",
+                "daily_requests": None,
+                "daily_micro_eur": 2000000,
+                "weekly_micro_eur": None,
+                "max_lifetime_days": 365,
+                "active_key_limit": 5,
+            },
+        )
+        with patch.dict(os.environ, {"ATLAS_STABLE": "1"}):
+            self.assertEqual(
+                self.store.policy("test-org"),
+                {
+                    "mode": "self_service",
+                    "daily_requests": None,
+                    "daily_micro_eur": None,
+                    "weekly_micro_eur": 100000000,
+                    "max_lifetime_days": 90,
+                    "active_key_limit": 5,
+                },
+            )
+
+    def test_stable_self_service_key_uses_weekly_own_budget(self) -> None:
+        with patch.dict(os.environ, {"ATLAS_STABLE": "1"}):
+            row, _ = self.create(
+                browser_policy=True,
+                lifetime_days=21,
+                administrator=False,
+            )
+        self.assertIsNone(row["daily_requests"])
+        self.assertIsNone(row["daily_micro_eur"])
+        self.assertEqual(row["weekly_micro_eur"], 100000000)
+        self.assertTrue(row["own_budget"])
+        self.assertEqual(row["expires_at"] - row["created_at"], 21 * 86400)
+
+    def test_code_execution_daily_limit_is_atomic(self) -> None:
+        row, _ = self.create()
+        request_id = self.store.reserve(row["id"], 1000)
+        self.store.count_code_execution(request_id, 1)
+        with self.assertRaises(LimitError):
+            self.store.count_code_execution(request_id, 1)
+        with self.store.connection() as db:
+            self.assertEqual(
+                db.execute(
+                    "SELECT code_executions FROM api_key_requests WHERE id=?",
+                    (request_id,),
+                ).fetchone()[0],
+                1,
+            )
+
+    def test_key_privacy_setting_is_persisted_and_resolved(self) -> None:
+        row, key = self.create(privacy="strict")
+        self.assertEqual(row["privacy"], "strict")
+        self.assertEqual(self.store.resolve(key, "192.0.2.1").privacy, "strict")
+
+    def test_strict_privacy_header_returns_explicit_403(self) -> None:
+        _, key = self.create(scopes=["model"])
+        with TestClient(app) as client:
+            reply = client.post(
+                "/api/atlas/v1/chat/completions",
+                headers={"Authorization": "Bearer " + key, "X-Atlas-Privacy": "strict"},
+                json={
+                    "model": "atlas-code",
+                    "messages": [{"role": "user", "content": "Hello"}],
+                },
+            )
+        # A permanent policy refusal: 403, so that SDKs do not retry it as an outage.
+        self.assertEqual(reply.status_code, 403, reply.text)
+        self.assertEqual(reply.json()["error"]["type"], "strict_privacy_unavailable")
+
+    def test_strict_privacy_key_setting_returns_explicit_403(self) -> None:
+        _, key = self.create(scopes=["model"], privacy="strict")
+        with TestClient(app) as client:
+            reply = client.post(
+                "/api/atlas/v1/chat/completions",
+                headers={"Authorization": "Bearer " + key},
+                json={
+                    "model": "atlas-code",
+                    "messages": [{"role": "user", "content": "Hello"}],
+                },
+            )
+        # A permanent policy refusal: 403, so that SDKs do not retry it as an outage.
+        self.assertEqual(reply.status_code, 403, reply.text)
+        self.assertEqual(reply.json()["error"]["type"], "strict_privacy_unavailable")
+
+    def test_hash_expiry_revocation_metadata_and_permissions(self) -> None:
+        row, key = self.create()
+        self.assertRegex(row["prefix"], r"^atl_[0-9a-f]{8}$")
+        self.assertTrue(key.startswith(row["prefix"] + "_"))
+        self.assertNotIn(key.encode(), self.store.path.read_bytes())
+        self.assertNotIn("hash", row)
+        self.assertEqual(row["expires_at"] - row["created_at"], 90 * 86400)
+        principal = self.store.resolve(key, "192.0.2.123")
+        self.assertEqual(principal.budget_user, "webui-test-id")
+        updated = self.store.get(principal.id)
+        self.assertEqual(updated["last_used_ip_prefix"], "192.0.2.0/24")
+        self.assertEqual(updated["last_used_at"], int(self.now[0]))
+        self.assertEqual(self.store.path.stat().st_mode & 0o777, 0o600)
+        wrong = Store(self.store.path, "other-test-pepper-" * 3)
+        with self.assertRaises(PermissionError):
+            wrong.resolve(key)
+        for kwargs in (
+            {"lifetime_days": 0},
+            {"lifetime_days": 366},
+            {"scopes": ["connectors"]},
+            {"daily_requests": 0},
+        ):
+            with self.assertRaises(ValueError):
+                self.create(**kwargs)
+        self.now[0] = float(row["expires_at"])
+        with self.assertRaises(PermissionError):
+            self.store.resolve(key)
+        self.now[0] -= 1
+        self.store.revoke(principal.id)
+        with self.assertRaises(PermissionError):
+            self.store.resolve(key)
+        with self.store.connection() as db:
+            audit = [dict(r) for r in db.execute("SELECT * FROM api_key_audit")]
+        self.assertTrue(
+            {"create", "revoke", "failure"}.issubset({r["event"] for r in audit})
+        )
+        self.assertNotIn(key, json.dumps(audit))
+
+    def test_atomic_request_and_money_quotas_unknown_and_next_day(self) -> None:
+        row, _ = self.create(daily_requests=1, daily_micro_eur=100000)
+
+        def reserve(_: int) -> str:
+            try:
+                return self.store.reserve(row["id"], 100000)
+            except KeyQuotaError:
+                return "rejected"
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+            results = list(pool.map(reserve, range(6)))
+        self.assertEqual(results.count("rejected"), 5)
+        request_id = next(r for r in results if r != "rejected")
+        self.store.finish(request_id, None)
+        self.assertEqual(self.store.usage(row["id"])["unknown_micro_eur"], 100000)
+        with self.assertRaises(ValueError):
+            self.store.finish(request_id, 0)
+        self.now[0] += 86400
+        request_id = self.store.reserve(row["id"], 100000)
+        self.store.finish(request_id, 500)
+        with self.store.connection() as db:
+            self.assertEqual(
+                db.execute("SELECT COUNT(*) FROM api_key_daily_summary").fetchone()[0],
+                2,
+            )
+        row, _ = self.create(daily_micro_eur=99999)
+        with self.assertRaises(KeyQuotaError) as caught:
+            self.store.reserve(row["id"], 100000)
+        self.assertEqual(caught.exception.values["daily_micro_eur"], 99999)
+
+    def test_no_request_cap_by_default_only_spending_caps(self) -> None:
+        # Owner decision 2026-11-19: keys carry spending caps only; the request
+        # count never refuses a call unless a cap was set explicitly on the key.
+        row, _ = self.create(daily_micro_eur=1000000, weekly_micro_eur=None)
+        self.assertIsNone(row["daily_requests"])
+        for _ in range(250):
+            self.store.finish(self.store.reserve(row["id"], 1000), 1000)
+        usage = self.store.usage(row["id"])
+        self.assertEqual(usage["requests"], 250)
+        self.assertNotIn("daily_requests", usage)
+        self.assertEqual(usage["daily_micro_eur"], 1000000)
+        # The spending cap still refuses, and the refusal names no request cap.
+        with self.assertRaises(KeyQuotaError) as caught:
+            self.store.reserve(row["id"], 800000)
+        self.assertNotIn("daily_requests", caught.exception.values)
+        self.assertEqual(caught.exception.values["requests"], 250)
+        self.assertEqual(caught.exception.values["daily_micro_eur"], 1000000)
+        # Browser self-service keys follow the policy, which has no request cap.
+        for stable in ("0", "1"):
+            with patch.dict(os.environ, {"ATLAS_STABLE": stable}):
+                self.assertIsNone(self.store.policy("test-org")["daily_requests"])
+                browser, _ = self.create(
+                    member_id="member-" + stable,
+                    browser_policy=True,
+                    administrator=True,
+                    lifetime_days=30,
+                )
+            self.assertIsNone(browser["daily_requests"])
+
+    def test_explicit_request_cap_is_still_enforced_and_reported(self) -> None:
+        row, _ = self.create(daily_requests=2, daily_micro_eur=None)
+        for _ in range(2):
+            self.store.finish(self.store.reserve(row["id"], 10), 10)
+        with self.assertRaises(KeyQuotaError) as caught:
+            self.store.reserve(row["id"], 10)
+        self.assertEqual(caught.exception.values["daily_requests"], 2)
+        self.assertEqual(caught.exception.values["requests"], 2)
+        self.assertEqual(self.store.usage(row["id"])["daily_requests"], 2)
+
+    def test_weekly_money_cap_is_atomic_resets_in_utc_and_reports_usage(self) -> None:
+        self.now[0] = datetime(2026, 1, 4, 23, 59, tzinfo=timezone.utc).timestamp()
+        row, _ = self.create(
+            daily_requests=None, daily_micro_eur=None, weekly_micro_eur=100000
+        )
+
+        def reserve(_: int) -> bool:
+            try:
+                self.store.reserve(row["id"], 60000)
+                return True
+            except KeyQuotaError:
+                return False
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+            self.assertEqual(sum(pool.map(reserve, range(4))), 1)
+        usage = self.store.usage(row["id"])
+        self.assertEqual(usage["week"], "2026-W01")
+        week_usage = usage["week_usage"]
+        assert isinstance(week_usage, dict)
+        self.assertEqual(week_usage["charged_micro_eur"], 60000)
+        self.assertEqual(usage["weekly_micro_eur"], 100000)
+        self.now[0] = datetime(2026, 1, 5, tzinfo=timezone.utc).timestamp()
+        self.store.reserve(row["id"], 100000)
+
+    def test_reservation_bound_follows_the_operator_call_cap(self) -> None:
+        # A long coding-agent turn reserved 300550 microEUR and was refused as a bare
+        # invalid_request; the ledger bound is the highest cap an operator may set.
+        row, _ = self.create(
+            daily_requests=None, daily_micro_eur=None, weekly_micro_eur=None
+        )
+        self.store.finish(self.store.reserve(row["id"], 300550), 300550)
+        self.store.finish(self.store.reserve(row["id"], MAX_CALL_RESERVATION), 0)
+        with self.assertRaisesRegex(ValueError, "invalid_reservation"):
+            self.store.reserve(row["id"], MAX_CALL_RESERVATION + 1)
+        self.assertEqual(self.store.usage(row["id"])["charged_micro_eur"], 300550)
+
+    def test_own_budget_bypasses_owner_monthly_cap_not_global_monthly_cap(self) -> None:
+        own, secret = self.create(own_budget=True, weekly_micro_eur=1000000)
+        principal = self.store.resolve(secret)
+        self.assertNotEqual(principal.budget_user, "webui-test-id")
+        with patch.dict(
+            os.environ,
+            {"ATLAS_USER_MONTHLY_EUR": "1", "ATLAS_GLOBAL_MONTHLY_EUR": "2"},
+        ):
+            spent = DailyLedger().reserve_cost("webui-test-id", Decimal("0.90"), "en")
+            DailyLedger().settle_cost(spent, Decimal("0.90"))
+            ModelAccounting(self.store, principal).reserve(own["id"], 200000)
+        with patch.dict(
+            os.environ,
+            {"ATLAS_USER_MONTHLY_EUR": "1", "ATLAS_GLOBAL_MONTHLY_EUR": "1"},
+        ):
+            with self.assertRaises(BudgetRefusal) as caught:
+                ModelAccounting(self.store, principal).reserve(own["id"], 1)
+        self.assertEqual(caught.exception.category, "global_monthly_cost")
+
+    def test_own_budget_key_is_not_held_to_the_per_user_monthly_cap(self) -> None:
+        # Measured 2026-10-30: an own-budget worker key was refused at 30 EUR this
+        # month by ATLAS_USER_MONTHLY_EUR although its weekly key cap was 100 EUR.
+        own, secret = self.create(own_budget=True, weekly_micro_eur=100000000)
+        shared, shared_secret = self.create(own_budget=False)
+        principal = self.store.resolve(secret)
+        with patch.dict(
+            os.environ,
+            {"ATLAS_USER_MONTHLY_EUR": "1", "ATLAS_GLOBAL_MONTHLY_EUR": "100"},
+        ):
+            accounting = ModelAccounting(self.store, principal)
+            for _ in range(3):
+                request_id = accounting.reserve(own["id"], 900000)
+                accounting.finish(request_id, 900000)
+            shared_principal = self.store.resolve(shared_secret)
+            spent = DailyLedger().reserve_cost(
+                shared_principal.budget_user, Decimal("0.95"), "en"
+            )
+            DailyLedger().settle_cost(spent, Decimal("0.95"))
+            with self.assertRaises(BudgetRefusal) as caught:
+                ModelAccounting(self.store, shared_principal).reserve(
+                    shared["id"], 100000
+                )
+        self.assertEqual(caught.exception.category, "monthly_cost")
+
+    def test_existing_key_store_upgrades_without_changing_existing_caps(self) -> None:
+        path = self.root / "old-keys.sqlite"
+        db = sqlite3.connect(path)
+        try:
+            db.executescript(
+                "CREATE TABLE api_keys (id TEXT PRIMARY KEY, org_id TEXT NOT NULL, member_id TEXT NOT NULL, subject TEXT NOT NULL, budget_user TEXT NOT NULL, name TEXT NOT NULL, prefix TEXT NOT NULL, hash TEXT NOT NULL UNIQUE, hash_kind TEXT NOT NULL, scopes TEXT NOT NULL, expires_at INTEGER NOT NULL, daily_requests INTEGER NOT NULL, daily_micro_eur INTEGER NOT NULL, created_by TEXT NOT NULL, created_at INTEGER NOT NULL, last_used_at INTEGER, last_used_ip_prefix TEXT, revoked_at INTEGER);"
+                "CREATE TABLE api_key_requests (id TEXT PRIMARY KEY, key_id TEXT NOT NULL REFERENCES api_keys(id), day TEXT NOT NULL, reserved INTEGER NOT NULL, charged INTEGER NOT NULL, input_tokens INTEGER, output_tokens INTEGER, state TEXT NOT NULL);"
+            )
+            db.execute(
+                "INSERT INTO api_keys VALUES ('old','org','member','subject','user','old','atl_old','hash','hmac-sha256','[\"assistant\"]',1900000000,3,400000,'operator',1800000000,NULL,NULL,NULL)"
+            )
+            db.execute(
+                "INSERT INTO api_key_requests VALUES ('request','old','2025-12-31',1,1,NULL,NULL,'complete')"
+            )
+            db.commit()
+        finally:
+            db.close()
+        path.chmod(0o600)
+        self.now[0] = datetime(2025, 12, 31, tzinfo=timezone.utc).timestamp()
+        upgraded = Store(path, "test-pepper-" * 4, lambda: self.now[0])
+        old = upgraded.get("old")
+        self.assertEqual((old["daily_requests"], old["daily_micro_eur"]), (3, 400000))
+        self.assertIsNone(old["weekly_micro_eur"])
+        self.assertFalse(old["own_budget"])
+        self.assertEqual(
+            upgraded.usage("old")["week"], upgraded.week_for_day("2025-12-31")
+        )
+        self.assert_key_references_intact(path)
+
+    def test_existing_policy_store_upgrades_without_changing_existing_caps(
+        self,
+    ) -> None:
+        path = self.root / "old-policy.sqlite"
+        db = sqlite3.connect(path)
+        try:
+            db.executescript(
+                "CREATE TABLE api_keys (id TEXT PRIMARY KEY, org_id TEXT NOT NULL, member_id TEXT NOT NULL, subject TEXT NOT NULL, budget_user TEXT NOT NULL, name TEXT NOT NULL, prefix TEXT NOT NULL, hash TEXT NOT NULL UNIQUE, hash_kind TEXT NOT NULL, scopes TEXT NOT NULL, expires_at INTEGER NOT NULL, daily_requests INTEGER, daily_micro_eur INTEGER, weekly_micro_eur INTEGER, own_budget INTEGER NOT NULL DEFAULT 0, created_by TEXT NOT NULL, created_at INTEGER NOT NULL, last_used_at INTEGER, last_used_ip_prefix TEXT, revoked_at INTEGER);"
+                "CREATE TABLE api_key_policy (org_id TEXT PRIMARY KEY, mode TEXT NOT NULL, daily_requests INTEGER NOT NULL, daily_micro_eur INTEGER NOT NULL, max_lifetime_days INTEGER NOT NULL, active_key_limit INTEGER NOT NULL);"
+            )
+            db.execute(
+                "INSERT INTO api_key_policy VALUES ('org','self_service',7,500000,90,3)"
+            )
+            db.commit()
+        finally:
+            db.close()
+        path.chmod(0o600)
+        upgraded = Store(path, "test-pepper-" * 4, lambda: self.now[0])
+        self.assertEqual(
+            upgraded.policy("org"),
+            {
+                "mode": "self_service",
+                "daily_requests": 7,
+                "daily_micro_eur": 500000,
+                "weekly_micro_eur": None,
+                "max_lifetime_days": 90,
+                "active_key_limit": 3,
+            },
+        )
+
+    def test_store_repairs_requests_pointing_at_dropped_upgrade_table(self) -> None:
+        path = self.root / "broken-keys.sqlite"
+        Store(path, "test-pepper-" * 4, lambda: self.now[0])
+        db = sqlite3.connect(path)
+        try:
+            db.executescript(
+                "DROP TABLE api_key_requests;"
+                'CREATE TABLE api_key_requests (id TEXT PRIMARY KEY, key_id TEXT NOT NULL REFERENCES "api_keys_before_optional_caps"(id), day TEXT NOT NULL, week TEXT NOT NULL, reserved INTEGER NOT NULL, charged INTEGER NOT NULL, input_tokens INTEGER, output_tokens INTEGER, state TEXT NOT NULL);'
+                "INSERT INTO api_keys (id,org_id,member_id,subject,budget_user,name,prefix,hash,hash_kind,scopes,expires_at,created_by,created_at) VALUES ('old','org','member','subject','user','old','atl_old','hash','hmac-sha256','[\"model\"]',1900000000,'operator',1800000000);"
+                "INSERT INTO api_key_requests VALUES ('request','old','2025-12-31','2026-W01',1,1,NULL,NULL,'complete');"
+            )
+        finally:
+            db.close()
+        Store(path, "test-pepper-" * 4, lambda: self.now[0])
+        self.assert_key_references_intact(path)
+        db = sqlite3.connect(path)
+        try:
+            self.assertEqual(
+                db.execute("SELECT id FROM api_key_requests").fetchall(), [("request",)]
+            )
+        finally:
+            db.close()
+
+    def assert_key_references_intact(self, path: Path) -> None:
+        db = sqlite3.connect(path)
+        try:
+            db.execute("PRAGMA foreign_keys=ON")
+            schema = " ".join(
+                str(r[0])
+                for r in db.execute(
+                    "SELECT sql FROM sqlite_master WHERE sql IS NOT NULL"
+                )
+            )
+            self.assertNotIn("api_keys_before_optional_caps", schema)
+            self.assertIn("api_key_daily", schema)
+            self.assertEqual(db.execute("PRAGMA foreign_key_check").fetchall(), [])
+            db.execute(
+                "INSERT INTO api_key_requests (id,key_id,day,week,reserved,charged,state) VALUES ('new','old','2026-01-01','2026-W01',1,0,'reserved')"
+            )
+            with self.assertRaises(sqlite3.IntegrityError):
+                db.execute(
+                    "INSERT INTO api_key_requests (id,key_id,day,week,reserved,charged,state) VALUES ('orphan','missing','2026-01-01','2026-W01',1,0,'reserved')"
+                )
+        finally:
+            db.close()
+
+    def test_legacy_import_and_both_entries_share_revoke_and_usage(self) -> None:
+        legacy = DeveloperStore(self.root / "legacy.sqlite")
+        provision(legacy, "service-test", self.root / "legacy.key", 3, 50000)
+        secret = (self.root / "legacy.key").read_text().strip()
+        legacy.finish(legacy.reserve("service-test", 1000), 50)
+        row = self.store.import_developer(
+            legacy,
+            "service-test",
+            org_id="test-org",
+            member_id="test-member",
+            subject="service-test",
+            budget_user="service-budget",
+            created_by="operator",
+        )
+        self.assertTrue(row["rotation_required"])
+        # Keys are generic: an imported developer key gets every scope too.
+        self.assertEqual(row["scopes"], ["assistant", "model"])
+        principal = self.store.resolve(secret)
+        accounting = ModelAccounting(self.store, principal)
+        accounting.finish(accounting.reserve(row["id"], 1000), 100)
+        self.assertEqual(self.store.get(row["id"])["daily_requests"], 3)
+        with (
+            patch.dict(os.environ, {"ATLAS_DEVAPI_DB": str(legacy.path)}),
+            TestClient(dev_app) as client,
+            patch(
+                "services.orchestrator.api_keys.configured_store",
+                return_value=self.store,
+            ),
+        ):
+            headers = {"Authorization": "Bearer " + secret}
+            reply = client.get("/v1/usage", headers=headers)
+            self.assertEqual(reply.status_code, 200)
+            self.assertEqual(reply.json()["key_id"], row["id"])
+            self.store.revoke(row["id"])
+            self.assertEqual(client.get("/v1/models", headers=headers).status_code, 401)
+
+    def test_keys_get_every_scope_unless_restricted_explicitly(self) -> None:
+        row, _ = self.store.create(
+            org_id="test-org",
+            member_id="test-member",
+            subject="tester@example.invalid",
+            budget_user="test-id",
+            name="generic",
+            created_by="operator",
+        )
+        self.assertEqual(row["scopes"], ["assistant", "model"])
+        headers = {"Authorization": "Bearer " + "test-admin-" * 4}
+        identity = dict(
+            org_id="test-org",
+            member_id="test-member",
+            subject="tester",
+            budget_user="test-id",
+            name="key",
+        )
+        with TestClient(admin_app, client=("127.0.0.1", 10000)) as client:
+            reply = client.post("/keys", headers=headers, json=identity)
+            self.assertEqual(reply.status_code, 201, reply.text)
+            self.assertEqual(reply.json()["scopes"], ["assistant", "model"])
+            reply = client.post(
+                "/keys", headers=headers, json=identity | {"scopes": ["model"]}
+            )
+            self.assertEqual(reply.json()["scopes"], ["model"])
+            self.assertEqual(
+                client.post(
+                    "/keys", headers=headers, json=identity | {"scopes": []}
+                ).status_code,
+                422,
+            )
+
+    def test_scope_follows_the_model_name_on_every_format(self) -> None:
+        _, model_only = self.create(scopes=["model"])
+        _, assistant_only = self.create(scopes=["assistant"])
+        with TestClient(app) as client:
+            for path, body in (
+                ("/api/atlas/v1/responses", {"model": "atlas", "input": "Hello"}),
+                (
+                    "/api/atlas/v1/messages",
+                    {
+                        "model": "atlas",
+                        "max_tokens": 16,
+                        "messages": [{"role": "user", "content": "Hello"}],
+                    },
+                ),
+            ):
+                reply = client.post(
+                    path,
+                    headers={"Authorization": "Bearer " + model_only},
+                    json=body,
+                )
+                self.assertEqual(reply.status_code, 403, reply.text)
+                self.assertIn("assistant scope", reply.text)
+                self.assertIn(
+                    '"missing_scope":"assistant"', reply.text.replace(" ", "")
+                )
+            reply = client.get(
+                "/api/atlas/v1/models/atlas-dev",
+                headers={"Authorization": "Bearer " + assistant_only},
+            )
+            self.assertEqual(reply.status_code, 403, reply.text)
+            self.assertEqual(reply.json()["error"]["missing_scope"], "model")
+            reply = client.get(
+                "/api/atlas/v1/models/no-such-model",
+                headers={"Authorization": "Bearer " + assistant_only},
+            )
+            self.assertEqual(reply.status_code, 404)
+
+    def test_admin_requires_loopback_token_and_rejects_self_service(self) -> None:
+        headers = {"Authorization": "Bearer " + "test-admin-" * 4}
+        with TestClient(admin_app, client=("192.0.2.1", 10000)) as client:
+            self.assertEqual(client.get("/keys", headers=headers).status_code, 403)
+        with TestClient(admin_app, client=("127.0.0.1", 10000)) as client:
+            self.assertEqual(client.get("/keys").status_code, 403)
+            for extra in (
+                {"Origin": "http://localhost"},
+                {"Cookie": "token=x"},
+                {"X-Forwarded-For": "127.0.0.1"},
+            ):
+                self.assertEqual(
+                    client.get("/keys", headers=headers | extra).status_code, 403
+                )
+            reply = client.post(
+                "/keys",
+                headers=headers,
+                json=dict(
+                    org_id="test-org",
+                    member_id="test-member",
+                    subject="tester",
+                    budget_user="test-id",
+                    name="key",
+                    scopes=["assistant"],
+                ),
+            )
+            self.assertEqual(reply.status_code, 201)
+            self.assertIn("key", reply.json())
+            self.assertNotIn(
+                reply.json()["key"], client.get("/keys", headers=headers).text
+            )
+            self.assertEqual(
+                client.delete(
+                    "/keys/" + reply.json()["id"], headers=headers
+                ).status_code,
+                204,
+            )
+
+    def test_edge_public_model_streams_scope_origin_identity_and_member_budget(
+        self,
+    ) -> None:
+        from dev_gateway import Plan
+
+        row, secret = self.create(scopes=["model"], daily_requests=2)
+        headers = {
+            "Authorization": "Bearer " + secret,
+            "X-OpenWebUI-User-Id": "forged",
+            "X-Atlas-User": "forged",
+        }
+
+        plan = Plan("{}", "https://example.invalid/v1", 1000, Decimal(1), Decimal(1))
+
+        async def frames(_: Plan) -> AsyncIterator[dict[str, Any]]:
+            yield {
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"content": "7 times 8 is 56."},
+                        "finish_reason": None,
+                    }
+                ]
+            }
+            yield {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
+            yield {
+                "choices": [],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 2},
+                "cost_micro_eur": 1000,
+            }
+
+        body = dict(
+            model="atlas-code",
+            messages=[dict(role="user", content="Calculate 7 times 8")],
+        )
+        with (
+            TestClient(app) as client,
+            patch(
+                "services.orchestrator.dev_inference.gateway.prepare_api",
+                return_value=plan,
+            ),
+            patch(
+                "services.orchestrator.dev_inference.gateway.events", side_effect=frames
+            ),
+            patch.dict(
+                os.environ, {"ATLAS_MCP_CONFIG": "unused", "ATLAS_PROJECT_MODE": "1"}
+            ),
+            patch(
+                "services.orchestrator.api_key_edge.check_member",
+                return_value="broker-token",
+            ) as broker,
+        ):
+            for extra in ({"Origin": "http://testserver"}, {"Cookie": "token=value"}):
+                self.assertEqual(
+                    client.get(
+                        "/api/atlas/v1/models", headers=headers | extra
+                    ).status_code,
+                    401,
+                )
+            self.assertEqual(
+                client.post(
+                    "/v1/chat/completions", headers=headers, json=body
+                ).status_code,
+                403,
+            )
+            reply = client.get("/api/atlas/v1/models", headers=headers)
+            self.assertEqual(reply.status_code, 200)
+            self.assertIn("atlas-code", [m["id"] for m in reply.json()["data"]])
+            _, assistant = self.create(scopes=["assistant"])
+            reply = client.post(
+                "/api/atlas/v1/chat/completions",
+                headers={"Authorization": "Bearer " + assistant},
+                json=body,
+            )
+            self.assertEqual(reply.status_code, 403)
+            refusal = reply.json()["error"]
+            self.assertEqual(refusal["missing_scope"], "model")
+            self.assertEqual(refusal["code"], "insufficient_scope")
+            self.assertEqual(refusal["key_scopes"], ["assistant"])
+            self.assertEqual(refusal["param"], "model")
+            # The message says what is missing and how to fix it.
+            self.assertIn("model scope", refusal["message"])
+            self.assertIn("without a scope restriction", refusal["message"])
+            self.assertEqual(
+                client.post(
+                    "/api/atlas/v1/chat/completions",
+                    headers=headers,
+                    json=body | {"org_id": "forged"},
+                ).status_code,
+                403,
+            )
+            reply = client.post(
+                "/api/atlas/v1/chat/completions", headers=headers, json=body
+            )
+            self.assertEqual(reply.status_code, 200, reply.text)
+            self.assertIn("56", reply.json()["choices"][0]["message"]["content"])
+            reply = client.post(
+                "/api/atlas/v1/chat/completions",
+                headers=headers,
+                json=body | {"stream": True},
+            )
+            self.assertEqual(reply.status_code, 200, reply.text)
+            self.assertIn("56", reply.text)
+            self.assertIn("data: [DONE]", reply.text)
+            reply = client.post(
+                "/api/atlas/v1/chat/completions", headers=headers, json=body
+            )
+            self.assertEqual(reply.status_code, 429, reply.text)
+            self.assertEqual(reply.json()["error"]["requests"], 2)
+            self.assertEqual(reply.json()["error"]["daily_requests"], 2)
+            broker.side_effect = PermissionError("inactive_member")
+            self.assertEqual(
+                client.get("/api/atlas/v1/models", headers=headers).status_code, 401
+            )
+        self.assertEqual(self.store.usage(row["id"])["charged_micro_eur"], 2000)
+        ledger = DailyLedger().summary()
+        self.assertEqual(ledger[0]["user"], "webui-test-id")
+        self.assertEqual(Decimal(str(ledger[0]["measured_eur"])), Decimal("0.002"))
+        self.assertFalse(key_call.get())
+
+    def test_public_model_scope_and_reservations_use_the_same_member_ledger(
+        self,
+    ) -> None:
+        from dev_gateway import Plan
+
+        row, key = self.create(scopes=["model"], daily_requests=2)
+        plan = Plan("{}", "https://example.invalid/v1", 1000, Decimal(1), Decimal(1))
+
+        async def frames(plan: Plan) -> AsyncIterator[dict[str, Any]]:
+            yield {
+                "choices": [
+                    {"index": 0, "delta": {"content": "56"}, "finish_reason": None}
+                ]
+            }
+            yield {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
+            yield {
+                "choices": [],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 2},
+                "cost_micro_eur": 12,
+            }
+
+        headers = {"Authorization": "Bearer " + key}
+        body = {
+            "model": "atlas-code",
+            "messages": [{"role": "user", "content": "Calculate 7 times 8"}],
+        }
+        with (
+            TestClient(app) as client,
+            patch(
+                "services.orchestrator.dev_inference.gateway.prepare_api",
+                return_value=plan,
+            ),
+            patch(
+                "services.orchestrator.dev_inference.gateway.events", side_effect=frames
+            ),
+        ):
+            from services.orchestrator.api_key_edge import transcription_configured
+
+            models = client.get("/api/atlas/v1/models", headers=headers).json()
+            ids = [m["id"] for m in models["data"]]
+            self.assertEqual(
+                ids,
+                [
+                    "atlas-code",
+                    "atlas-chat",
+                    "atlas-dev",
+                    "atlas-code-fast",
+                    "atlas-code-2026-10-30",
+                    "atlas-chat-2026-10-30",
+                    "mistral/zai-glm-5-3-flash",
+                    "scaleway/deepseek-v4-flash-0731",
+                    "mistral/mistral-large-4",
+                    "mistral/zai-glm-5-3",
+                    "scaleway/glm-5.2",
+                    "atlas-embed",
+                    *(["atlas-transcribe"] if transcription_configured() else []),
+                ],
+            )
+            pinned = {m["id"]: m["owned_by"] for m in models["data"] if "/" in m["id"]}
+            self.assertEqual(pinned["mistral/zai-glm-5-3"], "mistral")
+            self.assertEqual(pinned["scaleway/glm-5.2"], "scaleway")
+            _, assistant = self.create(scopes=["assistant"])
+            rejected = client.post(
+                "/api/atlas/v1/chat/completions",
+                headers={"Authorization": "Bearer " + assistant},
+                json=body,
+            )
+            self.assertEqual(rejected.status_code, 403)
+            self.assertEqual(rejected.json()["error"]["missing_scope"], "model")
+            reply = client.post(
+                "/api/atlas/v1/chat/completions", headers=headers, json=body
+            )
+            self.assertEqual(reply.status_code, 200, reply.text)
+            self.assertEqual(reply.json()["choices"][0]["message"]["content"], "56")
+            reply = client.post(
+                "/api/atlas/v1/chat/completions",
+                headers=headers,
+                json=body | {"stream": True},
+            )
+            self.assertEqual(reply.status_code, 200)
+            self.assertIn("56", reply.text)
+            reply = client.post(
+                "/api/atlas/v1/chat/completions", headers=headers, json=body
+            )
+            self.assertEqual(reply.status_code, 429)
+            self.assertEqual(reply.json()["error"]["daily_requests"], 2)
+        self.assertEqual(self.store.usage(row["id"])["charged_micro_eur"], 24)
+        self.assertEqual(DailyLedger().summary()[0]["measured_eur"], 0.000024)
+
+    def test_public_usage_model_preserves_images_tools_and_streaming(self) -> None:
+        from dev_gateway import Plan
+
+        _, key = self.create(scopes=["model"], daily_requests=3)
+        plan = Plan("{}", "https://example.invalid/v1", 1000, Decimal(1), Decimal(1))
+        seen: list[Any] = []
+
+        def prepare_public(request: Any, *_: str, **__: object) -> Plan:
+            seen.append(request)
+            return plan
+
+        async def frames(plan: Plan) -> AsyncIterator[dict[str, Any]]:
+            yield {
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "fictional-call",
+                                    "function": {"name": "describe", "arguments": "{}"},
+                                }
+                            ]
+                        },
+                        "finish_reason": None,
+                    }
+                ]
+            }
+            yield {
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]
+            }
+            yield {
+                "choices": [],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 2},
+                "cost_micro_eur": 12,
+            }
+
+        body = {
+            "model": "atlas-code",
+            "stream": True,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Describe this fictional image"},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": "https://example.invalid/fictional.png"
+                            },
+                        },
+                    ],
+                }
+            ],
+            "tools": [
+                {"type": "function", "function": {"name": "describe", "parameters": {}}}
+            ],
+        }
+        with (
+            TestClient(app) as client,
+            patch(
+                "services.orchestrator.dev_inference.gateway.prepare_api",
+                side_effect=prepare_public,
+            ),
+            patch(
+                "services.orchestrator.dev_inference.gateway.events", side_effect=frames
+            ),
+        ):
+            reply = client.post(
+                "/api/atlas/v1/chat/completions",
+                headers={"Authorization": "Bearer " + key},
+                json=body,
+            )
+        self.assertEqual(reply.status_code, 200, reply.text)
+        self.assertIn("fictional-call", reply.text)
+        self.assertEqual(seen[0].messages[0].content[1]["type"], "image_url")
+        self.assertEqual(seen[0].tools[0].function.name, "describe")
+
+    def test_pinned_model_failure_returns_429_with_retry_after_and_no_fallback(
+        self,
+    ) -> None:
+        from dev_gateway import Plan
+        from provider_retry import TransientProviderError
+
+        _, key = self.create(scopes=["model"])
+        plan = Plan(
+            "{}",
+            "https://example.invalid/v1",
+            1000,
+            Decimal(1),
+            Decimal(1),
+            provider="mistral",
+            model="zai-glm-5-3",
+        )
+        calls = 0
+
+        async def failing(plan: Plan) -> AsyncIterator[dict[str, Any]]:
+            nonlocal calls
+            calls += 1
+            raise TransientProviderError(
+                "provider_error", detail="http_429", status=429, retry_after="7"
+            )
+            yield {}
+
+        with (
+            TestClient(app) as client,
+            patch(
+                "services.orchestrator.dev_inference.gateway.prepare_api",
+                return_value=plan,
+            ),
+            patch(
+                "services.orchestrator.dev_inference.gateway.events",
+                side_effect=failing,
+            ),
+        ):
+            reply = client.post(
+                "/api/atlas/v1/chat/completions",
+                headers={"Authorization": "Bearer " + key},
+                json={
+                    "model": "mistral/zai-glm-5-3",
+                    "messages": [{"role": "user", "content": "Hello"}],
+                },
+            )
+        self.assertEqual(reply.status_code, 429, reply.text)
+        self.assertEqual(reply.headers.get("Retry-After"), "7")
+        self.assertEqual(reply.json()["error"]["type"], "rate_limit")
+        self.assertEqual(reply.json()["error"]["provider_status"], 429)
+        self.assertEqual(calls, 1)
+
+    def test_fallback_false_on_an_alias_uses_the_first_target_only(self) -> None:
+        from dev_gateway import Plan
+
+        _, key = self.create(scopes=["model"])
+        plan = Plan(
+            "{}",
+            "https://example.invalid/v1",
+            1000,
+            Decimal(1),
+            Decimal(1),
+            provider="mistral",
+            model="zai-glm-5-3",
+        )
+        seen: list[dict[str, Any]] = []
+
+        def prepare_public(request: Any, usage: str, *_: str, **kwargs: Any) -> Plan:
+            seen.append({"usage": usage, **kwargs})
+            return plan
+
+        async def frames(plan: Plan) -> AsyncIterator[dict[str, Any]]:
+            yield {
+                "choices": [
+                    {"index": 0, "delta": {"content": "56"}, "finish_reason": None}
+                ]
+            }
+            yield {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
+            yield {
+                "choices": [],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 2},
+                "cost_micro_eur": 12,
+                "served_by": "mistral/zai-glm-5-3",
+            }
+
+        with (
+            TestClient(app) as client,
+            patch(
+                "services.orchestrator.dev_inference.gateway.prepare_api",
+                side_effect=prepare_public,
+            ),
+            patch(
+                "services.orchestrator.dev_inference.gateway.events", side_effect=frames
+            ),
+        ):
+            reply = client.post(
+                "/api/atlas/v1/chat/completions",
+                headers={"Authorization": "Bearer " + key},
+                json={
+                    "model": "atlas-chat",
+                    "fallback": False,
+                    "messages": [{"role": "user", "content": "7 times 8"}],
+                },
+            )
+        self.assertEqual(reply.status_code, 200, reply.text)
+        self.assertEqual(seen[0]["usage"], "atlas-chat")
+        self.assertIs(seen[0]["pinned"], False)
+        self.assertIs(seen[0]["fallback"], False)
+        self.assertEqual(reply.json()["served_by"], "mistral/zai-glm-5-3")
+        self.assertEqual(reply.headers.get("X-Atlas-Served-By"), "mistral/zai-glm-5-3")
+
+    def test_unknown_raw_model_is_rejected_before_dispatch(self) -> None:
+        _, key = self.create(scopes=["model"])
+        with TestClient(app) as client:
+            reply = client.post(
+                "/api/atlas/v1/chat/completions",
+                headers={"Authorization": "Bearer " + key},
+                json={
+                    "model": "raw/fictional-unknown",
+                    "messages": [{"role": "user", "content": "Hello"}],
+                },
+            )
+        self.assertEqual(reply.status_code, 400, reply.text)
+        self.assertEqual(reply.json()["error"]["code"], "invalid_model")
+
+    def test_assistant_scope_does_not_grant_public_model_access(self) -> None:
+        _, key = self.create(scopes=["assistant"])
+        with TestClient(app) as client:
+            reply = client.post(
+                "/api/atlas/v1/chat/completions",
+                headers={"Authorization": "Bearer " + key},
+                json={
+                    "model": "atlas-code",
+                    "messages": [{"role": "user", "content": "Find current news"}],
+                },
+            )
+        self.assertEqual(reply.status_code, 403, reply.text)
+        self.assertEqual(reply.json()["error"]["missing_scope"], "model")
+
+    def assistant_settlement(self, process: Any, stream: bool = False) -> sqlite3.Row:
+        """Run one assistant-scope request through the key edge; return its key row."""
+        _, key = self.create()
+        with (
+            TestClient(app) as client,
+            patch("services.orchestrator.chat_api.process", process),
+        ):
+            reply = client.post(
+                "/api/atlas/v1/chat/completions",
+                headers={"Authorization": "Bearer " + key},
+                json={
+                    "model": "atlas",
+                    "stream": stream,
+                    "messages": [{"role": "user", "content": "Hello"}],
+                },
+            )
+        # A stream reports the failure as an error event after its 200 header.
+        self.assertTrue(stream or reply.status_code != 200, reply.text)
+        self.assertNotIn('"finish_reason": "stop"', reply.text)
+        with sqlite3.connect(self.store.path) as db:
+            db.row_factory = sqlite3.Row
+            rows = db.execute(
+                "SELECT charged,state,input_tokens,output_tokens FROM api_key_requests"
+            ).fetchall()
+        self.assertEqual(len(rows), 1)
+        row: sqlite3.Row = rows[0]
+        return row
+
+    def test_refusal_before_any_model_call_is_not_charged(self) -> None:
+        from services.orchestrator.model import GatewayError, GatewayModel
+
+        async def refused(payload: Any, item: Any) -> None:
+            # The free configuration call does not count as a provider call.
+            with patch("aiohttp.ClientSession.post", side_effect=OSError):
+                try:
+                    await GatewayModel.post("http://127.0.0.1:9/agent/config", {}, 1)
+                except Exception:
+                    pass
+            raise GatewayError(
+                "memory_unavailable", 503, "Personal memory is unavailable."
+            )
+
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                self.store.path.unlink()
+                self.store = Store(
+                    self.store.path, "test-pepper-" * 4, lambda: self.now[0]
+                )
+                with patch(
+                    "services.orchestrator.api_key_edge.configured_store",
+                    return_value=self.store,
+                ):
+                    row = self.assistant_settlement(refused, stream)
+                self.assertEqual(
+                    (row["charged"], row["state"], row["input_tokens"]),
+                    (0, "complete", 0),
+                )
+
+    def test_failure_after_a_provider_call_started_keeps_the_reservation(
+        self,
+    ) -> None:
+        from services.orchestrator.model import GatewayModel
+
+        async def aborted(payload: Any, item: Any) -> None:
+            with patch("aiohttp.ClientSession.post", side_effect=OSError):
+                try:
+                    await GatewayModel.post("http://127.0.0.1:9/agent/complete", {}, 1)
+                except Exception:
+                    pass
+            raise RuntimeError("stream interrupted")
+
+        row = self.assistant_settlement(aborted)
+        self.assertEqual(
+            (row["charged"], row["state"], row["input_tokens"]),
+            (100000, "unknown", None),
+        )
+        # The daily cap keeps the reservation too, not the unmeasured 0.
+        from services.orchestrator.daily_budget import DailyLedger
+
+        with sqlite3.connect(DailyLedger().path) as db:
+            measured = db.execute(
+                "SELECT COALESCE(SUM(measured_micro),0) FROM budget_ledger"
+                " WHERE kind='day'"
+            ).fetchone()[0]
+        self.assertEqual(measured, 100000)
+
+    def test_failed_turn_with_complete_cost_is_charged_its_measured_cost(
+        self,
+    ) -> None:
+        from services.orchestrator.model import GatewayModel
+
+        async def stopped(payload: Any, item: Any) -> None:
+            with patch("aiohttp.ClientSession.post", side_effect=OSError):
+                try:
+                    await GatewayModel.post("http://127.0.0.1:9/agent/complete", {}, 1)
+                except Exception:
+                    pass
+            # A Work turn stopped on a limit knows the cost of every call.
+            item.cout_eur, item.cost_complete = 0.02, True
+            raise RuntimeError("stopped on a limit")
+
+        row = self.assistant_settlement(stopped)
+        self.assertEqual((row["charged"], row["state"]), (20000, "complete"))
+        from services.orchestrator.daily_budget import DailyLedger
+
+        with sqlite3.connect(DailyLedger().path) as db:
+            measured = db.execute(
+                "SELECT COALESCE(SUM(measured_micro),0) FROM budget_ledger"
+                " WHERE kind='day'"
+            ).fetchone()[0]
+        self.assertEqual(measured, 20000)
+
+    def test_failed_work_turn_settles_its_conservative_cost(self) -> None:
+        async def stopped(payload: Any, item: Any) -> None:
+            # A failed provider call retains its allowance in the conservative cost.
+            item.cout_eur, item.cost_complete = 0.12, True
+            raise RuntimeError("provider failed")
+
+        with patch.dict(os.environ, {"ATLAS_CODE_COST_EUR": "1"}):
+            row = self.assistant_settlement(stopped)
+        self.assertEqual((row["charged"], row["state"]), (120000, "complete"))
+        from services.orchestrator.daily_budget import DailyLedger
+
+        with sqlite3.connect(DailyLedger().path) as db:
+            measured = db.execute(
+                "SELECT COALESCE(SUM(measured_micro),0) FROM budget_ledger"
+                " WHERE kind='day'"
+            ).fetchone()[0]
+        self.assertEqual(measured, 120000)
+
+    def test_http_expired_revoked_invalid_and_quota_before_provider(self) -> None:
+        from dev_gateway import Plan
+
+        row, key = self.create(scopes=["model"], daily_micro_eur=1)
+        headers = {"Authorization": "Bearer " + key}
+        with (
+            TestClient(app) as client,
+            patch(
+                "services.orchestrator.dev_inference.gateway.prepare_api",
+                return_value=Plan(
+                    "{}", "https://example.invalid/v1", 2, Decimal(1), Decimal(1)
+                ),
+            ),
+            patch("services.orchestrator.dev_inference.gateway.events") as events,
+        ):
+            reply = client.post(
+                "/api/atlas/v1/chat/completions",
+                headers=headers,
+                json={
+                    "model": "atlas-code",
+                    "messages": [{"role": "user", "content": "Hello"}],
+                },
+            )
+            self.assertEqual(reply.status_code, 429)
+            self.assertEqual(reply.json()["error"]["daily_micro_eur"], 1)
+            events.assert_not_called()
+            for auth in (
+                {},
+                {"Authorization": "Bearer invalid"},
+                {"Authorization": "Basic invalid"},
+            ):
+                self.assertEqual(
+                    client.get("/api/atlas/v1/models", headers=auth).status_code, 401
+                )
+            self.now[0] = float(row["expires_at"])
+            self.assertEqual(
+                client.get("/api/atlas/v1/models", headers=headers).status_code, 401
+            )
+            self.now[0] -= 1
+            self.store.revoke(row["id"])
+            self.assertEqual(
+                client.get("/api/atlas/v1/models", headers=headers).status_code, 401
+            )
+
+
+class LegacyOrganizationKeyTests(unittest.IsolatedAsyncioTestCase):
+    async def test_instance_keys_skip_project_membership_in_project_mode(self) -> None:
+        from types import SimpleNamespace
+
+        from services.orchestrator.api_key_edge import (
+            check_member,
+            project_organization,
+        )
+
+        self.assertFalse(project_organization("stable"))
+        self.assertTrue(project_organization("99fadc50-63ef-4f19-8f4d-746a95905d42"))
+        legacy = SimpleNamespace(
+            org_id="stable", member_id="workers", subject="w@example.test"
+        )
+        with patch.dict(os.environ, {"ATLAS_PROJECT_MODE": "1"}):
+            with patch("services.orchestrator.api_key_edge.broker_identity") as broker:
+                self.assertIsNone(await check_member(legacy))  # type: ignore[arg-type]
+                broker.assert_not_called()

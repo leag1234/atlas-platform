@@ -1,0 +1,1588 @@
+"""Owner-only Code mode through the existing gateway and agent loop."""
+
+import asyncio
+import base64
+import json
+from decimal import Decimal
+import os
+from pathlib import Path
+import re
+import time
+import threading
+from typing import Any
+from collections.abc import Awaitable, Callable, Sequence
+from functools import partial
+
+import yaml
+
+from packages import addressing
+from packages.ports import atlas_ports
+from services.orchestrator.chat_schema import ChatRequest
+from services.orchestrator.code_tools import CodeTools, WorkTools, declarations
+from services.orchestrator.code_verification import annotate, explicit_tests
+from services.orchestrator.document_stream import DocumentWriter
+from services.orchestrator.code_workspace import (
+    Audit,
+    Workspace,
+    enabled,
+    redact,
+    work_carry_enabled,
+)
+from services.orchestrator.interactions import Interaction
+from services.orchestrator.loop import (
+    CodeResult,
+    Limits,
+    Message,
+    Model,
+    Query,
+    Turn,
+    ResultReferences,
+    run,
+)
+from services.orchestrator.model import GatewayError, GatewayModel
+from services.orchestrator.stream_client import sink_context
+from services.orchestrator.terminal_client import TerminalClient
+from services.orchestrator.work_clock import work_context
+from services.orchestrator.work_plan import instruction as plan_instruction
+
+
+def code_profile() -> str:
+    routing = yaml.safe_load(Path("services/model-gateway/routing.yaml").read_text())
+    return next(
+        str(name) for name, role in routing["public_profiles"].items() if role == "code"
+    )
+
+
+def settings() -> Limits:
+    return Limits(
+        profile=code_profile(),
+        tokens=None,
+        code_mode=True,
+        tool_calls=int(os.environ.get("ATLAS_CODE_MAX_STEPS", "40")),
+        wall_clock=float(os.environ.get("ATLAS_CODE_WALL_SECONDS", "1200")),
+        cost=Decimal(os.environ.get("ATLAS_CODE_COST_EUR", "3")),
+        model_calls=int(os.environ.get("ATLAS_CODE_MAX_MODEL_CALLS", "41")),
+    )
+
+
+def workspace_startup_timeout(limits: Limits) -> float:
+    """Allow a cold isolated workspace to start without exceeding its turn budget."""
+    return min(120.0, limits.wall_clock)
+
+
+class CodeModel(GatewayModel):
+    """Keep gateway per-call ceilings, while the loop owns the larger turn budget."""
+
+    work_tools: Callable[[], list[dict[str, object]]] | None = None
+    work_cost: Decimal | None = None
+    work_per_call: Decimal = Decimal("0.10")
+    work_unknown: bool = False
+    work_unknown_eur: Decimal = Decimal(0)
+    work_check: Callable[[], Awaitable[None]] | None = None
+    # Set when ATLAS_WORK_STREAMED_DOCUMENTS is on (document_stream.py).
+    document_writer: DocumentWriter | None = None
+
+    @property
+    def allowance(self) -> Decimal:
+        return min(
+            self.work_per_call,
+            max(
+                Decimal(0),
+                (self.work_cost if self.work_cost is not None else settings().cost)
+                - self.spent,
+            ),
+        )
+
+    def available_tools(self, messages: list[Message]) -> list[dict[str, object]]:
+        return self.work_tools() if self.work_tools is not None else self.tools
+
+    async def complete(self, messages: list[Message], timeout: float) -> Turn:
+        if self.work_check is not None:
+            await self.work_check()
+        reserved = self.allowance
+        before = self.spent
+        try:
+            writer = self.document_writer
+            if writer is not None:
+                messages = writer.annotate(messages)
+                if writer.due(messages, self.available_tools(messages)):
+                    written = await writer.write(
+                        self, messages, timeout, partial(GatewayModel.complete, self)
+                    )
+                    if written is not None:
+                        if writer.cut:
+                            # The cut call's provider usage is unknown.
+                            self.spent = max(self.spent, before + reserved)
+                            self.work_unknown = True
+                            self.work_unknown_eur += reserved
+                        return written
+            return await super().complete(messages, timeout)
+        except BaseException:
+            # Failed/canceled provider usage is unknown: retain the reservation.
+            self.spent = max(self.spent, before + reserved)
+            self.work_unknown = True
+            self.work_unknown_eur += reserved
+            raise
+
+
+def configure_work_model(model: CodeModel, request: ChatRequest) -> None:
+    """One request configuration for public Work and its measurement adapter."""
+    model.configure_quality(request.model, request.max_tokens)
+
+
+def code_deliverable_pending(
+    question: str,
+    group: str,
+    deliverables: Sequence[object],
+    file_requested: bool | None = None,
+) -> bool:
+    """True while the request asks for a file that was not produced yet.
+
+    file_requested is the turn's own decision when it has one (the routed
+    decision behind the chat): "Je voudrais un PDF qui ..." names no creation
+    verb, so the lexical check alone left the guard off and the agent wrote a
+    Markdown file instead of the PDF (staging corpus 2026-11-11).
+    """
+    from packages.file_intent import produces_file
+    from services.orchestrator.work_tool_selection import office_format_requested
+
+    requested = (
+        produces_file(question, include_images=False)
+        if file_requested is None
+        else file_requested
+    )
+    return (
+        requested
+        and not (group == "code" and not office_format_requested(question))
+        and not deliverables
+    )
+
+
+CLAIM = re.compile(
+    r"(?:\btests?\b.{0,45}\b(?:pass(?:ed|es|ing)?|successful|green|passano|passati|r[eé]ussi\w*|passent|vert\w*|bestanden|erfolgreich|gr[uü]n\w*|superat\w*|riuscit\w*)\b"
+    r"|\b(?:pruebas?|tests?)\b.{0,45}\b(?:pasan|pasaron|superad\w*|exitos\w*|correctamente)\b"
+    r"|\b(?:tous|all|alle|tutti|todas)\b.{0,20}\btests?\b.{0,25}\b(?:ok|passed|pass|bestanden|superati)\b)",
+    re.I,
+)
+CORRECTION = {
+    "en": "Test success is unverified: no successful test command was recorded in this turn.",
+    "fr": "La réussite des tests n'est pas vérifiée : aucune commande de test réussie n'a été enregistrée pendant ce tour.",
+    "de": "Der Testerfolg ist nicht bestätigt: In diesem Durchgang wurde kein erfolgreicher Testbefehl aufgezeichnet.",
+    "es": "El éxito de las pruebas no está verificado: no se registró ningún comando de prueba exitoso en este turno.",
+    "it": "Il successo dei test non è verificato: in questo turno non è stato registrato alcun comando di test riuscito.",
+}
+
+# A failed Work turn tells the user, in their language, that the work did not
+# complete and why, as a reason category. Raw reasons stay in the project events.
+WORK_FAILURE = {
+    "en": {
+        "template": "The work did not complete: {reason}.",
+        "tool_error": "a tool step failed and was not resolved",
+        "tests_failed": "the tests did not pass",
+        "time_limit": "the time limit was reached",
+        "step_limit": "the step limit was reached",
+        "repeated_failure": "the same tool step failed several times in a row and was stopped",
+        "budget": "the budget limit for this turn was reached",
+        "machine_busy": "your machine is already used by other conversations; try again in a few minutes",
+        "machine_minutes": "the monthly command time of this machine is used up",
+        "approval_failed": "a command you approved could not be started",
+        "other": "the work stopped before finishing",
+    },
+    "fr": {
+        "template": "Le travail n'a pas abouti : {reason}.",
+        "tool_error": "une étape d'outil a échoué et n'a pas été corrigée",
+        "tests_failed": "les tests n'ont pas réussi",
+        "time_limit": "la limite de temps a été atteinte",
+        "step_limit": "la limite d'étapes a été atteinte",
+        "repeated_failure": "la même étape d'outil a échoué plusieurs fois de suite et a été arrêtée",
+        "budget": "la limite de budget de ce tour a été atteinte",
+        "machine_busy": "votre machine est déjà utilisée par d'autres conversations ; réessayez dans quelques minutes",
+        "machine_minutes": "le temps de commande mensuel de cette machine est épuisé",
+        "approval_failed": "une commande que vous avez autorisée n'a pas pu démarrer",
+        "other": "le travail s'est arrêté avant la fin",
+    },
+    "de": {
+        "template": "Die Arbeit wurde nicht abgeschlossen: {reason}.",
+        "tool_error": "ein Werkzeugschritt ist fehlgeschlagen und wurde nicht behoben",
+        "tests_failed": "die Tests wurden nicht bestanden",
+        "time_limit": "das Zeitlimit wurde erreicht",
+        "step_limit": "das Schrittlimit wurde erreicht",
+        "repeated_failure": "derselbe Werkzeugschritt ist mehrmals hintereinander fehlgeschlagen und wurde abgebrochen",
+        "budget": "das Budgetlimit dieses Durchgangs wurde erreicht",
+        "machine_busy": "Ihre Maschine wird bereits von anderen Unterhaltungen genutzt; versuchen Sie es in einigen Minuten erneut",
+        "machine_minutes": "die monatliche Befehlszeit dieser Maschine ist aufgebraucht",
+        "approval_failed": "ein von Ihnen erlaubter Befehl konnte nicht gestartet werden",
+        "other": "die Arbeit wurde vor dem Abschluss beendet",
+    },
+    "es": {
+        "template": "El trabajo no se completó: {reason}.",
+        "tool_error": "un paso de herramienta falló y no se resolvió",
+        "tests_failed": "las pruebas no se superaron",
+        "time_limit": "se alcanzó el límite de tiempo",
+        "step_limit": "se alcanzó el límite de pasos",
+        "repeated_failure": "el mismo paso de herramienta falló varias veces seguidas y se detuvo",
+        "budget": "se alcanzó el límite de presupuesto de este turno",
+        "machine_busy": "su máquina ya la usan otras conversaciones; vuelva a intentarlo en unos minutos",
+        "machine_minutes": "se agotó el tiempo mensual de comandos de esta máquina",
+        "approval_failed": "un comando que usted autorizó no se pudo iniciar",
+        "other": "el trabajo se detuvo antes de terminar",
+    },
+    "it": {
+        "template": "Il lavoro non è stato completato: {reason}.",
+        "tool_error": "un passaggio di uno strumento non è riuscito e non è stato risolto",
+        "tests_failed": "i test non sono stati superati",
+        "time_limit": "è stato raggiunto il limite di tempo",
+        "step_limit": "è stato raggiunto il limite di passaggi",
+        "repeated_failure": "lo stesso passaggio di uno strumento è fallito più volte di seguito ed è stato interrotto",
+        "budget": "è stato raggiunto il limite di budget di questo turno",
+        "machine_busy": "la tua macchina è già usata da altre conversazioni; riprova tra qualche minuto",
+        "machine_minutes": "il tempo mensile dei comandi di questa macchina è esaurito",
+        "approval_failed": "un comando che hai autorizzato non è stato avviato",
+        "other": "il lavoro si è interrotto prima della fine",
+    },
+}
+# Kept from a Work turn's time limit when the loop stops on time: the files
+# are saved and the stopped turn explained before the turn's own timeout.
+WORK_CLOSING_SECONDS = 30.0
+STEP_LIMITS = {
+    "tool_calls",
+    "model_calls",
+    "loop_detected",
+    "protocol_completion_limit",
+    "search_limit",
+    "fetch_limit",
+}
+
+
+# How the loop's agent runs code, for the instruction of a requested run.
+RUN_TOOL = "run_command (in the code group: call switch_tool_group first if another group is selected)"
+
+
+def open_failures(failures: dict[str, str], deliverables: list[Any]) -> dict[str, str]:
+    """Tool errors still open at the end of a Work turn.
+
+    A refused read changes nothing and the model saw the error: it is a result,
+    not a failure (a script that ran was reported failed for one read of a
+    missing path, staging 2026-11-10). A group switch refused because the
+    requested file did not exist yet is steering: once the turn has published a
+    file it is settled.
+    """
+    # A page that gave no text or a search that failed is a result too: the
+    # model writes with what it has (staging 2026-11-11). A machine tool's
+    # refusal is a sentence the model relays (key not installed yet, host key
+    # changed): the person's next step, not a broken turn.
+    from services.orchestrator.tool_failures import relayed_failure_tools
+
+    settled = set(relayed_failure_tools())
+    if (
+        deliverables
+        and failures.get("switch_tool_group") == "deliverable_group_required"
+    ):
+        settled.add("switch_tool_group")
+    return {tool: error for tool, error in failures.items() if tool not in settled}
+
+
+# A machine limit is a known, temporary state of the person's machine, said as such
+# (on staging the chat fell back to "I cannot access your server", 2026-11-11).
+MACHINE_LIMITS = {
+    "runner_concurrency_limit": "machine_busy",
+    "runner_minutes_limit": "machine_minutes",
+}
+
+
+def work_failure_category(reason: str, *, tool_failure: bool) -> str | None:
+    """Map a failed Work turn reason to a public category; None is an outage."""
+    if tool_failure:
+        if reason in MACHINE_LIMITS:
+            return MACHINE_LIMITS[reason]
+        return "tests_failed" if reason == "tests_not_verified" else "tool_error"
+    if reason == "provider_error":
+        return None
+    if reason == "wall_clock":
+        return "time_limit"
+    if reason in STEP_LIMITS:
+        return "step_limit"
+    from services.orchestrator.tool_failures import STOP_REASON
+
+    if reason == STOP_REASON:
+        # The loop stopped a tool that kept failing the same way.
+        return "repeated_failure"
+    if reason in {"cost", "tokens"}:
+        return "budget"
+    return "other"
+
+
+def stopped_work_reply(item: Interaction, lang: str) -> str:
+    """An honest final answer for a Work turn that stopped without a known category."""
+    known = work_failure_reply(item, lang)
+    if known is not None:
+        return known
+    words = addressing.addressed_table(WORK_FAILURE.get(lang, WORK_FAILURE["en"]), lang)
+    reason = next((str(e) for e in reversed(item.erreurs) if e), "")
+    category = (
+        reason
+        if reason in words and reason != "template"
+        else work_failure_category(reason, tool_failure=False) or "other"
+    )
+    return str(words["template"]).format(reason=words.get(category, words["other"]))
+
+
+def work_failure_reply(item: Interaction, lang: str) -> str | None:
+    """The public final answer of a Work turn that failed for a known reason."""
+    failure = item.work_failure
+    if item.state != "failed" or failure.get("category") not in WORK_FAILURE["en"]:
+        return None
+    words = addressing.addressed_table(WORK_FAILURE.get(lang, WORK_FAILURE["en"]), lang)
+    message = str(words["template"]).format(reason=words[failure["category"]])
+    return "\n\n".join(
+        p
+        for p in (
+            failure.get("answer", "").strip(),
+            message,
+            failure.get("question", "").strip(),
+        )
+        if p
+    )
+
+
+def claims_success(text: str) -> bool:
+    for match in CLAIM.finditer(text):
+        context = text[max(0, match.start() - 12) : match.end()]
+        if not re.search(
+            r"\b(?:not|never|no|pas|aucun\w*|nicht|kein\w*|non|nessun\w*)\b",
+            context,
+            re.I,
+        ):
+            return True
+    return False
+
+
+def honest(text: str, evidence: list[dict[str, Any]], lang: str) -> tuple[str, bool]:
+    if evidence or not claims_success(text):
+        return text, False
+    # Replace the whole claiming sentence; never leave a second contradictory claim.
+    sentences = re.split(r"(?<=[.!?])\s+|\n", text)
+    corrected = [
+        CORRECTION.get(lang, CORRECTION["en"]) if claims_success(sentence) else sentence
+        for sentence in sentences
+    ]
+    return "\n".join(corrected), True
+
+
+async def execute_turn(
+    request: ChatRequest,
+    model: Model,
+    tools: CodeTools,
+    limits: Limits,
+    workspace_context: dict[str, Any] | None = None,
+    references: ResultReferences | None = None,
+) -> CodeResult:
+    from packages.addressing import answer_instruction
+    from services.orchestrator.work_closing import closing_step
+
+    history: list[Message] = [
+        {"role": m.role, "content": redact(m.text)} for m in request.messages[:-1]
+    ]
+    from packages import context_usage
+
+    registered = context_usage.parts.get() or {}
+    for original, message in zip(request.messages[:-1], history):
+        if original.text in registered:
+            context_usage.register(
+                str(message["content"]), redact(registered[original.text])
+            )
+    if workspace_context is not None:
+        history.append(
+            {
+                "role": "user",
+                "content": json.dumps(redact({"code_workspace": workspace_context})),
+            }
+        )
+    if workspace_context is not None:
+        from packages.context_usage import register
+
+        register(str(history[-1]["content"]), {"session_state": workspace_context})
+    if isinstance(tools, WorkTools):
+        tools.verification.explicit = explicit_tests(request.user_text)
+    guard = tools.run_guard if isinstance(tools, WorkTools) else None
+    from services.orchestrator.work_delivery import MISSING_KEY, file_guard
+
+    # A requested file holds the final answer until it is published, like a
+    # requested run (work_delivery.py).
+    delivery = file_guard(tools, model) if isinstance(tools, WorkTools) else None
+
+    def before_final(executed: list[str]) -> str | None:
+        step = guard.next_step(RUN_TOOL, executed) if guard is not None else None
+        return step or (delivery.next_step() if delivery is not None else None)
+
+    if isinstance(model, GatewayModel):
+        # A step still receiving output runs on within the turn's own time
+        # instead of being cut at its per-call deadline (staging 2026-11-13:
+        # an answer streaming for 120 s was cut and the turn failed, twice).
+        model.progress_deadline = time.monotonic() + limits.wall_clock
+    result = await run(
+        Query(
+            question=redact(request.user_text),
+            lang=request.lang,
+            prose_lang=request.prose_lang,
+        ),
+        model,
+        tools,
+        Path("prompts/chat.txt").read_text()
+        + Path("prompts/chat-agent.txt").read_text()
+        + (
+            answer_instruction(request.prose_lang)
+            if isinstance(tools, WorkTools)
+            else ""
+        )
+        + (tools.instructions if isinstance(tools, WorkTools) else "")
+        # The plan the person sees in the chat, if any (work_plan.py).
+        + (plan_instruction() if isinstance(tools, WorkTools) else ""),
+        limits,
+        history=history,
+        references=references,
+        skill_messages=tools.skills.instructions
+        if isinstance(tools, WorkTools) and tools.skills is not None
+        else None,
+        # A Work turn answers with its last statement. What the agent says between
+        # tool calls ("I will first…", "that failed, let me retry…") is progress,
+        # not the answer: it was glued in front of the result without a space.
+        final_only=isinstance(tools, WorkTools),
+        before_final=None if guard is None and delivery is None else before_final,
+        # Once the requested file is published, the turn ends with a short
+        # closing message instead of answering the request again.
+        after_tools=partial(
+            closing_step, tools, bool(getattr(model, "produces_files", False))
+        )
+        if isinstance(tools, WorkTools)
+        else None,
+    )
+    assert isinstance(result, CodeResult)
+    if isinstance(tools, WorkTools) and guard is not None and result.state == "done":
+        result.text, unexecuted = guard.answer(result.text, request.lang)
+        if unexecuted:
+            await tools.emit(
+                "honesty",
+                label="Run not executed",
+                status="completed",
+                output={"text": result.text},
+            )
+    if delivery is not None and result.state == "done":
+        # Still no file: the answer says so first, never that it was created.
+        result.text, missing = delivery.answer(
+            result.text, request.lang, request.user_text
+        )
+        if missing:
+            request.__dict__[MISSING_KEY] = True
+            await tools.emit(
+                "honesty",
+                label="Requested file not created",
+                status="completed",
+                output={"text": result.text},
+            )
+    if isinstance(tools, WorkTools):
+        result.verification = tools.verification.status()
+        if (
+            workspace_context is not None
+            and not workspace_context.get("repository")
+            and not tools.verification.runs
+            and not tools.verification.edited
+        ):
+            result.text, replaced = redact(result.text), False
+        else:
+            result.text, replaced = annotate(redact(result.text), result.verification)
+    else:
+        result.text, replaced = honest(
+            redact(result.text), tools.test_evidence, request.lang
+        )
+    if replaced:
+        await tools.emit(
+            "honesty",
+            label="Test claim corrected",
+            status="completed",
+            output={
+                "text": result.text,
+                "verification": result.verification.model_dump(),
+            },
+        )
+    if result.limit_stop:
+        await tools.emit(
+            "limit",
+            label="Turn stopped",
+            status="completed",
+            output={**result.limit_stop, "detail": result.text},
+        )
+    return result
+
+
+active: set[str] = set()
+active_lock = threading.Lock()
+
+
+async def process_code(request: ChatRequest, item: Interaction) -> None:
+    if not enabled() or request.code_session_id is None:
+        raise ValueError("code_mode_disabled")
+    session = request.code_session_id
+    item.task_type = "code"
+    with active_lock:
+        if session in active:
+            item.reponse, item.state = (
+                "This Code session already has an active turn; wait for it to finish.",
+                "done",
+            )
+            return
+        active.add(session)
+    audit = Audit(session, item.request_id)
+    workspace = Workspace(session)
+    tools = CodeTools(workspace, audit, sink_context.get())
+    limits = settings()
+    started = time.monotonic()
+    model: GatewayModel | None = None
+    try:
+        async with asyncio.timeout(limits.wall_clock):
+            await workspace.prepare()
+            metadata = workspace.metadata()
+            if request.documents:
+                if metadata.get("baseline") or len(request.documents) != 1:
+                    raise ValueError(
+                        "Import requires exactly one archive into an empty session"
+                    )
+                imported = await workspace.invoke(
+                    "import",
+                    {"archive": request.documents[0].file_data.split(",")[-1]},
+                    min(120, limits.wall_clock),
+                )
+                if imported.get("error"):
+                    raise ValueError(str(imported["error"]))
+                metadata = {"baseline": imported["baseline"], "plan": []}
+                workspace.save(metadata)
+                await tools.emit(
+                    "import",
+                    label="Archive imported",
+                    status="completed",
+                    output=imported,
+                )
+            if metadata.get("plan"):
+                await tools.emit(
+                    "plan",
+                    label="Current plan",
+                    status="completed",
+                    output={"items": metadata["plan"]},
+                )
+            if not metadata.get("baseline"):
+                raise ValueError(
+                    "Upload one zip or tar archive to initialize this Code session"
+                )
+            listing = await workspace.invoke("list_dir", {"path": "."}, 10)
+            workspace_context = {
+                "root": "/workspace",
+                "archive_state": "already_extracted",
+                "paths": "relative or absolute under /workspace",
+                "listing": listing,
+                **work_context(request),
+            }
+            await tools.emit(
+                "workspace",
+                label="Current workspace",
+                status="completed",
+                output=workspace_context,
+            )
+            model = await CodeModel.connect(
+                os.environ.get("ATLAS_GATEWAY_URL", atlas_ports().url("gateway")),
+                local_enabled=False,
+            )
+            model.configure_quality(code_profile(), request.max_tokens)
+            model.tools = declarations()
+            # Hold all model prose until the honesty guard has evidence.
+            model.sink = None
+            remaining = max(0, limits.wall_clock - (time.monotonic() - started))
+            from dataclasses import replace
+
+            result = await execute_turn(
+                request,
+                model,
+                tools,
+                replace(limits, wall_clock=remaining),
+                workspace_context,
+            )
+            item.reponse = result.text
+            item.tool_urls.extend(getattr(result, "tool_urls", set()))
+            item.verification = result.verification.model_dump()
+            item.cout_eur = float(result.cost)
+            item.tokens = {"in": model.input_tokens, "out": model.output_tokens}
+            if result.reason:
+                item.erreurs.append(result.reason)
+            exported = await workspace.invoke(
+                "export",
+                {"baseline": metadata["baseline"]},
+                min(60, max(0.1, limits.wall_clock - (time.monotonic() - started))),
+            )
+            if exported.get("error"):
+                item.reponse += "\nExport failed: " + str(redact(exported["error"]))
+            else:
+                terminal = TerminalClient(item.request_id)
+                await terminal.initialize()
+                for filename, content in (
+                    ("workspace.tar.gz", base64.b64decode(exported["archive"])),
+                    ("changes.patch", exported["patch"].encode()),
+                ):
+                    path = await terminal.upload_generated(
+                        filename, content or b"\n", 30, max_bytes=220 * 1024 * 1024
+                    )
+                    url = "/api/v1/terminals/atlas-files/files/serve/" + path.lstrip(
+                        "/"
+                    )
+                    item.files.append(url)
+                    item.reponse += f"\n[{filename}]({url})"
+                await tools.emit(
+                    "export",
+                    label="Workspace exported",
+                    status="completed",
+                    output={"files": item.files},
+                )
+            await tools.emit(
+                "recap",
+                label="Code turn complete",
+                status="completed",
+                output={
+                    "text": item.reponse,
+                    "steps": result.tool_calls,
+                    "model_calls": result.model_calls,
+                    "cost_eur": item.cout_eur,
+                    "test_evidence": tools.test_evidence,
+                    "question": "What would you like to do next?",
+                    "actions": ["Review the changes", "Run the tests"],
+                },
+            )
+    except TimeoutError:
+        elapsed = time.monotonic() - started
+        item.reponse = f"Code turn stopped: elapsed {elapsed:.3f} seconds; limit {limits.wall_clock:.3f} seconds."
+        await tools.emit(
+            "limit",
+            label="Wall time limit",
+            status="completed",
+            output={
+                "kind": "wall_clock",
+                "measured": elapsed,
+                "limit": limits.wall_clock,
+                "unit": "seconds",
+            },
+        )
+    except GatewayError as exc:
+        item.reponse = "Code model request stopped: " + str(
+            redact(exc.detail or exc.code)
+        )
+        await tools.emit(
+            "error",
+            label="Code model stopped",
+            status="failed",
+            output={"code": exc.code, "message": item.reponse},
+        )
+    except (ValueError, RuntimeError, OSError) as exc:
+        item.reponse = "Code operation failed: " + str(redact(str(exc)))
+        await tools.emit(
+            "error",
+            label="Code operation failed",
+            status="failed",
+            output={"message": item.reponse},
+        )
+    except asyncio.CancelledError:
+        audit.record("cancelled", elapsed_seconds=time.monotonic() - started)
+        raise
+    finally:
+        if model is not None:
+            item.cout_eur = max(item.cout_eur, float(model.spent))
+            item.provider_model = model.provider_model
+            item.reasoning_retried = model.reasoning_retried
+            item.reasoning_effort = model.reasoning_used
+        with active_lock:
+            active.discard(session)
+    # Limit stops are successful protocol replies with explicit measured refusal.
+    item.state = "done"
+
+
+class WorkExecution:
+    """Per-turn client state; the retrieval lease is the only execution lock."""
+
+    def __init__(self, broker: Any, session: dict[str, Any], request_id: str) -> None:
+        self.broker, self.session, self.request_id = broker, session, request_id
+
+    def fence(self) -> dict[str, Any]:
+        return dict(
+            session_id=self.session["id"],
+            request_id=self.request_id,
+            generation=self.session["lease"]["generation"],
+        )
+
+    async def turn(self, operation: str, **changes: Any) -> dict[str, Any]:
+        data = dict(
+            self.fence(),
+            operation=operation,
+            usage=None,
+            terminal_state=None,
+            cleanup_confirmed=False,
+        )
+        data.update(changes)
+        result = await self.broker.call("turn", data)
+        return dict(result)
+
+    async def check(self) -> None:
+        from services.retrieval.project_identity import ProjectError
+
+        result = await self.turn("check")
+        if result["cleanup_required"]:
+            raise ProjectError(409, "session_busy", "Work cancellation requested")
+
+    def workspace(self) -> Workspace:
+        return Workspace(
+            self.session["id"],
+            org=self.broker.org,
+            project=self.broker.project,
+            workspace=self.session["workspace_id"],
+            generation=self.session["lease"]["generation"],
+            authorize=self.check,
+            limits=self.session["effective_limits"],
+        )
+
+    async def snapshot(self, workspace: Workspace) -> None:
+        import hashlib
+        import io
+        import tarfile
+        from pathlib import PurePosixPath
+        from services.retrieval.project_identity import ProjectError
+
+        bases = self.session["base_file_versions"]
+        buffer = io.BytesIO()
+        remaining = self.session["effective_limits"]["expanded_bytes"]
+        with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
+            for base in bases:
+                await self.check()
+                status, file = await self.broker.public(
+                    "GET", "files/" + base["file_id"]
+                )
+                if status != 200 or file.get("version_id") != base["version_id"]:
+                    raise ProjectError(409, "revision_conflict")
+                content = await self.broker.content(
+                    base["file_id"], base["version_id"], remaining
+                )
+                if (
+                    len(content) != file["size_bytes"]
+                    or hashlib.sha256(content).hexdigest() != file["sha256"]
+                ):
+                    raise ProjectError(503, "dependency_unavailable")
+                path = PurePosixPath(file["relative_path"])
+                if path.is_absolute() or ".." in path.parts:
+                    raise ProjectError(422, "invalid_request")
+                remaining -= len(content)
+                entry = tarfile.TarInfo(str(file["folder_id"]) + "/" + str(path))
+                entry.size = len(content)
+                entry.mode = 0o600
+                archive.addfile(entry, io.BytesIO(content))
+        imported = await workspace.invoke(
+            "import", dict(archive=base64.b64encode(buffer.getvalue()).decode()), 120
+        )
+        if imported.get("error"):
+            raise ValueError(str(imported["error"]))
+        workspace.save(dict(baseline=imported["baseline"], plan=[]))
+        if work_carry_enabled():
+            await workspace.restore_carry()
+
+
+async def cleanup_work(
+    broker: Any, session_id: str, expected_request: str | None = None
+) -> None:
+    """Explicit cancel/restart recovery: fence, remove workers/scratch, then release."""
+    from uuid import uuid4
+    from services.retrieval.project_identity import ProjectError
+
+    status, session = await broker.public("GET", "work-sessions/" + session_id)
+    if status != 200:
+        raise ProjectError(status, str(session.get("error", "not_found")))
+    if session["lease"] is None:
+        return
+    if (
+        expected_request is not None
+        and session["lease"]["request_id"] != expected_request
+    ):
+        return
+    request_id = str(uuid4())
+    result = await broker.call(
+        "turn",
+        dict(
+            session_id=session_id,
+            request_id=request_id,
+            generation=session["lease"]["generation"],
+            operation="recover",
+            usage=None,
+            terminal_state=None,
+            cleanup_confirmed=False,
+        ),
+    )
+    execution = WorkExecution(broker, result["session"], request_id)
+    await execution.workspace().cleanup()
+    await execution.turn("release", terminal_state="cancelled", cleanup_confirmed=True)
+
+
+async def process_work(
+    request: ChatRequest,
+    item: Interaction,
+    *,
+    subject: str,
+    org_id: str,
+    project_id: str,
+    session_id: str,
+    collect_workspace: Callable[[Workspace], Awaitable[None]] | None = None,
+    saved_reply: str | None = None,
+    wall_clock: float | None = None,
+    turn_request_id: str | None = None,
+) -> None:
+    """Task-G handoff after verified identity and scoped conversation/context selection.
+
+    No caller headers or database handles enter this interface. The broker refreshes
+    current authority for each operation; disconnect cancellation follows the same
+    cleanup boundary as an explicit cancel. wall_clock, when given, lowers the
+    turn's time limit (a chat turn's Work ends before the chat deadline); the
+    project interface leaves it out and keeps the Work limit. turn_request_id,
+    when given, identifies this run of the turn instead of the chat request id:
+    a run started again after a failed one needs its own lease and reservation.
+    """
+    from uuid import UUID
+    from dataclasses import replace
+    from services.orchestrator.code_api import ExecutionBroker
+    from services.orchestrator.code_tools import WorkTools
+    from services.retrieval.project_identity import ProjectError
+
+    from services.orchestrator.project_transcript import work_dispatch
+
+    dispatch = work_dispatch.get()
+    broker = ExecutionBroker(subject, str(UUID(org_id)), str(UUID(project_id)))
+    status, session = await broker.public(
+        "GET", "work-sessions/" + str(UUID(session_id))
+    )
+    if status != 200:
+        raise ProjectError(status, str(session.get("error", "not_found")))
+    if session["conversation_id"] != request.conversation_id:
+        raise ProjectError(404, "not_found")
+    limits = settings()
+    run_id = str(UUID(turn_request_id or item.request_id.removeprefix("chatcmpl-")))
+    acquired = await broker.call(
+        "acquire",
+        dict(
+            session_id=session_id,
+            request_id=run_id,
+            expected_revision=session["revision"],
+            storage_bytes=session["effective_limits"]["expanded_bytes"],
+        ),
+    )
+    execution = WorkExecution(broker, acquired["session"], run_id)
+    if dispatch is not None:
+        dispatch.session_id = session_id
+        dispatch.generation = execution.session["lease"]["generation"]
+    workspace = execution.workspace()
+    tools = WorkTools(workspace, execution, sink_context.get())
+    # Set by the chat when Work runs behind it: no approval card can be answered there.
+    tools.approvals_unattended = bool(request.__dict__.get("approvals_unattended"))
+    tools.numbered_copies = bool(request.__dict__.get("numbered_copies"))
+    tools.earlier_answers = list(request.__dict__.get("earlier_answers") or [])
+    tools.revises_delivered = bool(request.__dict__.get("revises_delivered"))
+    tools.lang = request.lang
+    # The person's answer to an approval asked in the conversation (chat_work.py).
+    tools.machine_approval = request.__dict__.get("machine_approval")
+    from packages.work_intent import named_office_format
+    from services.orchestrator.request_router import decision as routed_decision
+
+    # A chat turn routed by the model carries its decision into Work.
+    routed = routed_decision(request)
+    named_format = (
+        routed.office_format
+        if routed is not None
+        else named_office_format(request.user_text)
+    )
+    tools.requested_suffix = "." + named_format if named_format else None
+    tools.request_text = request.user_text
+    tools.earlier_requests = [
+        message.text for message in request.messages[:-1] if message.role == "user"
+    ]
+    tools.picture_scope = f"{subject}|{request.conversation_id}"
+    ceiling = execution.session["effective_limits"]
+    limits = replace(
+        limits,
+        tool_calls=min(limits.tool_calls, ceiling["tool_calls"]),
+        model_calls=min(limits.model_calls or 0, ceiling["model_calls"]),
+        wall_clock=min(limits.wall_clock, ceiling["wall_seconds"]),
+        cost=min(limits.cost, Decimal(str(ceiling["cost_eur"]))),
+    )
+    if wall_clock is not None:
+        limits = replace(
+            limits, wall_clock=max(0.0, min(limits.wall_clock, wall_clock))
+        )
+    started = time.monotonic()
+
+    def left(reserve: float = 0.0) -> Limits:
+        """The limits with the time this turn has left, less a closing reserve.
+
+        The engine and the loop measure time from their own start: preparing the
+        workspace and the engine is counted here, so they stop before the turn's
+        own timeout and the stopped turn still saves its files and explains.
+        """
+        seconds = limits.wall_clock - (time.monotonic() - started) - reserve
+        return replace(limits, wall_clock=max(0.0, seconds))
+
+    model: CodeModel | None = None
+    result: CodeResult | None = None
+    nearby_usage: dict[str, Any] | None = None
+    terminal = "failed"
+    owner = asyncio.current_task()
+    assert owner is not None
+
+    async def heartbeat() -> None:
+        try:
+            while True:
+                await asyncio.sleep(5)
+                await execution.turn("renew")
+        except (ProjectError, OSError, ValueError):
+            owner.cancel()
+
+    renewal = asyncio.create_task(heartbeat())
+    try:
+        async with asyncio.timeout(limits.wall_clock):
+            await workspace.prepare()
+            await execution.snapshot(workspace)
+            if saved_reply is not None:
+                item.reponse, item.state, terminal = saved_reply, "done", "completed"
+                nearby_usage = dict(
+                    tool_calls=0,
+                    model_calls=0,
+                    elapsed_seconds=time.monotonic() - started,
+                    cost_eur=0,
+                    reserved_eur=0,
+                    unknown_eur=0,
+                    stored_bytes=0,
+                    input_tokens=0,
+                    output_tokens=0,
+                    tokens_estimated=False,
+                )
+                return
+            from services.orchestrator.location import location_dependent
+
+            if location_dependent(request.user_text) and (
+                request.location is None
+                or (request.location.position is None and not request.location.place)
+            ):
+                from services.orchestrator.nearby_chat import process_nearby
+
+                await execution.check()
+                count = await process_nearby(
+                    request,
+                    item,
+                    max_calls=min(8, limits.tool_calls),
+                    cost_limit=limits.cost,
+                    check=execution.check,
+                )
+                terminal = "completed" if item.state == "done" else "failed"
+                nearby_usage = dict(
+                    tool_calls=count,
+                    model_calls=0,
+                    elapsed_seconds=time.monotonic() - started,
+                    cost_eur=item.cout_eur,
+                    reserved_eur=0,
+                    unknown_eur=0,
+                    stored_bytes=0,
+                    input_tokens=0,
+                    output_tokens=0,
+                    tokens_estimated=False,
+                )
+                await tools.emit(
+                    "recap",
+                    label="Nearby places",
+                    status=terminal,
+                    output=dict(
+                        text=item.reponse,
+                        steps=count,
+                        cost_eur=item.cout_eur,
+                        file_version_ids=[],
+                    ),
+                )
+                return
+            await tools.emit(
+                "workspace", label="Server workspace", status="completed", output={}
+            )
+            connected = await CodeModel.connect(
+                os.environ.get("ATLAS_GATEWAY_URL", atlas_ports().url("gateway")),
+                local_enabled=False,
+            )
+            if not isinstance(connected, CodeModel):
+                raise RuntimeError("Invalid Work model client")
+            model = connected
+            configure_work_model(model, request)
+            tools.check_model = model
+            model.dispatch_hook = dispatch.publish if dispatch is not None else None
+            model.session_context = (
+                dispatch.session_context if dispatch is not None else None
+            )
+            model.work_check = execution.check
+            model.work_cost = limits.cost
+            model.work_per_call = Decimal(str(ceiling["per_call_eur"]))
+            from packages.file_intent import produces_file
+
+            # A requested file is written in one call: the gateway then allows
+            # that call up to 300 s instead of 120 (the per-call cost stays ours).
+            from packages.work_intent import work_reason
+
+            model.produces_files = (
+                routed.kind == "file"
+                if routed is not None
+                else produces_file(request.user_text, include_images=False)
+                or work_reason(request.user_text) == "file"
+            )
+            from services.orchestrator.work_execution import (
+                ExecutionGuard,
+                run_requested,
+            )
+
+            # Code to run is run before the answer, or the answer says it was not.
+            tools.run_guard = ExecutionGuard(
+                run_requested(
+                    routed.kind if routed is not None else None, request.user_text
+                )
+            )
+            from services.orchestrator.work_tool_selection import (
+                WorkToolSelection,
+                select_group,
+            )
+
+            selected_files = []
+            for version in execution.session["base_file_versions"]:
+                status, file = await broker.public("GET", "files/" + version["file_id"])
+                if status != 200:
+                    raise ProjectError(status, str(file.get("error", "not_found")))
+                selected_files.append(file)
+            status, project = await broker.public("GET", "")
+            if status != 200:
+                raise ProjectError(status, str(project.get("error", "not_found")))
+            from services.orchestrator.work_machine_tools import machine_turn
+
+            # A turn on the user's own machine starts in the remote group, where
+            # a machine is added and verified in the conversation even when he
+            # has none yet. "Compile on my server" otherwise selected the code
+            # group (and the engine, which has no remote tools).
+            remote_turn = machine_turn(
+                request, routed, bool(execution.session.get("repository_id"))
+            )
+            tools.selection = WorkToolSelection(
+                "remote"
+                if remote_turn
+                else select_group(
+                    request.user_text,
+                    selected_files,
+                    bool(execution.session.get("repository_id")),
+                )
+            )
+            selection = tools.selection
+            from packages.privacy import elevate
+
+            # The project's level holds for every call of this Work turn.
+            elevate(project.get("privacy"))
+            from packages.privacy import allows
+
+            if not allows("web_search"):
+                selection.disable_research()
+            else:
+                from services.orchestrator.chat_pipeline import ChatTools
+
+                tools.web = ChatTools(item, request.user_text)
+                tools.web_lang = request.lang
+                selection.enable_research()
+            from services.orchestrator.work_opencode_turn import (
+                engine_turn_selected,
+                run_opencode_turn,
+            )
+
+            if engine_turn_selected(
+                selection, bool(execution.session.get("repository_id"))
+            ):
+                engine_result = await run_opencode_turn(
+                    request,
+                    item,
+                    tools,
+                    workspace,
+                    left(),
+                    selection.research_enabled,
+                )
+                if collect_workspace is not None:
+                    await collect_workspace(workspace)
+                item.reponse = engine_result.text
+                item.state = engine_result.state
+                item.cout_eur = engine_result.cost_eur
+                from packages.provider_calls import add_cost
+
+                # The engine prices its own provider calls: the request's record
+                # of what it consumed counts them, whatever the turn's outcome.
+                add_cost(engine_result.cost_eur)
+                item.tokens = {
+                    "in": engine_result.input_tokens,
+                    "out": engine_result.output_tokens,
+                }
+                terminal = "completed" if engine_result.state == "done" else "failed"
+                # Released with the turn below: the engine's usage reaches the
+                # project ledger like the loop's.
+                nearby_usage = dict(
+                    tool_calls=engine_result.tool_calls,
+                    model_calls=0,
+                    elapsed_seconds=time.monotonic() - started,
+                    cost_eur=engine_result.cost_eur,
+                    reserved_eur=0,
+                    unknown_eur=0,
+                    stored_bytes=0,
+                    input_tokens=engine_result.input_tokens,
+                    output_tokens=engine_result.output_tokens,
+                    tokens_estimated=False,
+                )
+                if terminal == "failed":
+                    item.erreurs.append(engine_result.reason)
+                    item.reponse += "\n\nWork failed: " + engine_result.reason
+                from services.orchestrator.work_save import (
+                    not_saved_line,
+                    not_saved_paths,
+                    project_file_lines,
+                    save_turn_files,
+                )
+
+                saved = await save_turn_files(
+                    execution,
+                    workspace,
+                    tools,
+                    execution.session["base_file_versions"],
+                    engine_result.state,
+                )
+                from services.orchestrator.file_results import append_deliverable_links
+
+                for receipt in saved.get("receipts", []):
+                    item.reponse = append_deliverable_links(
+                        item.reponse, receipt, broker.org, broker.project, request.lang
+                    )
+                item.reponse += project_file_lines(
+                    saved, broker.org, broker.project, request.lang
+                )
+                denied = not_saved_paths(saved, tools)
+                if denied and not tools.approvals_unattended:
+                    item.reponse += not_saved_line(request.lang) + ", ".join(denied)
+                await tools.emit(
+                    "recap",
+                    label="Work turn complete"
+                    if terminal == "completed"
+                    else "Work failed: " + engine_result.reason,
+                    status=terminal,
+                    output=dict(
+                        text=item.reponse,
+                        steps=engine_result.tool_calls,
+                        cost_eur=item.cout_eur,
+                        file_version_ids=[
+                            r["file_version_id"] for r in tools.deliverables
+                        ],
+                    ),
+                )
+                return
+            file_requested = bool(model.produces_files)
+            selection.deliverable_pending = lambda: code_deliverable_pending(
+                request.user_text,
+                selection.group,
+                # An overwrite the person declined settles the request too.
+                [*tools.deliverables, *tools.not_published],
+                file_requested,
+            )
+            if os.environ.get("ATLAS_REMOTE_RUNNERS") == "1":
+                targets = await broker.call(
+                    "remote", dict(execution.fence(), operation="list", arguments={})
+                )
+                if targets.get("items"):
+                    tools.selection.enable_remote()
+                if tools.selection.remote_enabled:
+                    from services.orchestrator.work_machine_tools import instructions
+
+                    tools.instructions = instructions(tools.approvals_unattended)
+            repository = None
+            if execution.session.get("repository_id"):
+                status, repositories = await broker.public("GET", "repositories")
+                if status != 200:
+                    raise ProjectError(status, "dependency_unavailable")
+                repository = next(
+                    (
+                        r
+                        for r in repositories["items"]
+                        if r["id"] == execution.session["repository_id"]
+                    ),
+                    None,
+                )
+            if request.location and location_dependent(request.user_text):
+                from services.orchestrator.nearby_chat import NearbyTools
+                from services.orchestrator.chat_pipeline import ChatTools
+
+                tools.nearby = NearbyTools(
+                    request.location,
+                    ChatTools(item),
+                    language=request.lang,
+                    max_calls=min(8, limits.tool_calls),
+                    cost_limit=limits.cost,
+                    check=execution.check,
+                )
+            references = None
+            if dispatch is not None:
+                from services.orchestrator.result_references import (
+                    ResultReferences as ScopedReferences,
+                )
+
+                references = ScopedReferences(
+                    dispatch.broker,
+                    str(request.conversation_id),
+                    execution.request_id,
+                    dispatch.generation,
+                )
+                tools.remote_references = references
+                tools.selection.reopen_enabled = True
+                tools.selection.memory_enabled = True
+                from services.orchestrator.project_memory_tools import MemoryTools
+
+                tools.memory = MemoryTools(
+                    dispatch.broker, dispatch.state, dispatch.generation
+                )
+            from services.orchestrator.connectors import prepare as prepare_connectors
+
+            if not request._api_key_request:
+                tools.connectors = await prepare_connectors(request)
+            if tools.connectors is not None:
+                tools.selection.add_connectors(tools.connectors)
+            from services.orchestrator.skill_tools import SkillTools
+
+            if os.environ.get("ATLAS_SKILLS_ENABLED") == "1":
+                tools.skills = await SkillTools.connect(
+                    broker, workspace, item.skills_loaded
+                )
+                if tools.skills.entries:
+                    tools.selection.skills_enabled = True
+                    tools.selection.catalog["load_skill"] = tools.skills.declaration()
+            if (
+                dispatch is not None
+                and not request._api_key_request
+                and not request._scheduled_run
+            ):
+                from services.orchestrator.schedule_tools import ScheduleTools
+
+                tools.schedules = ScheduleTools(
+                    dispatch.broker,
+                    dispatch.state["turn"],
+                    request.ui_timezone,
+                    request.lang,
+                )
+                tools.selection.schedules_enabled = True
+                tools.selection.catalog["propose_scheduled_task"] = (
+                    tools.schedules.declaration()
+                )
+            if (
+                request._scheduled_run
+                and request._scheduled_target
+                and Path(request._scheduled_target).suffix.lower()
+                not in {".docx", ".pptx", ".xlsx", ".pdf"}
+            ):
+                from services.orchestrator.schedule_tools import publish_declaration
+
+                tools.selection.scheduled_publication = True
+                tools.selection.catalog["publish_scheduled_file"] = (
+                    publish_declaration()
+                )
+            model.work_tools = tools.selection.declarations
+            model.sink = None
+            from services.orchestrator import document_stream
+
+            # A researched Word or PDF report is written as streamed text, then
+            # published by code (document_stream.py); off by default.
+            if (
+                document_stream.enabled()
+                and file_requested
+                and tools.requested_suffix in document_stream.SUFFIXES
+                and not selected_files
+                and selection.research_enabled
+            ):
+                model.document_writer = DocumentWriter(
+                    suffix=tools.requested_suffix,
+                    question=redact(request.user_text),
+                    pending=lambda: bool(
+                        selection.deliverable_pending is not None
+                        and selection.deliverable_pending()
+                    ),
+                    group=lambda: selection.group,
+                    retrieved=lambda: tools.retrieved_urls,
+                    report=tools.sink,
+                )
+            if file_requested and selection.group in {"documents", "presentations"}:
+                # The pictures the file needs are planned and drawn by code
+                # before the agent writes (work_pictures.prepare).
+                from services.orchestrator.work_pictures import prepare
+
+                await prepare(
+                    tools, request.user_text, left(WORK_CLOSING_SECONDS).wall_clock
+                )
+            from services.orchestrator import current_file
+
+            # A change of a file this chat delivered starts from its stored
+            # version, as an app follow-up starts from the stored app. In
+            # project mode, the file this conversation delivered last is given
+            # with a conditional instruction (no router says it is a change).
+            tools.current_file = await current_file.load(
+                tools,
+                project,
+                None
+                if tools.numbered_copies
+                else [
+                    message.text
+                    for message in request.messages[:-1]
+                    if message.role == "assistant" and message.text.strip()
+                ],
+            )
+            from services.orchestrator.page_budget import first_brief
+
+            # A new Word report asked with a page size: its budget before it is
+            # written (page_budget.py); a change of a delivered file gets the
+            # room measured on its print instead (current_file.room_note).
+            page_budget = await first_brief(tools)
+            result = await execute_turn(
+                request,
+                model,
+                tools,
+                left(WORK_CLOSING_SECONDS),
+                dict(
+                    root="/workspace",
+                    repository=repository,
+                    listing=await workspace.invoke(
+                        "list_dir", {"path": "."}, workspace_startup_timeout(limits)
+                    ),
+                    files=[
+                        dict(
+                            file_id=file["id"],
+                            version=file["version_id"],
+                            path=file["folder_id"] + "/" + file["relative_path"],
+                            mime=file["mime"],
+                        )
+                        for file in selected_files
+                    ],
+                    environment=execution.session["environment"],
+                    plan=execution.session.get("plan", []),
+                    **(
+                        {"current_file": tools.current_file.context(request.user_text)}
+                        if tools.current_file is not None
+                        else {}
+                    ),
+                    **({"page_budget": page_budget} if page_budget else {}),
+                    # Today's date in the person's zone, and a scheduled run's
+                    # deliverable note: trusted context, never the user's words.
+                    **work_context(request),
+                ),
+                **({"references": references} if references is not None else {}),
+            )
+            if collect_workspace is not None:
+                await collect_workspace(workspace)
+            from services.orchestrator.project_transcript import answer_content
+
+            item.reponse = answer_content(result.text)
+            if request.lang == "fr" and "\n\nVerification:" in item.reponse:
+                item.reponse = (
+                    item.reponse.split("\n\nVerification:", 1)[0]
+                    + "\n\n"
+                    + CORRECTION["fr"]
+                )
+            from services.orchestrator.work_machine_tools import complete_answer
+
+            # An install command shown to the person is copied verbatim: the
+            # model is told to, and this makes sure of it.
+            item.reponse = complete_answer(
+                item.reponse, tools.machine_commands, request.lang
+            )
+            from services.orchestrator.work_machine_tools import complete_approvals
+
+            item.reponse = complete_approvals(item.reponse, tools.machine_approvals)
+            item.tool_urls.extend(getattr(result, "tool_urls", set()))
+            item.verification = result.verification.model_dump()
+            if tools.nearby is not None and tools.nearby.result:
+                from services.orchestrator.nearby_chat import render
+                from services.orchestrator.location import LEDGER_LABEL
+
+                item.reponse = render(tools.nearby.result, request.lang)
+                item.location_used = LEDGER_LABEL
+                item.nearby_source = tools.nearby.result["source"]
+                item.retrieved_urls.extend(
+                    p["source"] for p in tools.nearby.result["places"]
+                )
+            from services.orchestrator.file_results import (
+                append_deliverable_links,
+                project_deliverable_links,
+            )
+
+            delivered: list[str] = []
+            for receipt in tools.deliverables:
+                delivered.append(
+                    project_deliverable_links(
+                        receipt, broker.org, broker.project, request.lang
+                    )
+                )
+                item.reponse = append_deliverable_links(
+                    item.reponse, receipt, broker.org, broker.project, request.lang
+                )
+            item.cout_eur = float(model.spent)
+            item.tokens = {"in": model.input_tokens, "out": model.output_tokens}
+            still_open = open_failures(tools.validation_failures, tools.deliverables)
+            reason = result.reason or next(iter(still_open.values()), "")
+            terminal = (
+                "completed" if result.state == "done" and not reason else "failed"
+            )
+            item.state = "done" if terminal == "completed" else "failed"
+            if terminal == "failed":
+                tool_failure = not result.reason and bool(reason)
+                reason = reason or result.state
+                category = work_failure_category(reason, tool_failure=tool_failure)
+                item.erreurs.append(reason)
+                from services.orchestrator.work_machine_tools import (
+                    approval_failure_answer,
+                )
+
+                approved = approval_failure_answer(
+                    tools.machine_approval_failures, request.lang
+                )
+                if (
+                    tool_failure
+                    and approved
+                    and {"remote_run", "remote_write_file"} & set(still_open)
+                ):
+                    # A command the person approved did not run: the answer
+                    # is written by code (what did not run, and the question
+                    # still open), never the model's, which claimed it done
+                    # (staging 2026-11-14).
+                    item.work_failure = dict(
+                        category="approval_failed",
+                        answer=approved,
+                        question="\n\n".join(tools.machine_approvals.values()),
+                    )
+                    item.reponse = str(work_failure_reply(item, request.lang))
+                elif category is not None:
+                    # A stopped loop's text is a diagnostic, not the model's answer.
+                    item.work_failure = dict(
+                        category=category,
+                        answer=item.reponse
+                        if result.state == "done"
+                        else complete_answer(
+                            "\n\n".join(dict.fromkeys(delivered)),
+                            tools.machine_commands,
+                            request.lang,
+                        ),
+                    )
+                item.reponse += "\n\nWork failed: " + reason
+            from services.orchestrator.work_save import (
+                not_saved_line,
+                not_saved_paths,
+                project_file_lines,
+                save_turn_files,
+            )
+
+            saved = await save_turn_files(
+                execution,
+                workspace,
+                tools,
+                execution.session["base_file_versions"],
+                result.state,
+            )
+            for receipt in saved.get("receipts", []):
+                item.reponse = append_deliverable_links(
+                    item.reponse, receipt, broker.org, broker.project, request.lang
+                )
+            item.reponse += project_file_lines(
+                saved, broker.org, broker.project, request.lang
+            )
+            denied = not_saved_paths(saved, tools)
+            if denied and not tools.approvals_unattended:
+                item.reponse += not_saved_line(request.lang) + ", ".join(denied)
+            await tools.emit(
+                "recap",
+                label="Work turn complete"
+                if terminal == "completed"
+                else "Work failed: " + reason,
+                status=terminal,
+                output=dict(
+                    text=item.reponse,
+                    steps=result.tool_calls,
+                    verification=result.verification.model_dump(),
+                    cost_eur=item.cout_eur,
+                    file_version_ids=[r["file_version_id"] for r in tools.deliverables],
+                ),
+            )
+    except asyncio.CancelledError:
+        terminal = "cancelled"
+        raise
+    finally:
+        item.verification = tools.verification.status().model_dump()
+        renewal.cancel()
+        await asyncio.gather(renewal, return_exceptions=True)
+        if model is not None:
+            item.cout_eur = max(item.cout_eur, float(model.spent))
+            item.cost_complete = True
+        # A newer generation owns cleanup if recovery raced this turn. Never let
+        # an old finally block destroy a newer workspace or release its slot.
+        cleanup_authorized = True
+        try:
+            await execution.turn("check")
+        except ProjectError as exc:
+            if exc.status in {403, 404, 409}:
+                cleanup_authorized = False
+                try:
+                    await cleanup_work(broker, session_id, execution.request_id)
+                except ProjectError as recovery_error:
+                    if recovery_error.status not in {403, 404, 409}:
+                        raise
+                    import logging
+
+                    logging.getLogger(__name__).warning(
+                        "work_cleanup_requires_authorized_recovery status=%s",
+                        recovery_error.status,
+                    )
+            else:
+                raise
+        if cleanup_authorized:
+            if tools.nearby is not None:
+                tools.nearby.position = None
+            if request.location:
+                request.location.position = None
+                request.location.place = None
+                request.location = None
+
+            async def finish() -> None:
+                await workspace.cleanup(keep_carry=work_carry_enabled())
+                usage = nearby_usage
+                if result is not None and model is not None:
+                    usage = dict(
+                        tool_calls=result.tool_calls,
+                        model_calls=result.model_calls,
+                        elapsed_seconds=time.monotonic() - started,
+                        cost_eur=float(model.spent),
+                        reserved_eur=0,
+                        unknown_eur=float(model.work_unknown_eur),
+                        stored_bytes=0,
+                        input_tokens=model.input_tokens,
+                        output_tokens=model.output_tokens,
+                        tokens_estimated=model.work_unknown,
+                        **(
+                            {"context": dispatch.context}
+                            if dispatch is not None and dispatch.context is not None
+                            else {}
+                        ),
+                    )
+                await execution.turn(
+                    "release",
+                    terminal_state=terminal,
+                    cleanup_confirmed=True,
+                    usage=usage,
+                )
+
+            cleanup_task = asyncio.create_task(finish())
+            try:
+                await asyncio.shield(cleanup_task)
+            except asyncio.CancelledError:
+                await cleanup_task
+                raise

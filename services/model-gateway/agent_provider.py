@@ -1,0 +1,627 @@
+"""Validated tool-calling transport and human-confirmed pricing, POC-P6."""
+
+import provider_settings
+import upstream
+
+from packages.limits import LimitError, ProviderLimitError, MalformedToolCall
+from packages import privacy
+
+from packages.profiles import accepted_profile, chat_seconds
+
+import asyncio
+import json
+import logging
+import re
+from time import monotonic
+import os
+from decimal import Decimal, InvalidOperation
+from pathlib import Path
+from typing import Literal, Self
+from collections.abc import AsyncGenerator
+
+import aiohttp
+import yaml
+from pydantic import BaseModel, ConfigDict, Field, model_validator, ValidationError
+from packages.validation import numeric_limit, malformed_tool_name
+
+
+def classify(messages: list[dict[str, object]]) -> str:
+    # Conservative allowlist: only short, familiar transformations use S.
+    simple = r"(?i)\b(tradui\w*|translate|reformul\w*|formuliere|rewrite|corrig\w*|summary|résumer|abkürzung|bedeutet|significa|capital|come si dice|che ore|auguri|asunto|ideen)\b"
+    complex_task = r"(?i)\b(analys\w*|anális\w*|analyz\w*|ris\w*|risk\w*|strat\w*|proof|prove|beweis\w*|dimostr\w*|design\w*|progett\w*|refactor\w*|algorithm\w*|algoritm\w*)\b"
+    users = [m.get("content") for m in messages if m.get("role") == "user"]
+    if not users or any(m.get("role") == "tool" for m in messages):
+        return "reasoning"
+    if all(
+        isinstance(t, str)
+        and 0 < len(t.strip()) <= 240
+        and re.search(simple, t)
+        and not re.search(complex_task, t)
+        for t in users
+    ):
+        return "chat_simple"
+    return "reasoning"
+
+
+class Function(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    # Memory guard only: max_tokens bounds a call's arguments.
+    arguments: str = Field(max_length=1048576)
+
+
+class ToolCall(BaseModel):
+    id: str = Field(min_length=1, max_length=200)
+    type: Literal["function"]
+    function: Function
+
+
+class Reply(BaseModel):
+    content: str | None = Field(default=None, max_length=128000)
+    tool_calls: list[ToolCall] = Field(default_factory=list, max_length=10)
+
+
+class Choice(BaseModel):
+    finish_reason: Literal["stop", "tool_calls", "length"]
+    message: Reply
+
+
+class Usage(BaseModel):
+    prompt_tokens: int = Field(ge=0, strict=True)
+    completion_tokens: int = Field(ge=0, le=16000, strict=True)
+
+
+class Completion(BaseModel):
+    # Some providers return HTTP 200 for errors; never ignore one beside choices.
+    error: None = None
+    usage: Usage
+    choices: list[Choice] = Field(min_length=1, max_length=1)
+
+
+# Output tokens a file turn (produces_files) may request in one call.
+FILE_OUTPUT_CEILING = 16000
+
+
+class AgentRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    messages: list[dict[str, object]] = Field(min_length=1, max_length=100)
+    tools: list[dict[str, object]] = Field(min_length=0, max_length=16)
+    tool_choice: Literal["auto", "none"] | dict[str, object] = Field(
+        default="auto", exclude_if=lambda value: value == "auto"
+    )
+    response_format: dict[Literal["type"], Literal["json_object"]] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    timeout: float = Field(gt=0, le=300)
+    # The caller's own time left (a Work turn's wall clock), in seconds. A call
+    # still receiving output keeps running past `timeout` up to this bound; a
+    # call that goes silent is still cut (quality.PROGRESS_STALL_SECONDS).
+    progress_timeout: float | None = Field(
+        default=None, gt=0, le=86400, exclude_if=lambda value: value is None
+    )
+    local_enabled: bool = True
+    privacy: Literal["standard", "strict"] = Field(
+        default="standard", exclude_if=lambda value: value == "standard"
+    )
+    # False for auxiliary calls (a dictation clean-up): a silent on-demand owned server
+    # is then reported as unavailable, never asked to power on (owned_start.py).
+    start_owned: bool = Field(default=True, exclude_if=lambda value: value is True)
+    observe: bool = False
+    profile: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    max_tokens: int = Field(
+        default=2048, ge=1, le=16000, exclude_if=lambda value: value == 2048
+    )
+    reasoning_effort: Literal["none", "low", "medium", "high"] = Field(
+        default="none", exclude_if=lambda value: value == "none"
+    )
+    reasoning_ceiling: Literal["none", "low", "medium", "high"] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    # Set by the orchestrator once a reasoning recovery happened: the following
+    # turns of the same answer must not restart the reasoning that already failed.
+    reasoning_disabled: bool = Field(
+        default=False, exclude_if=lambda value: value is False
+    )
+    has_attachments: bool = Field(
+        default=False, exclude_if=lambda value: value is False
+    )
+    produces_files: bool = Field(default=False, exclude_if=lambda value: value is False)
+    budget_eur: str | None = Field(
+        default=None, max_length=40, exclude_if=lambda value: value is None
+    )
+    # Sampling temperature of a profile call, bounded. Unset, the provider
+    # receives temperature 0 exactly as before; a caller that needs distinct
+    # drafts of one request (pictures by code) sets it.
+    sampling_temperature: float | None = Field(
+        default=None, ge=0, le=1, exclude_if=lambda value: value is None
+    )
+    # One attempt on the profile's own model: no recovery attempt and no other
+    # role. A caller that runs several drafts (pictures by code) drops a failed
+    # one instead of paying a recovery, never a silent costlier fallback.
+    single_attempt: bool = Field(default=False, exclude_if=lambda value: value is False)
+    # Role of a profile call that carries an image: "locate" runs on the model
+    # declared for finding where named parts are drawn (labelled pictures);
+    # unset, the vision role answers as before.
+    vision_role: Literal["vision", "locate"] = Field(
+        default="vision", exclude_if=lambda value: value == "vision"
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def request_level(cls, data: object) -> object:
+        # A request limited to owned targets (Strict, or Enhanced without the
+        # pseudonymiser) stays so for every call made on its behalf, whatever the
+        # caller put in the body: the level is never lowered.
+        if privacy.owned_only() and isinstance(data, dict):
+            return {**data, "privacy": "strict"}
+        return data
+
+    @model_validator(mode="after")
+    def quality(self) -> Self:
+        if self.response_format is not None and self.response_format != {
+            "type": "json_object"
+        }:
+            raise ValueError("invalid_response_format")
+        if isinstance(self.tool_choice, dict):
+            function = self.tool_choice.get("function")
+            if (
+                set(self.tool_choice) != {"type", "function"}
+                or self.tool_choice.get("type") != "function"
+                or not isinstance(function, dict)
+                or set(function) != {"name"}
+                or function.get("name")
+                not in {
+                    "terminal_command",
+                    "publish_document",
+                    "create_artifact",
+                    "document_statistics",
+                }
+                or not any(
+                    declared.get("name") == function["name"]
+                    for tool in self.tools
+                    if isinstance(declared := tool.get("function"), dict)
+                )
+            ):
+                raise ValueError("invalid_required_file_tool")
+        if self.profile is not None and not accepted_profile(self.profile):
+            raise ValueError("invalid_profile")
+        deadline = (
+            300
+            if (self.has_attachments or self.produces_files) and self.profile
+            # A chat call: the limit of the endpoint that answers it.
+            else chat_seconds(self.privacy == "strict")
+        )
+        if self.timeout > deadline:
+            raise LimitError(
+                "timeout_budget", int(self.timeout * 1000), int(deadline * 1000), "ms"
+            )
+        if self.progress_timeout is not None and (
+            self.profile is None or self.privacy == "strict"
+        ):
+            # Only the quality controller watches for a silent call.
+            raise ValueError("invalid_progress_timeout")
+        if self.profile is None:
+            if (
+                self.has_attachments
+                or self.produces_files
+                or self.max_tokens != 2048
+                or self.budget_eur is not None
+                or self.reasoning_effort == "high"
+                or self.reasoning_ceiling is not None
+                or self.sampling_temperature is not None
+                or self.single_attempt
+                or self.vision_role != "vision"
+            ):
+                raise ValueError("invalid_legacy_profile")
+            self.reasoning_effort = "none"
+            return self
+        ceiling = 6000
+        if "max_tokens" not in self.model_fields_set:
+            self.max_tokens = ceiling
+        # A file turn may ask for more: an app or drawing is one whole file in a
+        # single answer (services/orchestrator/app_turn.py). The cost ceiling of
+        # a file turn (0.30 EUR) still bounds every attempt.
+        if self.produces_files:
+            ceiling = FILE_OUTPUT_CEILING
+        if self.max_tokens > ceiling:
+            raise LimitError("output_budget", self.max_tokens, ceiling, "tokens")
+        self.reasoning_effort = "none"
+        cap = Decimal(
+            "0.30" if (self.has_attachments or self.produces_files) else "0.10"
+        )
+        try:
+            budget = Decimal(self.budget_eur) if self.budget_eur is not None else cap
+        except InvalidOperation:
+            raise ValueError("cost_budget") from None
+        if not budget.is_finite():
+            raise ValueError("cost_budget: expected a finite monetary amount")
+        if not 0 <= budget <= cap:
+            raise LimitError(
+                "cost_budget", int(budget * 1000000), int(cap * 1000000), "microEUR"
+            )
+        return self
+
+
+class AgentProvider:
+    def __init__(self) -> None:
+        if os.environ.get("ATLAS_PROVIDER"):
+            from serverless import ServerlessPolicy
+
+            policy = ServerlessPolicy()
+            self.model = policy.models["text"]
+        else:
+            self.model = os.environ["ESCALATION_MODEL"]
+        routing = yaml.safe_load(Path(__file__).with_name("routing.yaml").read_text())
+        self.local_endpoint = os.path.expandvars(
+            routing["providers"]["local"]["base_url"]
+        ).rstrip("/")
+        self.local_model = os.path.expandvars(
+            routing["task_classes"]["chat_simple"]["primary"]["model"]
+        )
+        catalogue = yaml.safe_load(Path(__file__).with_name("pricing.yaml").read_text())
+        if os.environ.get("ATLAS_PROVIDER"):
+            catalogue["models"] = policy.prices
+        if self.model not in catalogue["models"]:
+            raise ValueError("missing_price")
+        self.price = catalogue["models"][self.model]
+        for key in ("input_eur_per_mtok", "output_eur_per_mtok"):
+            value = Decimal(str(self.price[key]))
+            if not value.is_finite() or value < 0:
+                raise ValueError("invalid_price")
+
+    def configuration(self, local_enabled: bool = True) -> dict[str, object]:
+        if not local_enabled:
+            from serverless import ServerlessPolicy
+
+            return ServerlessPolicy().configuration()
+        return {
+            key: str(self.price[key])
+            for key in ("input_eur_per_mtok", "output_eur_per_mtok")
+        } | {"max_tokens": 2048}
+
+    async def stream(self, payload: object) -> AsyncGenerator[dict[str, object], None]:
+        from stream_transport import stream
+
+        from contextlib import aclosing
+
+        async with aclosing(stream(self, payload)) as events:
+            async for event in events:
+                yield event
+
+    async def complete(self, payload: object) -> dict[str, object]:
+        request = AgentRequest.model_validate(payload)
+        if request.privacy == "strict" and request.profile is not None:
+            return await self.owned_answer(payload)
+        if request.privacy == "strict":
+            return await self.owned_complete(request)
+        if request.profile is not None:
+            from quality import complete
+
+            return await complete(self, request)
+        if not request.local_enabled:
+            return await self.serverless_complete(request)
+        endpoint = provider_settings.endpoint()
+        started = monotonic()
+        route = classify(request.messages)
+        fallback = False
+
+        def observed(answer: dict[str, object], provider: str) -> dict[str, object]:
+            if request.observe:
+                return {
+                    **answer,
+                    "observation": {
+                        "provider": provider,
+                        "route": "simple" if route == "chat_simple" else "complexe",
+                    },
+                }
+            return answer
+
+        if route == "chat_simple" and request.local_enabled:
+            try:
+                if "$" in self.local_model or "$" in self.local_endpoint:
+                    raise RuntimeError("local_unconfigured")
+                async with asyncio.timeout(min(2.0, request.timeout * 0.2)):
+                    answer = await self._complete(
+                        request,
+                        self.local_endpoint,
+                        self.local_model,
+                        "",
+                        min(2.0, request.timeout * 0.2),
+                    )
+                logging.getLogger(__name__).info(
+                    json.dumps(
+                        {
+                            "event": "routing",
+                            "route": route,
+                            "provider": "local",
+                            "fallback": False,
+                        }
+                    )
+                )
+                return observed(answer, "local")
+            except (RuntimeError, TimeoutError):
+                fallback = True
+        remaining = request.timeout - (monotonic() - started)
+        if remaining <= 0:
+            raise TimeoutError("timeout")
+        logging.getLogger(__name__).info(
+            json.dumps(
+                {
+                    "event": "routing",
+                    "route": route,
+                    "provider": "scaleway",
+                    "fallback": fallback,
+                }
+            )
+        )
+        async with asyncio.timeout(remaining):
+            answer = await self._complete(
+                request,
+                endpoint,
+                self.model,
+                provider_settings.api_key(),
+                remaining,
+            )
+            return observed(answer, "escalade")
+
+    async def owned_answer(self, payload: object) -> dict[str, object]:
+        """A strict assistant call that is not streamed to its caller.
+
+        It runs the streamed owned call and returns its result, so a profile
+        answer carries what the orchestrator checks on every profile call (its
+        measured cost, 0 on the owned server; the answer's output allowance;
+        the model name). The plain owned completion has no cost and a
+        2048-token cap: every non-streamed strict API turn failed as
+        provider_error (staging -141 and -142, 2026-11-21).
+        """
+        from contextlib import aclosing
+
+        result: dict[str, object] | None = None
+        async with aclosing(self.stream(payload)) as events:
+            async for event in events:
+                if isinstance(event.get("result"), dict):
+                    result = event["result"]  # type: ignore[assignment]
+        if result is None:
+            raise RuntimeError("provider_error")
+        return result
+
+    async def owned_complete(self, request: AgentRequest) -> dict[str, object]:
+        endpoint = provider_settings.owned_endpoint()
+        model = str(provider_settings.preset_value("owned-vllm", "text_model"))
+        key = provider_settings.owned_api_key()
+        try:
+            async with asyncio.timeout(request.timeout):
+                answer = await self._complete(
+                    request, endpoint, model, key, request.timeout
+                )
+        except RuntimeError as exc:
+            if str(exc) == "provider_error" and request.start_owned:
+                # A silent owned server may be powered off: ask its starter.
+                import owned_start
+
+                await owned_start.ensure()
+            raise
+        if request.observe:
+            answer["observation"] = {
+                "provider": "owned",
+                "route": "simple"
+                if classify(request.messages) == "chat_simple"
+                else "complexe",
+            }
+        return answer
+
+    async def serverless_complete(self, request: AgentRequest) -> dict[str, object]:
+        from serverless import ServerlessPolicy
+        from provider_retry import RetryLedger, retry_stream, unbilled
+        from contextlib import aclosing
+
+        if request.privacy == "strict":
+            return await self.owned_complete(request)
+        policy = ServerlessPolicy()
+        plan = policy.reserve(request.messages, request.tools)
+        endpoint = provider_settings.endpoint()
+        started = monotonic()
+        unknown = Decimal(0)
+        malformed_name: MalformedToolCall | None = None
+        for index, model in enumerate((plan.primary, plan.fallback)):
+            remaining = request.timeout - (monotonic() - started)
+            if remaining <= 0:
+                if malformed_name is not None:
+                    raise MalformedToolCall(malformed_name.measured, index)
+                raise TimeoutError("timeout")
+            # Leave time for one fallback while keeping the original total deadline.
+            allotted = remaining * 0.7 if index == 0 else remaining
+            ledger = RetryLedger()
+
+            async def completion_events(
+                current: AgentRequest, selected: str, seconds: float
+            ) -> AsyncGenerator[dict[str, object], None]:
+                yield {
+                    "result": await self._complete(
+                        current,
+                        endpoint,
+                        selected,
+                        provider_settings.api_key(),
+                        seconds,
+                    )
+                }
+
+            try:
+                async with (
+                    asyncio.timeout(allotted),
+                    aclosing(
+                        retry_stream(
+                            completion_events,
+                            request,
+                            model,
+                            allotted,
+                            plan.reserved_eur - unknown,
+                            plan.incoming,
+                            ledger,
+                        )
+                    ) as events,
+                ):
+                    async for event in events:
+                        value = event["result"]
+                        assert isinstance(value, dict)
+                        answer = value
+            except ProviderLimitError:
+                raise
+            except (RuntimeError, TimeoutError) as exc:
+                if isinstance(exc, MalformedToolCall):
+                    malformed_name = exc
+                unknown += ledger.spent + (
+                    Decimal(0)
+                    if unbilled(exc)
+                    else plan.fallback_bound
+                    if index
+                    else plan.primary_bound
+                )
+                logging.getLogger(__name__).info(
+                    json.dumps(
+                        {
+                            "event": "serverless_failure",
+                            "task_type": plan.task_type,
+                            "attempt": index + 1,
+                            "reserved_unknown_eur": str(unknown),
+                        }
+                    )
+                )
+                if index:
+                    if malformed_name is not None:
+                        raise MalformedToolCall(
+                            malformed_name.measured, index
+                        ) from None
+                    raise
+                if isinstance(exc, MalformedToolCall):
+                    request = request.model_copy(
+                        update={"tools": [], "tool_choice": "none"}
+                    )
+                continue
+            unknown += ledger.spent
+            usage = answer.get("usage")
+            if not isinstance(usage, dict):
+                raise RuntimeError("provider_response_invalid")
+            actual = policy.cost(
+                model, int(usage["prompt_tokens"]), int(usage["completion_tokens"])
+            )
+            logging.getLogger(__name__).info(
+                json.dumps(
+                    {
+                        "event": "serverless_usage",
+                        "task_type": plan.task_type,
+                        "fallback": bool(index),
+                        "tokens": usage,
+                        "cost_eur": str(actual),
+                        "reserved_unknown_eur": str(unknown),
+                    }
+                )
+            )
+            answer["cost_eur"] = str(unknown + actual)
+            if request.observe:
+                answer["observation"] = {
+                    "provider": "escalade",
+                    "route": "simple"
+                    if classify(request.messages) == "chat_simple"
+                    else "complexe",
+                    "task_type": plan.task_type,
+                    "fallback": bool(index),
+                }
+            return answer
+        raise RuntimeError("provider_error")
+
+    async def _complete(
+        self, request: AgentRequest, endpoint: str, model: str, key: str, timeout: float
+    ) -> dict[str, object]:
+        from provider_retry import ProviderUnreached, TransientProviderError
+
+        body = {
+            "model": model,
+            "messages": request.messages,
+            # Never an empty tool list: vLLM refuses it (HTTP 400).
+            **(
+                {"tools": request.tools, "tool_choice": request.tool_choice}
+                if request.tools
+                else {}
+            ),
+            **provider_settings.json_options(request.response_format),
+            "max_tokens": 2048,
+            "temperature": 0,
+            "reasoning_effort": "none",
+        }
+        try:
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=timeout), trust_env=False
+            ) as session:
+                async with session.post(
+                    endpoint + "/chat/completions",
+                    json=provider_settings.request_options(body),
+                    headers={"Authorization": "Bearer " + key} if key else {},
+                    allow_redirects=False,
+                ) as response:
+                    if response.status in (502, 503, 504):
+                        # Refused before running: nothing billed, except a 504
+                        # (provider_retry.unbilled).
+                        raise TransientProviderError(
+                            "provider_error",
+                            received_bytes=None if response.status == 504 else 0,
+                        )
+                    if response.status != 200:
+                        raise RuntimeError("provider_error")
+                    data = bytearray()
+                    with upstream.abort_if_abandoned(response):
+                        async for piece in response.content.iter_chunked(16384):
+                            data.extend(piece)
+                            if len(data) > 800000:
+                                raise ProviderLimitError(
+                                    "provider_response_limit",
+                                    len(data),
+                                    800000,
+                                    "bytes",
+                                )
+            completion = Completion.model_validate(json.loads(data))
+            if completion.usage.completion_tokens > 2048:
+                raise ProviderLimitError(
+                    "output_budget", completion.usage.completion_tokens, 2048, "tokens"
+                )
+            content_size = len(completion.choices[0].message.content or "")
+            if content_size > 32000:
+                raise ProviderLimitError(
+                    "provider_response_limit", content_size, 32000, "characters"
+                )
+            if completion.choices[0].finish_reason == "length":
+                raise ValueError("provider_response_invalid")
+            reply = completion.choices[0].message
+            if not (reply.content or "").strip() and not reply.tool_calls:
+                raise TransientProviderError("provider_response_invalid")
+            ids = [call.id for call in reply.tool_calls]
+            if len(ids) != len(set(ids)):
+                raise RuntimeError("provider_response_invalid")
+            return {
+                "text": reply.content or "",
+                "usage": completion.usage.model_dump(),
+                "calls": [
+                    {
+                        "id": call.id,
+                        "name": call.function.name,
+                        "arguments": call.function.arguments,
+                    }
+                    for call in reply.tool_calls
+                ],
+            }
+        except LimitError:
+            raise
+        except json.JSONDecodeError:
+            raise TransientProviderError("provider_error") from None
+        except ValidationError as exc:
+            malformed = malformed_tool_name(exc)
+            if malformed is not None:
+                raise malformed from None
+            limit = numeric_limit(exc)
+            if limit is not None:
+                raise limit from None
+            raise RuntimeError("provider_error") from None
+        except aiohttp.ClientConnectorError:
+            # No connection, so no request reached the provider.
+            raise ProviderUnreached("provider_error") from None
+        except (aiohttp.ClientError, ValueError):
+            raise RuntimeError("provider_error") from None

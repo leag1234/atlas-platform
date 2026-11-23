@@ -1,0 +1,86 @@
+# SearXNG settings owned by ATLAS.  server.secret_key is overridden by
+# SEARXNG_SECRET at runtime; no credential is committed here.
+use_default_settings:
+  engines:
+    keep_only:
+      - duckduckgo
+      - startpage
+      - mojeek
+      - seznam
+      - qwant
+      - brave
+      - google
+      - bing
+      - privacywall
+      - mwmbl
+      - wikipedia
+
+general:
+  enable_metrics: false
+
+search:
+  safe_search: 1
+  default_lang: en
+  autocomplete: ""
+  ban_time_on_fail: 60
+  max_ban_time_on_fail: 3600
+  # SearXNG's default suspensions
+  # (https://docs.searxng.org/admin/settings/settings_search.html). An engine
+  # that refused this server is not asked again before the block can lift:
+  # 60 s suspensions asked blocking engines again every minute and the blocks
+  # lasted (2026-11-16). The client waits as long (searxng.SUSPENDED_SECONDS).
+  suspended_times:
+    SearxEngineAccessDenied: 86400
+    SearxEngineCaptcha: 86400
+    SearxEngineTooManyRequests: 3600
+    cf_SearxEngineCaptcha: 1296000
+    cf_SearxEngineAccessDenied: 86400
+    recaptcha_SearxEngineCaptcha: 604800
+  formats:
+    - html
+    - json
+
+server:
+  secret_key: ultrasecretkey
+  limiter: false
+  image_proxy: false
+  public_instance: false
+
+# The client asks one engine per request with the "engines" parameter, which
+# selects an engine even when it is disabled. Every engine is disabled so that
+# a request naming no loaded engine, or adding "categories", reaches no engine
+# instead of all of them (SearXNG's webadapter falls back to the whole default
+# category). Startpage and Mojeek are inactive upstream because they answer
+# with a proof-of-work challenge; the pinned engines solve it, and the cost is
+# small at this instance's volume (measured 2026-11-14).
+engines:
+  - name: wikipedia
+    display_type: [list]
+    disabled: true
+  - name: duckduckgo
+    disabled: true
+  - name: startpage
+    disabled: true
+    inactive: false
+  - name: mojeek
+    disabled: true
+    inactive: false
+  - name: seznam
+    disabled: true
+  - name: qwant
+    disabled: true
+  - name: brave
+    disabled: true
+  - name: google
+    disabled: true
+  - name: bing
+    disabled: true
+  - name: privacywall
+    disabled: true
+  - name: mwmbl
+    disabled: true
+
+outgoing:
+  request_timeout: 7.0
+  max_request_timeout: 8.0
+  retries: 0

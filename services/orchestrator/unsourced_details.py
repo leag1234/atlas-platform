@@ -1,0 +1,2272 @@
+"""Precise details an answer adds from memory around sourced facts.
+
+The dominant measured quality defect is an answer that states a sourced fact and
+then adds precise details nobody retrieved: founding members, a full birth date,
+a height, the origin of a name. The code finds them, the model decides what to do
+with them (owner principle "the code does and checks, the model decides"):
+
+1. every precise detail of the answer is extracted (a full date, a calendar
+   quarter, a version number, a year, a number with its scale word or unit, a
+   proper name, a quoted title);
+2. each one is looked up in the texts the turn retrieved (search results, fetched
+   pages, specialized sources such as the encyclopedia facts), in the person's own
+   messages, or as the same value in another written form (another language's
+   month name, an ISO date, another thousands separator, a rounded number, a
+   scale written short such as "1,5 Mio.", "Q3 2024" for "third quarter of
+   2024", "version 5.0" for "5", a name without its accents);
+   a value the turn computed is no added detail either (``Computed``): a result
+   of a computation tool (calculator, date_time, unit_convert, currency_convert),
+   arithmetic on the person's own numbers (a difference, a percentage, a share),
+   a written calculation code recomputes, and calendar facts (the days, weeks or
+   months between two given dates, the weekday names). Staging 2026-11-20:
+   "There are **261** days between 3 March and 19 November 2026" became "There
+   are **days** between...", the date_time result being in no page read;
+3. the details no retrieved text holds go to one bounded revision call: the model
+   removes each one, replaces it with what the given source excerpts state, or
+   keeps it followed by a "not verified" marker in the answer language (UNVERIFIED)
+   when the sentence would lose its point without it, and changes nothing else;
+4. the revision is checked by code and kept only when it removes unsupported
+   details without adding any new one, keeps every link, and stays an answer; a
+   sentence left with its detail cut out and nothing rewritten ("There are
+   **days**") goes as a whole, never stays hollow;
+   otherwise the original answer is kept, and in ``revise_mark`` mode the details
+   still unsupported after this second and last check are marked next to their
+   sentence, in the answer language.
+
+Survey (2026-11-21, owner rule: existing work first). FActScore (Min et al.
+2023) splits an answer into atomic facts and scores each against retrieved
+passages with a model; SAFE (Wei et al. 2024) adds a search per fact;
+RefChecker (Hu et al. 2024) extracts claim triplets with a model and checks
+them against the reference. All three spend one or more model calls per claim
+(seconds to tens of seconds per answer). Their measured weak point is the same
+as here: names, dates and numbers carry most errors, and these are exactly what
+string and value matching checks for free. So code extracts and matches the
+specific details (dates, quarters, versions, numbers, names, titles) in under a
+second, and a model is called once, only when something is unmatched, to decide
+what to do with it. A relation between sourced facts (a cause the source never
+states) is not a detail: source_faithfulness checks it for provided documents.
+
+Before the revision, the details no retrieved text holds are looked up in the
+subject's full encyclopedia articles (the pages the turn reached, the article the
+question names, its counterpart in English or the answer's language): a detail
+found there is sourced, and the article joins the consulted sources. An article
+counts only when it is about the subject (its title is named in the question or
+the answer): a stadium's page holding "21" never supports a percentage, nor
+joins its sources (staging 2026-11-20). Only standard and enhanced levels read
+the live encyclopedia here.
+
+A turn that streams (no held check) cannot have its text taken back (owner
+decision 2026-11-21): once it ends, ``streamed_check`` looks its details up in
+the texts it read (collected in ``anchors``) and names those none holds in one
+closing note in the person's language, without a model call; an answer whose
+details are all found gets no note. The interface stream receives the note as
+a last delta; an API answer, streamed or not, is sent whole with it.
+
+Dates are compared by value (``date_spans``): the same day of the same month,
+in any written form ("16.01.2026", "16 janvier 2026", "January 16, 2026"), a
+day and month without the year included; another day or month is another
+date, never a near match (a "30 janvier" once read as the number 30 was
+supported by any 30 of the source). A date the answer gives for an event
+(``EVENTS``: a receipt or transmission, a publication, a signature, an
+adoption, an entry into force, a writing) must be the one the source gives for
+that event when the source labels one: a cover note dated the 30th that
+records the receipt on the 29th does not support "transmitted on the 30th"
+(staging 2026-11-21). A percentage is matched with its unit.
+
+The same check covers the answers that restate a provided source (an attached
+document, a pasted text) and the files produced in a turn, against everything
+the turn holds (documents, pages read, tool results; ``turn_passages``):
+chat_pipeline runs it after source_faithfulness, whose judge reads relations,
+and deliverable_check reads the built file back (``deliverable_details``) and
+refuses it once with the details no source holds. A name or a title is not
+matched when the text and its sources are in different languages (a
+translated name is no added detail).
+
+``ATLAS_UNSOURCED_DETAILS``: ``off`` (default), ``mark``, ``revise``,
+``revise_mark`` (the streamed note runs in the two marking modes). It applies to a held factual turn (grounding's cue, or a
+question about a named subject when the setting is on), with or without
+retrieved sources; grounding runs after it on the final text. An answer whose
+details are mostly unsupported (the sources do not cover it) is left as it is.
+Every pass over the answer and the sources is linear in their size.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from bisect import bisect_left
+from contextvars import ContextVar
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass, field
+from datetime import date
+from decimal import Decimal, InvalidOperation
+import json
+import logging
+import math
+import os
+import re
+import time
+
+from urllib.parse import unquote
+
+import aiohttp
+
+from packages import privacy
+from packages.ports import atlas_ports
+from services.orchestrator import dangling_words, encyclopedia, reference_fetch
+from services.orchestrator.dictation_cleanup import fast_profile
+from services.orchestrator.link_requests import own_words
+from services.orchestrator.grounding import STOP as STOP_WORDS
+from services.orchestrator.grounding import (
+    CREATIVE,
+    Grounding,
+    needs_grounding,
+    normalized,
+    question_entities,
+    small_talk,
+    terms,
+)
+
+LOGGER = logging.getLogger(__name__)
+MODES = frozenset({"off", "mark", "revise", "revise_mark"})
+# One revision call: its ceiling and its time (the answer is held meanwhile).
+CALL_BUDGET_EUR = Decimal("0.02")
+DEADLINE_SECONDS = float(os.environ.get("ATLAS_UNSOURCED_DETAILS_SECONDS", "12"))
+EXCERPT_CHARACTERS = 4000
+# The reference check: full encyclopedia articles of the subject, read once.
+REFERENCE_SECONDS = 6.0
+REFERENCE_ARTICLES = 4
+WIKI_URL = re.compile(r"https://([a-z]{2,3})\.wikipedia\.org/wiki/([^\s\"'<>#?|\]]++)")
+MAX_DETAILS = 40
+# Beyond this share of unsupported details the sources do not cover the answer (a
+# broad answer from memory): stripping or flagging most of it would leave no answer,
+# so it is left as it is and counted.
+UNCOVERED_SHARE = 0.4
+# Details an uncovered answer's closing note names at most.
+NOTE_DETAILS = 8
+
+MONTHS: dict[str, int] = {}
+for _number, _names in enumerate(
+    (
+        "january janvier januar enero gennaio jan",
+        "february fevrier februar febrero febbraio feb fev",
+        "march mars marz marzo",
+        "april avril abril aprile apr avr",
+        "may mai mayo maggio",
+        "june juin juni junio giugno jun",
+        "july juillet juli julio luglio jul juil",
+        "august aout agosto aug",
+        "september septembre septiembre settembre sep sept",
+        "october octobre oktober octubre ottobre oct okt",
+        "november novembre noviembre nov",
+        "december decembre dezember diciembre dicembre dec dez",
+    ),
+    start=1,
+):
+    for _name in _names.split():
+        MONTHS[_name] = _number
+# Month words that are a month only written with a capital ("5 May", not "it
+# may"; "2 Mar." and "Jan 3", not a word cut short).
+CAPITAL_MONTHS = frozenset(
+    "may mar jan feb fev apr avr jun jul juil aug sep sept oct okt nov dec dez".split()
+)
+
+
+def _month(word: str) -> int:
+    """The month a written word names, 0 when none."""
+    name = normalized(word)
+    if not word or (word[0].islower() and name in CAPITAL_MONTHS):
+        return 0
+    return MONTHS.get(name, 0)
+
+
+# What a date is the date of, by the words just before it: a date the answer
+# gives as a receipt, a publication or a signature must be the one the source
+# gives for it when the source labels one, not another date of the same text.
+# Staging 2026-11-21: a cover note "Bruxelles, le 30 janvier 2025" recording
+# "Date de reception: 29 janvier 2025"; the answer said "transmise au Conseil le
+# 30 janvier", and both dates were in the source. Word stems (normalized) and
+# whole words, in the five interface languages.
+EVENTS: dict[str, tuple[tuple[str, ...], frozenset[str]]] = {
+    "transfer": (
+        (
+            "reception",
+            "transmi",
+            "envoy",
+            "expedi",
+            "receiv",
+            "receipt",
+            "submitt",
+            "deliver",
+            "eingegangen",
+            "eingang",
+            "empfang",
+            "ubermittel",
+            "zugestellt",
+            "eingereicht",
+            "versand",
+            "geschickt",
+            "gesendet",
+            "recibid",
+            "ricevut",
+            "inviat",
+            "enviad",
+        ),
+        frozenset(
+            "recu recue recus recues envoi soumis soumise sent filed erhalten".split()
+        ),
+    ),
+    "publication": (
+        (
+            "publie",
+            "publica",
+            "publish",
+            "publiz",
+            "parution",
+            "veroffentlich",
+            "pressemitteilung",
+            "erschien",
+            "pubblica",
+        ),
+        frozenset("paru parue released release communique".split()),
+    ),
+    "signature": (
+        ("signature", "unterzeichn", "unterschrieb", "signing", "firmad", "firmat"),
+        frozenset("signe signee signes signees signed".split()),
+    ),
+    "adoption": (
+        (
+            "adopt",
+            "approuv",
+            "approved",
+            "verabschiedet",
+            "beschlossen",
+            "angenommen",
+            "aprobad",
+            "approvat",
+        ),
+        frozenset(),
+    ),
+    "force": (("inkraft",), frozenset("vigueur kraft".split())),
+    # The date a text is written or dated on: "la note, redigee le 30 janvier".
+    # Named, it is the nearest event; a date of another event is not read
+    # across it (staging 2026-11-21: "Date de transmission : la note a ete
+    # redigee le 30 janvier" is the date of writing).
+    "writing": (
+        ("redig", "verfass", "datiert", "drafted"),
+        frozenset("datee datees dated written ecrite ecrit redaction".split()),
+    ),
+}
+# How far back the words of a date's event are read, in characters.
+EVENT_WINDOW = 80
+
+
+# Where the words after a date stop being about it: a German verb ends its
+# clause ("am 30. Januar 2026 eingegangen"), a comma starts another one.
+CLAUSE_END = re.compile(r"[,;:.()\n]")
+
+
+def event_of(before: str, after: str = "") -> str:
+    """The event the words just before a date name (EVENTS), else the words of
+    its clause after it; "" when none."""
+    tokens = list(reversed(normalized(before[-EVENT_WINDOW:]).split()))
+    if not any(_event(token) for token in tokens):
+        stop = CLAUSE_END.search(after)
+        tokens = normalized(after[: stop.start() if stop else len(after)]).split()
+    for token in tokens:
+        if event := _event(token):
+            return event
+    return ""
+
+
+def _event(token: str) -> str:
+    for event, (stems, words) in EVENTS.items():
+        if token in words or token.startswith(stems):
+            return event
+    return ""
+
+
+DateValue = tuple[int, int, int]  # year (0 when not written), month, day
+
+
+def date_spans(text: str, *, source: bool = False) -> list[tuple[int, int, DateValue]]:
+    """The calendar dates a text writes, by value, in reading order.
+
+    Every written form compares by value: "16.01.2026", "2026-01-16", "16
+    janvier 2026", "January 16, 2026" and "16. Januar 2026" are one date; a
+    day and month without the year ("30 janvier") is one too, with year 0. A
+    source's numeric date is read both ways when both are calendar dates
+    ("03/05/2025"), and a range of days ("29 et 30 janvier") gives both.
+    """
+    marks = bytearray(len(text) + 1)
+    found: list[tuple[int, int, DateValue]] = []
+
+    def put(start: int, end: int, values: list[DateValue]) -> None:
+        values = [v for v in values if 1 <= v[1] <= 12 and 1 <= v[2] <= 31]
+        if not values or marks[start]:
+            return
+        marks[start:end] = b"\x01" * (end - start)
+        found.extend((start, end, value) for value in values)
+
+    for match in NUMERIC_DATE.finditer(text):
+        if match[1]:
+            put(*match.span(), [(int(match[1]), int(match[2]), int(match[3]))])
+            continue
+        year, first, second = int(match[6]), int(match[4]), int(match[5])
+        orders = [(year, second, first)]
+        if source and first != second:
+            orders.append((year, first, second))
+        put(*match.span(), orders)
+    if source:
+        for match in DAY_RANGE.finditer(text):
+            month = _month(match[3])
+            year = int(match[4]) if match[4] else 0
+            if month:
+                put(
+                    *match.span(),
+                    [(year, month, int(match[1])), (year, month, int(match[2]))],
+                )
+    for pattern, month_group, day_group in (
+        (DAY_FIRST, 2, 1),
+        (MONTH_FIRST, 1, 2),
+    ):
+        for match in pattern.finditer(text):
+            if month := _month(match[month_group]):
+                put(*match.span(), [(int(match[3]), month, int(match[day_group]))])
+    for pattern, month_group, day_group in (
+        (DAY_MONTH, 2, 1),
+        (MONTH_DAY, 1, 2),
+    ):
+        for match in pattern.finditer(text):
+            if month := _month(match[month_group]):
+                put(*match.span(), [(0, month, int(match[day_group]))])
+    found.sort()
+    return found
+
+
+def _event_floor(text: str, start: int, previous: int) -> int:
+    """Where the words of a date's event begin: not before the line, the
+    sentence or the date before it."""
+    lowest = max(previous, start - EVENT_WINDOW, 0)
+    floor = max(lowest, text.rfind("\n", lowest, start) + 1)
+    sentence = text.rfind(". ", floor, start)
+    return sentence + 2 if sentence >= 0 else floor
+
+
+def dated_events(
+    text: str, *, source: bool = False
+) -> list[tuple[int, int, DateValue, str]]:
+    """Each date of a text with the event the words before it name."""
+    spans = date_spans(text, source=source)
+    starts = sorted({start for start, _, _ in spans})
+    result: list[tuple[int, int, DateValue, str]] = []
+    previous = 0
+    for start, end, value in spans:
+        floor = _event_floor(text, start, previous)
+        following = starts[bisect_left(starts, end)] if starts[-1] >= end else len(text)
+        ceiling = min(following, end + EVENT_WINDOW)
+        result.append(
+            (start, end, value, event_of(text[floor:start], text[end:ceiling]))
+        )
+        previous = max(previous, end)
+    return result
+
+
+NUMBER_WORDS: dict[int, frozenset[str]] = {
+    value: frozenset(words.split())
+    for value, words in enumerate(
+        (
+            "zero zero null cero",
+            "one un une eins uno una",
+            "two deux zwei dos due",
+            "three trois drei tres tre",
+            "four quatre vier cuatro quattro",
+            "five cinq funf cinco cinque",
+            "six six sechs seis sei",
+            "seven sept sieben siete sette",
+            "eight huit acht ocho otto",
+            "nine neuf neun nueve nove",
+            "ten dix zehn diez dieci",
+            "eleven onze elf once undici",
+            "twelve douze zwolf doce dodici",
+        )
+    )
+}
+SCALES = {
+    "thousand": 1e3,
+    "mille": 1e3,
+    "tausend": 1e3,
+    "mil": 1e3,
+    "million": 1e6,
+    "millions": 1e6,
+    "millionen": 1e6,
+    "millones": 1e6,
+    "milioni": 1e6,
+    "milione": 1e6,
+    "millon": 1e6,
+    "billion": 1e9,
+    "billions": 1e9,
+    "milliard": 1e9,
+    "milliards": 1e9,
+    "milliarden": 1e9,
+    "miliardi": 1e9,
+    "miliardo": 1e9,
+    "milliarde": 1e9,
+    # Written short: "1,5 Mio.", "2 Mrd.", "3 Md€", "4 bn".
+    "mio": 1e6,
+    "mln": 1e6,
+    "mrd": 1e9,
+    "md": 1e9,
+    "mds": 1e9,
+    "mld": 1e9,
+    "bn": 1e9,
+}
+# Words written with a capital at the start of a sentence that are not names.
+COMMON = frozenset(
+    (
+        "a an the this that these those it he she they we you i there here "
+        "however also but so then today yes no note source sources summary "
+        "le la les l un une des du de d ce cet cette ces il elle ils elles on nous "
+        "vous je mais donc puis ensuite enfin aujourd hui oui non voici selon "
+        "parmi apres avant depuis en au aux pour par avec sur dans "
+        "der die das ein eine es er sie wir und aber el los las una y pero "
+        "il lo gli e ma wikipedia wikidata"
+    ).split()
+) | frozenset(MONTHS)
+# Weekday names are calendar facts, not names a source must hold ("19 November
+# 2026 is a Thursday"; relative_dates checks the weekday against the calendar).
+WEEKDAYS = frozenset(
+    (
+        "monday tuesday wednesday thursday friday saturday sunday "
+        "lundi mardi mercredi jeudi vendredi samedi dimanche "
+        "montag dienstag mittwoch donnerstag freitag samstag sonntag "
+        "lunes martes miercoles jueves viernes sabado domingo "
+        "lunedi martedi mercoledi giovedi venerdi sabato domenica"
+    ).split()
+)
+# Words that join the parts of one name ("Charles de Gaulle", "Bank of England").
+CONNECTORS = frozenset(
+    "de du des la le les d l von van der den of the di da del dos".split()
+)
+STOP = CONNECTORS | frozenset("a an in on at to for by with and et y und e".split())
+# Titles before a name ("King Charles VIII", "President Ilse Varnholt"): a source
+# naming the person without the title still holds the name.
+TITLES = frozenset(
+    (
+        "king queen prince princess emperor empress pope saint st sir lord lady dame "
+        "president general captain duke count dr mr mrs ms "
+        "roi reine princesse empereur imperatrice pape sainte president presidente "
+        "general generale capitaine duc duchesse comte comtesse m mme "
+        "konig konigin kaiser papst rey reina emperador papa santo santa re regina "
+        "imperatore"
+    ).split()
+)
+
+# A full date: "18 December 1970", "December 18, 1970", "1st May 1968" (any of
+# the five interface languages).
+DAY_FIRST = re.compile(
+    r"\b(\d{1,2})(?:er|st|nd|rd|th|\.)?\s([^\W\d_]{3,10})\.?\s(\d{4})\b"
+)
+MONTH_FIRST = re.compile(
+    r"\b([^\W\d_]{3,10})\.?\s(\d{1,2})(?:st|nd|rd|th)?,?\s(\d{4})\b"
+)
+YEAR = re.compile(r"\b(?:1[0-9]{3}|20[0-9]{2})\b")
+# A day and a month without the year: "30 janvier", "30. Januar", "January 30".
+# The day is no number of its own: read as one, "transmise le 30 janvier" was
+# supported by any "30" of the source (staging 2026-11-21, the source said 29).
+DAY_MONTH = re.compile(r"\b(\d{1,2})(?:er|st|nd|rd|th|\.)?\s([^\W\d_]{3,10})\b")
+MONTH_DAY = re.compile(
+    r"\b([^\W\d_]{3,10})\.?\s(\d{1,2})(?:st|nd|rd|th)?\b(?![.,:]?\d)"
+)
+# Two days of one month in a source: "29 et 30 janvier 2025", "29-30 January".
+DAY_RANGE = re.compile(
+    r"\b(\d{1,2})(?:er|st|nd|rd|th|\.)?\s?(?:-|–|et|and|und|y|e|au|to|bis)\s?"
+    r"(\d{1,2})(?:er|st|nd|rd|th|\.)?\s([^\W\d_]{3,10})\b\.?(?:\s(\d{4})\b)?"
+)
+# A numeric date: "2004-12-16", "16/12/2004", "16.12.2004".
+NUMERIC_DATE = re.compile(
+    r"\b(\d{4})-(\d{2})-(\d{2})\b|\b(\d{1,2})[/.](\d{1,2})[/.](\d{4})\b"
+)
+# A number: grouped thousands or plain digits, a decimal part, a scale word.
+NUMBER = re.compile(
+    r"(?<![\w.,])(?:\d{1,3}(?:[   .,]\d{3})++|\d++)(?:[.,]\d++)?+"
+    r"(?:\s?(?:%|(?i:mio|mln|mrd|mds?|mld|bn)\b\.?|[^\W\d_]{4,11}))?+"
+)
+# A percentage written in words after its number.
+PERCENT_WORD = re.compile(
+    r"(?i)\s?(?:percent|per\scent|pour\s?cent|prozent|por\sciento|per\scento|pct\b)"
+)
+# A version number: after a version word ("version 4.2.1", "Version 5",
+# "release 3.0", "v2.1"), or three or four dotted parts ("4.2.1"). Its digits
+# are no year or amount: "4.2.7" read as the number 4.2 matched a source's
+# "4.2.1" (2026-11-21).
+VERSION = re.compile(
+    r"(?i)(?<![\w.])(?:(?:version|versión|versione|release|révision|revision|build)"
+    r"\s|v(?=\d))(\d{1,4}(?:\.\d{1,4}){0,3})(?![\w]|\.\d)"
+    r"|(?<![\w.,])(\d{1,4}\.\d{1,4}\.\d{1,4}(?:\.\d{1,4})?)(?![\w]|\.\d)"
+)
+# Dotted numbers of a source, as the versions it may name ("Tarnweld 4.2").
+DOTTED = re.compile(r"(?<![\w.,])\d{1,4}(?:\.\d{1,4})+(?![\w]|\.\d)")
+# A calendar quarter: "Q3 2024", "T3 2024", "2024 Q3", "3. Quartal 2024",
+# "third quarter of 2024", its French ordinal form, "drittes Quartal 2024".
+QUARTER = re.compile(
+    r"(?i)\b(?:[QT]([1-4])|([1-4])\.\s?Quartals?)\s?[/-]?\s?(\d{4})\b"
+    r"|\b(\d{4})\s?[/-]?\s?Q([1-4])\b"
+    r"|\b([^\W_]{2,10})\s(?:quarter|trimestre|quartals?)\s(?:of\s|de\s|del\s|des\s)?"
+    r"(\d{4})\b"
+)
+QUARTER_WORDS: dict[str, int] = {
+    word: number
+    for number, words in enumerate(
+        (
+            "first 1st premier 1er erstes ersten erste erster primer primero primo",
+            "second 2nd deuxieme 2e 2eme zweites zweiten zweite zweiter segundo secondo",
+            "third 3rd troisieme 3e 3eme drittes dritten dritte dritter tercer tercero "
+            "terzo",
+            "fourth 4th quatrieme 4e 4eme viertes vierten vierte vierter cuarto quarto",
+        ),
+        start=1,
+    )
+    for word in words.split()
+}
+QUOTE = re.compile(r"[«“\"]\s?([^«»“”\"\n]{3,80})\s?[»”\"]")
+WORD = re.compile(r"[^\W_]++(?:['’\-][^\W_]++)*+")
+CONTRACTION = re.compile(
+    r"(?i)(?:i|you|we|they|he|she|it|that|there|who|what|let|ca|wo|do|does|did"
+    r"|is|are|was|were|have|has|had|could|would|should|must|might|need)"
+    r"['’](?:ll|m|ve|d|re|s|t)"
+    r"|[a-z]+n['’]t"
+)
+SENTENCE_END = re.compile(r"[.!?](?=\s)|\n")
+# Abbreviations that a full stop does not end a sentence after ("No. 2", "St. Paul").
+ABBREVIATIONS = frozenset(
+    "no nos nr st ste dr mr mrs ms jr sr mt vs etc cf p pp vol art ch fig ca env "
+    "mme mlle m av apr bd mio mrd md mds mln mld bn".split()
+)
+MARKUP = re.compile(r"\*\*|__|`|^\s*(?:[-*+>]|\d{1,3}[.)]|#{1,6})\s", re.M)
+# Atlas's own links and pictures, whole (label and target): an artifact's
+# open and download links (their title and "(version N)" label),
+# the stored pictures and their choice links. Their labels are written by
+# code from what Atlas stored, never claims to find in a source; the version
+# label of a picture artifact was noted as a detail missing from the
+# sources.
+OWN_LINK = re.compile(
+    r"!?\[[^\[\]\n]{0,300}\]\((?:https?://[^\s/()]{1,253})?"
+    r"(?:/api/atlas/[^\s()]{0,700}"
+    r"|/images/(?:picture/)?[0-9a-f]{32}(?:/[0-9]{1,2})?)\)"
+)
+
+
+def mode() -> str:
+    value = os.environ.get("ATLAS_UNSOURCED_DETAILS", "off").strip().lower()
+    return value if value in MODES else "off"
+
+
+def marks() -> bool:
+    """The modes that tell the person what no source holds (streamed_check)."""
+    return mode() in {"mark", "revise_mark"}
+
+
+# The texts a streamed turn read (search results, fetched pages, specialized
+# sources) and its computation results, collected like the held check's
+# (chat_pipeline sets it on turns without one).
+anchors: ContextVar[Grounding | None] = ContextVar("atlas_anchors", default=None)
+
+
+# Questions about a named subject that grounding's precise-fact cues miss. A request
+# to present someone or something ("tell me about", "who is") is enough; a generic
+# "what is" or "which" counts only with a capitalised name in the question, so a
+# definition or an explanation ("what is the difference between...") keeps streaming.
+ABOUT = re.compile(
+    r"\b(?:tell me about|talk about|who s|who is|who was|parle moi de|parle moi du|"
+    r"parle moi des|presente moi|c est qui|qui est|qui etait|"
+    r"erzahl mir von|wer ist|wer war|hablame de|quien es|quien era|parlami di|"
+    r"chi e|chi era)\b"
+)
+GENERIC_ABOUT = re.compile(
+    r"\b(?:what s|what is|what was|what are|what were|which|wich|whose|c est quoi|"
+    r"qu est ce que|was ist|que es|cos e)\b"
+)
+
+
+OWN = re.compile(
+    r"\b(?:my|our|mon|ma|mes|notre|nos|mein|meine|unser|mi|mis|mio|mia|miei)\b"
+)
+
+
+def wants_review(question: str) -> bool:
+    """A question whose answer is held so its details can be checked (mode on only).
+
+    Grounding's own cue (needs_grounding) plus questions about a person, a place,
+    a company or a work asked without a precise-fact word. Decided before any
+    streaming, like grounding.
+    """
+    if mode() == "off":
+        return False
+    text = normalized(question)
+    if not text or CREATIVE.search(text) or small_talk(question) or len(text) > 400:
+        return False
+    if needs_grounding(question):
+        return True
+    if OWN.search(text):
+        # "my server", "notre facture": the person's own things, not a public subject.
+        return False
+    return bool(ABOUT.search(text)) or bool(
+        GENERIC_ABOUT.search(text) and question_entities(question)
+    )
+
+
+@dataclass(frozen=True)
+class Detail:
+    kind: str  # date, quarter, version, year, number, name, title
+    text: str
+    start: int  # offset of the sentence holding it in the answer body
+    end: int
+    # A date's value, and the event the words before it name (EVENTS).
+    value: DateValue | None = None
+    event: str = ""
+
+    @property
+    def key(self) -> str:
+        return self.kind + ":" + normalized(self.text)
+
+
+NEXT_WORD = re.compile(r"\s{0,3}([^\W\d_]{3,10})")
+
+
+def _next_word(body: str, index: int) -> str:
+    """The word right after a position (a month after "30."), "" when none."""
+    match = NEXT_WORD.match(body, index)
+    return match[1] if match else ""
+
+
+def _sentences(body: str) -> list[tuple[int, int]]:
+    spans = []
+    start = 0
+    for match in SENTENCE_END.finditer(body):
+        if match[0] == ".":
+            words = body[max(start, match.start() - 6) : match.start()].split()
+            word = words[-1].strip("(\"'*_«“[").casefold() if words else ""
+            following = body[match.end() : match.end() + 3].lstrip()
+            if (
+                (word and (word in ABBREVIATIONS or len(word) == 1))
+                or not following
+                or following[0].isdigit()
+                or following[0].islower()
+                or (
+                    word.isdigit()
+                    and len(word) <= 2
+                    and _month(_next_word(body, match.end()))
+                )
+            ):
+                # "No. 2", "J. Smith", "etc. and", "am 30. Januar": the sentence
+                # goes on.
+                continue
+        if body[start : match.end()].strip():
+            spans.append((start, match.end()))
+        start = match.end()
+    if body[start:].strip():
+        spans.append((start, len(body)))
+    return spans
+
+
+def _number_value(text: str) -> tuple[float, float] | None:
+    """The value of a written number and the precision it is written with."""
+    match = re.match(r"(\d{1,3}(?:[   .,]\d{3})++|\d++)(?:([.,])(\d++))?+", text)
+    if match is None:
+        return None
+    whole = re.sub(r"\D", "", match[1])
+    decimals = match[3] or ""
+    if match[2] and len(decimals) == 3 and not re.search(r"[   ]", match[1]):
+        # "1,200" or "1.200" alone: thousands, not a decimal part.
+        whole, decimals = whole + decimals, ""
+    value = float(whole + ("." + decimals if decimals else ""))
+    zeros = len(whole) - len(whole.rstrip("0")) if whole.strip("0") else 0
+    # A round number ("47 000", "1,2 million") may be a rounded source value; any
+    # other number (a year, "324 m") must be found exactly.
+    if decimals:
+        precision = 10.0 ** -len(decimals)
+    else:
+        precision = 10.0**zeros if zeros >= 3 else 0.0
+    word = normalized(text[match.end() :]).split()
+    scale = SCALES.get(word[0], 1.0) if word else 1.0
+    if scale > 1 and not decimals:
+        # "about 12 million" for a source's 12.4 million: a figure written with
+        # a scale word is rounded to one unit of that scale.
+        precision = max(precision, 1.0)
+    if not math.isfinite(value * scale):
+        # Hundreds of digit groups read as one number: no value.
+        return None
+    return value * scale, precision * scale
+
+
+def version_of(text: str) -> str | None:
+    """A version as compared: its numbers without a trailing ".0" ("5.0" is 5).
+
+    None for a grouped number ("1.234.567") read as three dotted parts.
+    """
+    numbers = re.findall(r"\d+(?:\.\d+)*", text)
+    if not numbers:
+        return None
+    parts = numbers[-1].split(".")
+    if len(parts) >= 3 and all(len(part) == 3 for part in parts[1:]):
+        return None
+    canonical = [str(int(part)) for part in parts]
+    while len(canonical) > 1 and canonical[-1] == "0":
+        canonical.pop()
+    return ".".join(canonical)
+
+
+def quarter_of(text: str) -> str | None:
+    """A calendar quarter as compared ("q3 2024"), None when it names none."""
+    match = QUARTER.search(text)
+    if match is None:
+        return None
+    if match[3]:
+        number, year = match[1] or match[2], match[3]
+    elif match[4]:
+        number, year = match[5], match[4]
+    else:
+        found = QUARTER_WORDS.get(normalized(match[6]))
+        if found is None:
+            return None
+        number, year = str(found), match[7]
+    return f"q{number} {year}"
+
+
+# The capitalised word right before a version ("Tarnweld version 4").
+PRODUCT = re.compile(r"(?<![\w-])([^\W\d_][^\W_]*+) $")
+GERMAN_ARTICLES = frozenset("der die das den dem des".split())
+# Function words that tell a German text: German writes every noun with a
+# capital, which read as names flagged 6 ordinary nouns in a 4-sentence answer
+# (2026-11-21).
+GERMAN_WORDS = frozenset(
+    "der das und ist nicht mit fur auf wurde wurden eine einen einem einer dem den "
+    "sich auch werden hat haben sind oder bei nach zum zur vom uber wird seit "
+    "auf ein im sie".split()
+)
+OTHER_WORDS = frozenset(
+    "the and is of to with for was were that which are "
+    "le la les et est une du pour avec dans sur qui que pas "
+    "el los las y es con para por que una lo il gli e per con che".split()
+)
+# Before a single capitalised word in German, these introduce a place or a name
+# ("in Vasselin", "nach Ostrelach", "namens Brelune"); any other word before it
+# (an article, an adjective, a preposition) makes it an ordinary noun.
+GERMAN_INTRODUCERS = frozenset("in nach namens genannt heisst".split())
+GERMAN_NOUN = re.compile(
+    r"(?:ung|heit|keit|schaft|tion|sion|tat|ismus|nis|tum|ling|chen|ment|enz|anz)"
+    r"(?:en|s)?$"
+)
+GERMAN_COMMON_NOUNS = frozenset(
+    "zukunft kraft hohe bezug betrieb form folge zeit summe frage gang zahlen".split()
+)
+
+
+def is_german(body: str) -> bool:
+    words = normalized(body[:4000]).split()
+    german = sum(word in GERMAN_WORDS for word in words)
+    return german >= 2 and german > sum(word in OTHER_WORDS for word in words)
+
+
+def _german_noun(
+    plain: str, words: list[re.Match[str]], index: int, sentence_start: bool
+) -> bool:
+    """A single capitalised word of a German text that reads as an ordinary noun.
+
+    A sentence opener keeps the rule of every language (a name when it reads as
+    a list entry); inside a sentence, only an introducer makes it a name.
+    """
+    word = normalized(words[index][0])
+    if GERMAN_NOUN.search(word) or word in GERMAN_COMMON_NOUNS:
+        return True
+    if words[index][0].isupper() or any(c.isupper() for c in words[index][0][1:]):
+        return False  # an acronym or an inner capital: a name
+    if sentence_start or index == 0:
+        return False
+    if plain[words[index - 1].end() : words[index].start()] != " ":
+        return True
+    return normalized(words[index - 1][0]) not in GERMAN_INTRODUCERS
+
+
+def extract(answer: str) -> list[Detail]:
+    """Precise details of an answer, the source footer and code left out."""
+    # Atlas's own links are blanked to the same length: the sentence spans
+    # stay those of the answer.
+    body = OWN_LINK.sub(
+        lambda match: " " * len(match[0]), answer.split("<details>", 1)[0]
+    )
+    found: dict[str, Detail] = {}
+    in_fence = False
+    german = is_german(body)
+    # German genitives ("die Auswahl der Lieferanten") join two nouns, not a name.
+    connectors = CONNECTORS - GERMAN_ARTICLES if german else CONNECTORS
+    for start, end in _sentences(body):
+        sentence = body[start:end]
+        if sentence.lstrip().startswith("```"):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        stripped = sentence.strip()
+        # Headings, bold labels and table rows name sections, not facts: their
+        # numbers and dates are read, their capitalised words are not names.
+        heading = stripped.startswith(("#", "|")) or (
+            stripped.startswith("**") and stripped.rstrip(" :").endswith("**")
+        )
+        plain = MARKUP.sub(
+            " ", re.sub(r"\]\([^)\s]*\)|https?://\S+|\[\d{1,3}\]", " ", sentence)
+        )
+        # Characters a date, a year or a number already covers: one mark per
+        # character, so a sentence of thousands of numbers stays linear.
+        taken = bytearray(len(plain) + 1)
+
+        def add(
+            kind: str,
+            text: str,
+            span: tuple[int, int],
+            value: DateValue | None = None,
+            event: str = "",
+        ) -> None:
+            if kind != "name":
+                taken[span[0] : span[1]] = b"\x01" * (span[1] - span[0])
+            if len(found) >= MAX_DETAILS:
+                return
+            detail = Detail(kind, text.strip(), start, end, value, event)
+            if normalized(detail.text):
+                found.setdefault(detail.key, detail)
+
+        # Full dates and days of a month, with the event they are the date of.
+        for begin, finish, value, event in dated_events(plain):
+            add("date", plain[begin:finish], (begin, finish), value, event)
+        for match in QUARTER.finditer(plain):
+            if not taken[match.start()] and quarter_of(match[0]):
+                add("quarter", match[0], match.span())
+        for match in VERSION.finditer(plain):
+            if taken[match.start()] or version_of(match[0]) is None:
+                continue
+            text = match[0]
+            if match[1]:
+                # "Tarnweld version 4": the product the version belongs to.
+                before = PRODUCT.search(
+                    plain, max(0, match.start() - 40), match.start()
+                )
+                if (
+                    before
+                    and before[1][0].isupper()
+                    and normalized(before[1]) not in STOP | COMMON
+                ):
+                    text = before[1] + " " + text
+            add("version", text, match.span())
+        for match in YEAR.finditer(plain):
+            if not taken[match.start()]:
+                add("year", match[0], match.span())
+        for match in NUMBER.finditer(plain):
+            if taken[match.start()]:
+                continue
+            text = match[0]
+            tail = normalized(text).split()
+            if len(tail) > 1 and tail[-1] not in SCALES and "%" not in text:
+                # The word after the number goes, not the number's own groups:
+                # "9 731 people" is 9 731, never 9.
+                text = re.sub(r"\s?[^\W\d_]+$", "", text)
+            digits = re.sub(r"\D", "", text)
+            if text == digits and len(digits) == 1:
+                # A lone digit counts only before a noun ("4 founders"), not as a
+                # position or a part ("1 of", "chapter 2").
+                after = plain[match.end() : match.end() + 16]
+                if not re.match(r"\s[^\W\d_]{3}", after):
+                    continue
+            add("number", text, match.span())
+        for match in QUOTE.finditer(plain):
+            add("title", match[1], match.span(1))
+        words = list(WORD.finditer(plain))
+        index = 0
+        while index < len(words):
+            word = words[index][0]
+            if not word[0].isupper() or taken[words[index].start()]:
+                # A version word, a quarter or a scale ("Version", "Q3", "Mio.")
+                # read as part of a detail is no name.
+                index += 1
+                continue
+            last = index
+            following = index + 1
+            while following < len(words):
+                gap = plain[words[following - 1].end() : words[following].start()]
+                if gap not in {" ", " "}:
+                    break
+                if taken[words[following].start()]:
+                    break  # "Im Q3 2024": the quarter is no part of a name
+                candidate = words[following][0]
+                if candidate[0].isupper():
+                    last = following
+                    following += 1
+                elif (
+                    normalized(candidate) in connectors
+                    and following + 1 < len(words)
+                    and words[following + 1][0][0].isupper()
+                    and plain[words[following].end() : words[following + 1].start()]
+                    in {" ", " "}
+                ):
+                    last = following + 1
+                    following += 2
+                else:
+                    break
+            text = plain[words[index].start() : words[last].end()]
+            first = normalized(word)
+            single = last == index
+            sentence_start = (
+                not plain[: words[index].start()]
+                .rstrip(' (\t*_"«“|')[-1:]
+                .strip(".!?:|")
+            )
+            if sentence_start and first in STOP | COMMON and not single:
+                # "The Xyz", "Le Xyz": the article opening the sentence is no part of the name.
+                index += 1
+                continue
+            # A capitalised word opening a sentence is an ordinary word unless it
+            # reads as a name: a list entry ("Name (...)", "Name,"), an acronym or
+            # an inner capital.
+            after = plain[words[last].end() :].lstrip(" *_")
+            name_like = (
+                not after
+                or after[0] in "(,–—-"
+                or word.isupper()
+                or any(c.isupper() for c in word[1:])
+            )
+            if not (
+                first in MONTHS
+                or (single and first in WEEKDAYS)
+                or heading
+                or (single and (first in COMMON or len(word) < 3))
+                # "I'll", "We'd", "They're": a pronoun with its contraction,
+                # never a name ("not found in the sources consulted: I'll",
+                # class suite, staging -184). "O'Brien" and "Anna's" stay names.
+                or (single and CONTRACTION.fullmatch(word) is not None)
+                or (single and sentence_start and not name_like)
+                or (
+                    single
+                    and german
+                    and _german_noun(plain, words, index, sentence_start)
+                )
+            ):
+                add("name", text, (words[index].start(), words[last].end()))
+            index = following
+        if len(found) >= MAX_DETAILS:
+            break
+    return list(found.values())
+
+
+@dataclass
+class Evidence:
+    """Retrieved texts indexed once: words, phrases and number values."""
+
+    text: str = ""
+    words: frozenset[str] = frozenset()
+    values: list[float] = field(default_factory=list)
+    lowercase: frozenset[str] = frozenset()
+    # Versions ("4.2.1", "v5") and calendar quarters ("q3 2024") as compared.
+    versions: frozenset[str] = frozenset()
+    quarters: frozenset[str] = frozenset()
+    # Dates by value (year 0: written without one), their days of a month, and
+    # the dates a text labels with an event (EVENTS).
+    dates: frozenset[DateValue] = frozenset()
+    days: frozenset[tuple[int, int]] = frozenset()
+    events: dict[str, frozenset[DateValue]] = field(default_factory=dict)
+    # Values written as percentages ("40 %", "40 percent", "40 Prozent").
+    percents: list[float] = field(default_factory=list)
+
+    @classmethod
+    def of(cls, passages: list[str]) -> Evidence:
+        joined = "\n".join(passages)
+        text = " " + normalized(joined) + " "
+        values = sorted(
+            value
+            for match in NUMBER.finditer(joined)
+            if (parsed := _number_value(match[0])) is not None
+            for value in (parsed[0],)
+        )
+        lowercase = frozenset(
+            normalized(match[0])
+            for match in WORD.finditer(joined)
+            if match[0][0].islower()
+        )
+        versions = frozenset(
+            version
+            for pattern in (VERSION, DOTTED)
+            for match in pattern.finditer(joined)
+            if (version := version_of(match[0])) is not None
+        )
+        quarters = frozenset(
+            quarter
+            for match in QUARTER.finditer(joined)
+            if (quarter := quarter_of(match[0])) is not None
+        )
+        dated = dated_events(joined, source=True)
+        events: dict[str, set[DateValue]] = {}
+        for _, _, value, event in dated:
+            if event:
+                events.setdefault(event, set()).add(value)
+        percents = sorted(
+            parsed[0]
+            for match in NUMBER.finditer(joined)
+            if "%" in match[0] or PERCENT_WORD.match(joined, match.end())
+            if (parsed := _number_value(match[0])) is not None
+        )
+        return cls(
+            text,
+            frozenset(text.split()),
+            values,
+            lowercase,
+            versions,
+            quarters,
+            frozenset(value for _, _, value, _ in dated),
+            frozenset((value[1], value[2]) for _, _, value, _ in dated),
+            {event: frozenset(found) for event, found in events.items()},
+            percents,
+        )
+
+    def has_date(self, value: DateValue) -> bool:
+        """The same day of the same month (and year, when one is written)."""
+        year, month, day = value
+        if not year:
+            return (month, day) in self.days
+        # A source writing "29 janvier" once and the year elsewhere holds
+        # "29 janvier 2025".
+        return value in self.dates or (
+            (0, month, day) in self.dates and self.value(float(year), 0.0)
+        )
+
+    def percent(self, value: float, precision: float) -> bool:
+        tolerance = precision / 2 + abs(value) * 1e-9
+        index = bisect_left(self.percents, value - tolerance)
+        return index < len(self.percents) and self.percents[index] <= value + tolerance
+
+    def holds(self, phrase: str) -> bool:
+        return bool(phrase) and f" {phrase} " in self.text
+
+    def value(self, value: float, precision: float) -> bool:
+        tolerance = precision / 2 + abs(value) * 1e-9
+        index = bisect_left(self.values, value - tolerance)
+        return index < len(self.values) and self.values[index] <= value + tolerance
+
+
+def supported(detail: Detail, evidence: Evidence, own: Evidence) -> bool:
+    """True when a retrieved text (or the person's own words) holds the detail."""
+    if detail.kind == "date":
+        return _date_supported(detail, evidence, own)
+    phrase = normalized(detail.text)
+    # A percentage reads "40" once normalized: it is matched with its unit.
+    percentage = detail.kind == "number" and "%" in detail.text
+    if not percentage and (evidence.holds(phrase) or own.holds(phrase)):
+        return True
+    if detail.kind == "version":
+        wanted = version_of(detail.text)
+        if wanted is None:
+            return False
+        if wanted in evidence.versions or wanted in own.versions:
+            return True
+        # "Tarnweld version 4" for a source's "Tarnweld 4".
+        head = detail.text.split()[0]
+        product = head[0].isupper() and not re.match(
+            r"(?i)v?\d|version|versión|versione|release|révision|revision|build", head
+        )
+        return (
+            product
+            and "." not in wanted
+            and evidence.holds(normalized(head) + " " + wanted)
+        )
+    if detail.kind == "quarter":
+        wanted = quarter_of(detail.text)
+        return wanted is not None and (
+            wanted in evidence.quarters or wanted in own.quarters
+        )
+    if detail.kind == "name":
+        # "Brelune's": the possessive ending is no part of the name.
+        tokens = [
+            token
+            for token in phrase.split()
+            if token not in STOP and token not in TITLES and len(token) > 1
+        ]
+        return bool(tokens) and all(
+            token in evidence.words or token in own.words for token in tokens
+        )
+    if detail.kind in {"number", "year"}:
+        parsed = _number_value(detail.text)
+        if parsed is None:
+            return False
+        value, precision = parsed
+        if "%" in detail.text:
+            # A percentage is a figure with its unit: the source writes it as
+            # one too, not as any number of the same value.
+            precision = max(precision, 0.1)
+            return evidence.percent(value, precision) or own.value(value, precision)
+        if evidence.value(value, precision) or own.value(value, precision):
+            return True
+        if value == int(value) and int(value) in NUMBER_WORDS:
+            return any(
+                word in evidence.words or word in own.words
+                for word in NUMBER_WORDS[int(value)]
+            )
+    return False
+
+
+def _date_supported(detail: Detail, evidence: Evidence, own: Evidence) -> bool:
+    """A date is found by value, never as a near match.
+
+    The same day of the same month (and year when written), in any written
+    form; another day or month is another date, however close. A date the
+    answer gives for an event the source dates (a receipt, a publication) must
+    be the date the source gives for it, even when its other dates include it.
+    """
+    value = detail.value
+    if value is None:
+        spans = date_spans(detail.text)
+        if not spans:
+            return False
+        value = spans[0][2]
+    if own.has_date(value):
+        return True
+    labelled = evidence.events.get(detail.event) if detail.event else None
+    if labelled:
+        year, month, day = value
+        return any(
+            (month, day) == (found[1], found[2]) and (not year or found[0] in {0, year})
+            for found in labelled
+        )
+    return evidence.has_date(value)
+
+
+def common_word(
+    detail: Detail, evidence: Evidence, answer_lowercase: frozenset[str]
+) -> bool:
+    """A capitalised single word that the texts also write in lower case (an ordinary word)."""
+    phrase = normalized(detail.text)
+    return (
+        detail.kind == "name"
+        and " " not in phrase
+        and (phrase in evidence.lowercase or phrase in answer_lowercase)
+    )
+
+
+def unsupported(
+    answer: str,
+    evidence: Evidence,
+    own: Evidence,
+    computed: Computed | None = None,
+    skip: frozenset[str] = frozenset(),
+) -> list[Detail]:
+    found = [d for d in _unsupported(answer, evidence, own) if d.kind not in skip]
+    if computed is None:
+        return found
+    return [detail for detail in found if not computed.holds(detail, answer)]
+
+
+def _unsupported(answer: str, evidence: Evidence, own: Evidence) -> list[Detail]:
+    body = answer.split("<details>", 1)[0]
+    lowercase = frozenset(
+        normalized(match[0]) for match in WORD.finditer(body) if match[0][0].islower()
+    )
+    details = [d for d in extract(answer) if not common_word(d, evidence, lowercase)]
+    missing = [d for d in details if not supported(d, evidence, own)]
+    absent = {d.key for d in missing}
+    # An age or a duration computed from two supported years ("died at 83",
+    # "for 14 years") is supported by them.
+    years = sorted(
+        {
+            int(year)
+            for d in details
+            if d.key not in absent and d.kind in {"year", "date"}
+            for year in YEAR.findall(d.text)
+        }
+    )
+    spans = {b - a for i, a in enumerate(years) for b in years[i + 1 :]}
+    return [
+        d
+        for d in missing
+        if not (
+            d.kind == "number"
+            and d.text.isdigit()
+            and (int(d.text) in spans or int(d.text) + 1 in spans)
+        )
+    ]
+
+
+# --- Computed values: what the turn worked out, not what it retrieved. --------
+# Tools whose results are computations by code, never pages (roadmap T8).
+COMPUTATION_TOOLS = frozenset(
+    {"calculator", "date_time", "unit_convert", "currency_convert"}
+)
+# Numbers given by the person (and returned by the tools) that enter the pairwise
+# operations: bounded, so the derived values stay few and the pass stays cheap.
+BASE_VALUES = 24
+TOOL_VALUES = 64
+CALENDAR_DATES = 12
+GIVEN_CHARACTERS = 20_000
+# Constants a written calculation multiplies or divides by (a percentage, a unit
+# change, a calendar period).
+CALCULATION_CONSTANTS = frozenset({7.0, 12.0, 24.0, 60.0, 100.0, 365.0, 1000.0, 3600.0})
+# Calendar facts a number of days, weeks, months or hours may state ("a week has
+# 7 days", "February 2028 has 29 days").
+CALENDAR_CONSTANTS = frozenset({7, 12, 24, 28, 29, 30, 31, 52, 53, 60, 365, 366})
+PERIODS = (
+    r"(?:days?|weeks?|months?|years?|hours?|minutes?|jours?|semaines?|mois|ans|"
+    r"annees?|heures?|tage?n?|wochen?|monate?n?|jahre?n?|stunden?|minuten?|dias?|"
+    r"semanas?|meses|anos|horas?|minutos?|giorni|giorno|settimane|settimana|mesi|"
+    r"mese|anni|ore|ora|minuti)"
+)
+
+
+def _operations(a: float, b: float) -> Iterator[float]:
+    """What one operation on two given numbers gives, as an answer states it."""
+    yield a + b
+    yield abs(a - b)
+    yield a * b
+    yield a * b / 100  # b percent of a
+    for x, y in ((a, b), (b, a)):
+        if y:
+            yield x / y
+            yield x / y * 100
+            yield abs(x - y) / y * 100  # the change from y to x, in percent
+
+
+def _calendar_date(match: re.Match[str], kind: str) -> date | None:
+    try:
+        if kind == "numeric":
+            if match[1]:
+                return date(int(match[1]), int(match[2]), int(match[3]))
+            return date(int(match[6]), int(match[5]), int(match[4]))
+        day, name, year = (
+            (match[1], match[2], match[3])
+            if kind == "day_first"
+            else (match[2], match[1], match[3])
+        )
+        month = MONTHS.get(normalized(name))
+        return date(int(year), month, int(day)) if month else None
+    except ValueError:
+        return None
+
+
+def _dates_and_rest(text: str) -> tuple[list[date], str]:
+    """The full dates a text gives, and the text without them."""
+    found: list[date] = []
+
+    def taken(kind: str) -> Callable[[re.Match[str]], str]:
+        def replace(match: re.Match[str]) -> str:
+            day = _calendar_date(match, kind)
+            if day is None:
+                return match[0]
+            found.append(day)
+            return " "
+
+        return replace
+
+    for pattern, kind in (
+        (NUMERIC_DATE, "numeric"),
+        (DAY_FIRST, "day_first"),
+        (MONTH_FIRST, "month_first"),
+    ):
+        text = pattern.sub(taken(kind), text)
+    return found, text
+
+
+def _values(text: str) -> Iterator[float]:
+    for match in NUMBER.finditer(text):
+        parsed = _number_value(match[0])
+        if parsed is not None:
+            yield parsed[0]
+
+
+# A number a tool wrote: a decimal point, never a thousands separator
+# ("42.1648128" is forty-two, not 42 164).
+MACHINE_NUMBER = re.compile(r"(?<![\w.])\d++(?:\.\d++)?+(?![\w])")
+
+
+def _machine_values(text: str) -> Iterator[float]:
+    for match in MACHINE_NUMBER.finditer(text):
+        yield float(match[0])
+
+
+def _calendar_spans(days: list[date]) -> set[float]:
+    """Days, weeks, months and years between two dates, counted either way."""
+    found: set[float] = set()
+    unique = sorted(set(days))[:CALENDAR_DATES]
+    for index, first in enumerate(unique):
+        for last in unique[index + 1 :]:
+            count = (last - first).days
+            months = (
+                (last.year - first.year) * 12
+                + last.month
+                - first.month
+                - (last.day < first.day)
+            )
+            found |= {
+                float(count),
+                float(count + 1),
+                float(count - 1),
+                count / 7,
+                float(count // 7),
+                float(count * 24),
+                float(months),
+                float(months // 12),
+            }
+    return found
+
+
+def _within(values: list[float], value: float, unit: float) -> bool:
+    """A value of the sorted list that, rounded to the written unit, is the stated one."""
+    reach = unit / 2 + abs(value) * 1e-9
+    index = bisect_left(values, value - reach)
+    return index < len(values) and values[index] <= value + reach
+
+
+@dataclass
+class Computed:
+    """Values the turn computed: tool results, arithmetic on the person's numbers,
+    calendar spans between the dates given, and written calculations code
+    recomputes. A computed value is supported however the answer rounds it."""
+
+    base: list[float] = field(default_factory=list)
+    exact: list[float] = field(default_factory=list)
+    answers: dict[str, list[float]] = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def of(cls, given: list[str], results: list[str], today: str = "") -> Computed:
+        days: list[date] = []
+
+        def first(
+            texts: list[str], limit: int, read: Callable[[str], Iterator[float]]
+        ) -> list[float]:
+            # The most recent numbers first, read until the limit: a long pasted
+            # text adds no cost beyond one pass.
+            values: dict[float, None] = {}
+            for text in texts:
+                found, rest = _dates_and_rest(text[:GIVEN_CHARACTERS])
+                days.extend(found[:CALENDAR_DATES])
+                for value in read(rest):
+                    if len(values) >= limit:
+                        break
+                    values.setdefault(value)
+            return list(values)
+
+        numbers = first(list(reversed(given)), BASE_VALUES, _values)
+        tool = first(results, TOOL_VALUES, _machine_values)
+        base = list(dict.fromkeys([*numbers, *tool]))[:BASE_VALUES]
+        if today:
+            days += _dates_and_rest(today)[0]
+        derived = {
+            value
+            for index, first in enumerate(base)
+            for second in base[index + 1 :]
+            for value in _operations(first, second)
+        }
+        exact = sorted(set(tool) | derived | _calendar_spans(days))
+        return cls(base, exact)
+
+    def _answer_values(self, answer: str) -> list[float]:
+        """Second step values of one answer: its correct written calculations,
+        and operations between its computed numbers and the given ones."""
+        if (cached := self.answers.get(answer)) is not None:
+            return cached
+        from services.orchestrator import number_provenance as provenance
+
+        body = answer.split("<details>", 1)[0]
+        extra: set[float] = set()
+        # "21 / 84 × 100 = **25 %**": the emphasis is no part of the calculation.
+        text = provenance.scanned(re.sub(r"\*\*|__", "", body))
+        for begin, end in provenance.calculations(text):
+            written = text[begin:end]
+            sides = re.split(r"\s*(?:=|≈|~)\s*", written)
+            if len(sides) < 2 or not re.search(provenance.OPERATOR, sides[0][1:]):
+                continue
+            left = sides[0]
+            # "(120 × 0,85 = 102)": the bracket opened before the calculation
+            # closes after its result.
+            for _ in range(left.count("(") - left.count(")")):
+                left = left.replace("(", " ", 1)
+            result = provenance.evaluate(left)
+            stated = list(provenance.NUMBER.finditer(sides[-1]))
+            if result is None or not stated:
+                continue
+            value = provenance.number(stated[-1][0])
+            tolerance = Decimal("0.01") if re.search("[≈~]", written) else Decimal(0)
+            if value is None or not provenance.matches(
+                value, provenance.places(stated[-1][0]), result, tolerance
+            ):
+                continue
+            # A correct calculation: its result and its constants are computed.
+            extra.add(float(result))
+            for token in provenance.NUMBER.finditer(written):
+                constant = provenance.number(token[0])
+                if constant is not None and float(constant) in CALCULATION_CONSTANTS:
+                    extra.add(float(constant))
+        held = [
+            value
+            for match in NUMBER.finditer(body)
+            if (parsed := _number_value(match[0])) is not None
+            for value in (parsed[0],)
+            if _within(self.exact, value, parsed[1] or 1.0)
+        ]
+        held = list(dict.fromkeys([*extra, *held]))[:BASE_VALUES]
+        extra |= {
+            value
+            for first in held
+            for second in self.base
+            for value in _operations(first, second)
+        }
+        values = sorted(extra)
+        if len(self.answers) < 8:
+            self.answers[answer] = values
+        return values
+
+    def holds(self, detail: Detail, answer: str) -> bool:
+        if detail.kind != "number":
+            return False
+        parsed = _number_value(detail.text)
+        if parsed is None:
+            return False
+        value, precision = parsed
+        unit = precision or 1.0
+        candidates = [value, value / 100] if "%" in detail.text else [value]
+        for candidate in candidates:
+            step = unit / 100 if candidate != value else unit
+            if _within(self.exact, candidate, step) or _within(
+                self._answer_values(answer), candidate, step
+            ):
+                return True
+        if value == int(value) and int(value) in CALENDAR_CONSTANTS:
+            sentence = normalized(answer[detail.start : detail.end])
+            return bool(re.search(rf"(?:^| ){int(value)} {PERIODS}\b", sentence))
+        return False
+
+
+def excerpts(answer: str, details: list[Detail], passages: list[str]) -> str:
+    """Source sentences closest to the sentences holding unsupported details."""
+    wanted: list[set[str]] = []
+    seen_spans = set()
+    for detail in details:
+        if (detail.start, detail.end) not in seen_spans:
+            seen_spans.add((detail.start, detail.end))
+            wanted.append(terms(answer[detail.start : detail.end]))
+    best: dict[int, tuple[int, str]] = {}
+    for passage in passages:
+        for start, end in _sentences(passage):
+            sentence = passage[start:end].strip()
+            if not 20 <= len(sentence) <= 600:
+                continue
+            words = terms(sentence)
+            for index, target in enumerate(wanted):
+                score = len(words & target)
+                if score >= 2 and score > best.get(index, (0, ""))[0]:
+                    best[index] = (score, sentence)
+    chosen = list(dict.fromkeys(sentence for _, sentence in best.values()))
+    text = ""
+    for sentence in chosen:
+        if len(text) + len(sentence) > EXCERPT_CHARACTERS:
+            break
+        text += "- " + sentence + "\n"
+    return text
+
+
+INSTRUCTION = (
+    "You correct sentences of an assistant's answer so that they state only precise "
+    "details that the sources retrieved in this conversation support. You receive "
+    "numbered sentences of the answer, for each one the precise details (names, "
+    "dates, numbers, titles) that no retrieved source contains, and source excerpts.\n"
+    "For each listed detail: if an excerpt states the correct value, use the "
+    "excerpt's value; otherwise remove the detail, or the part of the sentence that "
+    "only exists to state it, so the sentence stays correct, natural and in its "
+    "language. When the sentence would lose its point without the detail, you may "
+    "instead keep it and write the MARKER right after it, so the person sees it "
+    "is not verified. Never add a name, date, number or title that is not already "
+    "in the sentence or in the excerpts. Keep the sentence's markdown (list marker, bold, "
+    "links, citation markers) and every other word. If nothing correct remains, "
+    "return an empty string for it.\n"
+    "Return only a JSON object mapping each sentence number to its corrected text, "
+    'for example {"1": "corrected sentence", "2": ""}.'
+)
+
+
+@dataclass
+class Report:
+    mode: str = "off"
+    details: int = 0
+    unsupported: int = 0
+    unsupported_after: int = 0
+    revised: str = ""  # kept, rejected:<reason>, failed, late, skipped:<reason>
+    marked: int = 0
+    # Details found in no source, by kind (date, version, name...), first check.
+    kinds: dict[str, int] = field(default_factory=dict)
+    # Details the revision removed or replaced with a sourced value, and those
+    # it kept with the not-verified marker.
+    fixed: int = 0
+    model_marked: int = 0
+    # Time of code's lookup alone (extraction and matching, both checks).
+    match_seconds: float = 0.0
+    cost_eur: Decimal = Decimal(0)
+    seconds: float = 0.0
+    removed: list[str] = field(default_factory=list)
+    referenced: int = 0  # details found in the encyclopedia articles read for the check
+    reference_urls: list[str] = field(default_factory=list)
+    reference_texts: list[str] = field(default_factory=list, repr=False)
+
+    def metadata(self) -> dict[str, object]:
+        return {
+            "mode": self.mode,
+            "details": self.details,
+            "unsupported": self.unsupported,
+            "matched": max(0, self.details - self.unsupported),
+            "unsupported_after": self.unsupported_after,
+            "kinds": self.kinds,
+            "revised": self.revised,
+            "fixed": self.fixed,
+            "model_marked": self.model_marked,
+            "marked": self.marked,
+            "match_seconds": round(self.match_seconds, 4),
+            "referenced": self.referenced,
+            "reference_articles": len(self.reference_urls),
+            "cost_eur": str(self.cost_eur),
+            "seconds": round(self.seconds, 3),
+        }
+
+
+async def _complete(payload: dict[str, object]) -> object:
+    """One completion through the model gateway; None when it did not answer."""
+    url = os.environ.get("ATLAS_GATEWAY_URL", atlas_ports().url("gateway"))
+    try:
+        async with aiohttp.ClientSession(
+            trust_env=False,
+            timeout=aiohttp.ClientTimeout(total=DEADLINE_SECONDS + 5),
+        ) as session:
+            async with session.post(
+                url.rstrip("/") + "/agent/complete",
+                json=payload,
+                allow_redirects=False,
+                headers=privacy.headers(),
+            ) as response:
+                if response.status != 200:
+                    return None
+                return await response.json(content_type=None)
+    except TimeoutError:
+        raise
+    except (OSError, aiohttp.ClientError, ValueError):
+        return None
+
+
+def _targets(details: list[Detail]) -> list[tuple[int, int, list[str]]]:
+    spans: dict[tuple[int, int], list[str]] = {}
+    for detail in details:
+        spans.setdefault((detail.start, detail.end), []).append(detail.text)
+    return [(start, end, texts) for (start, end), texts in sorted(spans.items())]
+
+
+async def _revise(
+    body: str,
+    details: list[Detail],
+    passages: list[str],
+    profile: str,
+    language: str,
+    report: Report,
+) -> str | None:
+    """One call that corrects only the sentences holding unsupported details."""
+    targets = [
+        (start, min(end, len(body)), texts)
+        for start, end, texts in _targets(details)
+        if start < len(body)
+    ]
+    numbered = "\n".join(
+        f"[{number}] {body[start:end].strip()}\n    unsupported: " + "; ".join(texts)
+        for number, (start, end, texts) in enumerate(targets, start=1)
+    )
+    content = (
+        f"LANGUAGE: {language}\nMARKER: {marker(language)}\n\nSENTENCES:\n{numbered}\n\n"
+        f"SOURCE EXCERPTS:\n{excerpts(body, details, passages) or '(none)'}"
+    )
+    payload: dict[str, object] = {
+        "messages": [
+            {"role": "system", "content": INSTRUCTION},
+            {"role": "user", "content": content},
+        ],
+        "tools": [],
+        # A short edit: the fast profile (measured 0.4 to 4 s, against 10 to 30 s
+        # for the large chat profiles); an owned-only turn keeps its own profile.
+        "profile": profile if privacy.owned_only() else fast_profile(),
+        "max_tokens": min(4000, 200 + sum(end - start for start, end, _ in targets)),
+        "timeout": DEADLINE_SECONDS,
+        "budget_eur": str(CALL_BUDGET_EUR),
+        "local_enabled": False,
+    }
+    if privacy.owned_only():
+        payload["privacy"] = "strict"
+    try:
+        result = await _complete(payload)
+    except TimeoutError:
+        report.revised = "late"
+        return None
+    if not isinstance(result, dict) or not isinstance(result.get("text"), str):
+        report.revised = "failed"
+        return None
+    try:
+        report.cost_eur += Decimal(str(result.get("cost_eur", "0")))
+    except InvalidOperation:
+        pass
+    text = str(result["text"]).strip()
+    opening, closing = text.find("{"), text.rfind("}")
+    try:
+        edits = json.loads(text[opening : closing + 1]) if opening >= 0 else None
+    except ValueError:
+        edits = None
+    if not isinstance(edits, dict):
+        report.revised = "failed:format"
+        return None
+    revised = body
+    for number, (start, end, texts) in reversed(list(enumerate(targets, start=1))):
+        new = edits.get(str(number))
+        if not isinstance(new, str):
+            continue
+        original = body[start:end]
+        lead = original[: len(original) - len(original.lstrip())]
+        trail = original[len(original.rstrip()) :]
+        # A detail cut out of its sentence must not leave the words that
+        # introduced it ("to be checked on, ...", staging -173).
+        new = dangling_words.repair(original.strip(), new.strip())
+        if hollow(original, new, texts):
+            # A detail cut out of a sentence that still announces it ("There are
+            # **days** between..."): the sentence goes as a whole.
+            new = ""
+        if not new:
+            # The whole sentence goes; a line it filled goes with its line break.
+            line_start = body.rfind("\n", 0, start) + 1
+            whole_line = not body[line_start:start].strip() and (
+                end == len(body) or body[end - 1] == "\n"
+            )
+            if whole_line:
+                revised = revised[:line_start] + revised[end:]
+                continue
+            revised = revised[:start] + revised[end:].lstrip(" ")
+            continue
+        revised = revised[:start] + lead + new + trail + revised[end:]
+    return revised
+
+
+EMPTY_EMPHASIS = re.compile(r"\*\*\s*+\*\*|__\s*+__|\(\s*+\)|\[\s*+\]")
+
+
+def hollow(original: str, new: str, removed: list[str]) -> bool:
+    """A sentence whose details were only cut out, the words around them kept.
+
+    "There are **261** days between..." returned as "There are **days**
+    between..." reads as an answer with its result missing (staging
+    2026-11-20). A sentence rewritten around the removal, or emptied, is not
+    hollow; an emphasis or a bracket left empty always is. Only quantities
+    count: a name dropped from a list leaves a list, a number dropped from its
+    sentence leaves a hole.
+    """
+    if not new.strip():
+        return False
+    if EMPTY_EMPHASIS.search(new) and not EMPTY_EMPHASIS.search(original):
+        return True
+    rest = original
+    for text in sorted(removed, key=len, reverse=True):
+        if any(character.isdigit() for character in text):
+            rest = rest.replace(text, " ")
+    return rest != original and normalized(rest) == normalized(new)
+
+
+LINK = re.compile(r"https?://[^\s)>\]]++|\]\([^)\s]++\)")
+
+
+def acceptable(
+    original: str,
+    revised: str,
+    before: list[Detail],
+    after: list[Detail],
+    marked: list[Detail] | None = None,
+) -> str:
+    """Empty when the revision is kept, else the reason it is not.
+
+    ``marked``: details the revision kept with the not-verified marker; they
+    count as treated, but never as new details.
+    """
+    if len(revised) < 0.35 * len(original) or len(revised) > 1.3 * len(original) + 200:
+        return "length"
+    if not set(LINK.findall(revised)) <= set(LINK.findall(original)):
+        return "links"
+    original_keys = {detail.key for detail in before}
+    if any(detail.key not in original_keys for detail in [*after, *(marked or [])]):
+        return "new_details"
+    if len(after) >= len(before):
+        return "unchanged"
+    return ""
+
+
+NOTE = {
+    "en": "not found in the sources consulted: {details}",
+    "fr": "non trouvé dans les sources consultées : {details}",
+    "de": "in den abgerufenen Quellen nicht gefunden: {details}",
+    "es": "no encontrado en las fuentes consultadas: {details}",
+    "it": "non trovato nelle fonti consultate: {details}",
+}
+
+
+# What the revision writes after a detail it keeps without a source.
+UNVERIFIED = {
+    "en": "not verified",
+    "fr": "non vérifié",
+    "de": "nicht überprüft",
+    "es": "no verificado",
+    "it": "non verificato",
+}
+_UNVERIFIED_FORMS = tuple(f" {normalized(text)} " for text in UNVERIFIED.values())
+
+
+def marker(language: str) -> str:
+    return "(" + UNVERIFIED.get(language, UNVERIFIED["en"]) + ")"
+
+
+def model_marked(detail: Detail, body: str) -> bool:
+    """True when the revision kept the detail with the not-verified marker after it."""
+    sentence = body[detail.start : detail.end]
+    position = sentence.find(detail.text)
+    rest = " " + normalized(sentence[max(position, 0) :]) + " "
+    return any(form in rest for form in _UNVERIFIED_FORMS)
+
+
+def uncovered_note(
+    answer: str, details: list[Detail], language: str
+) -> tuple[str, int]:
+    """One closing note naming the details of an answer the sources do not cover.
+
+    Marking most sentences of such an answer would bury it; saying nothing would
+    present its unsourced details as sourced.
+    """
+    body, separator, footer = answer.partition("<details>")
+    text = NOTE.get(language, NOTE["en"]).format(details=_listed(details))
+    note = "*(" + text[0].upper() + text[1:] + ")*"
+    final = body.rstrip() + "\n\n" + note
+    return final + ("\n\n" + separator + footer if separator else ""), 1
+
+
+def mark(answer: str, details: list[Detail], language: str) -> tuple[str, int]:
+    """A short note at the end of each sentence holding unsupported details."""
+    body, footer = (answer.split("<details>", 1) + [""])[:2]
+    by_sentence: dict[tuple[int, int], list[str]] = {}
+    for detail in details:
+        by_sentence.setdefault((detail.start, detail.end), []).append(detail.text)
+    template = NOTE.get(language, NOTE["en"])
+    for (start, end), texts in sorted(by_sentence.items(), reverse=True):
+        stop = end
+        while stop > start and body[stop - 1] in "\n ":
+            stop -= 1
+        note = " *(" + template.format(details=", ".join(dict.fromkeys(texts))) + ")*"
+        body = body[:stop] + note + body[stop:]
+    return body + ("<details>" + footer if footer else ""), len(by_sentence)
+
+
+def _wiki_pages(
+    urls: list[str], passages: list[str], language: str
+) -> list[tuple[str, str]]:
+    """Encyclopedia articles the turn already reached, the answer's edition first."""
+    pages: dict[tuple[str, str], None] = {}
+    for text in [*urls, *passages]:
+        for match in WIKI_URL.finditer(text):
+            title = unquote(match[2]).replace("_", " ")
+            while title.endswith(")") and title.count(")") > title.count("("):
+                title = title[:-1]  # a link closed by the markdown around it
+            if ":" not in title:
+                pages.setdefault((match[1], title))
+    return sorted(pages, key=lambda page: page[0] != language)
+
+
+@dataclass(frozen=True)
+class Article:
+    url: str
+    text: str
+    # The same subject in another edition: (edition, title), when listed.
+    other: tuple[str, str] | None = None
+
+
+async def _article(
+    edition: str, title: str, timeout: float, other_edition: str
+) -> Article | None:
+    params = {
+        "action": "query",
+        "format": "json",
+        "formatversion": "2",
+        "prop": "extracts|info|langlinks",
+        "explaintext": "1",
+        "redirects": "1",
+        "inprop": "url",
+        "lllang": other_edition,
+        "titles": title,
+    }
+    body = await reference_fetch.get(
+        f"https://{edition}.wikipedia.org/w/api.php",
+        capability=encyclopedia.CAPABILITY,
+        timeout=timeout,
+        ttl=encyclopedia.CACHE_SECONDS,
+        max_bytes=4_000_000,
+        params=params,
+    )
+    try:
+        pages = json.loads(body).get("query", {}).get("pages", [])
+    except (ValueError, AttributeError):
+        return None
+    page = pages[0] if pages and isinstance(pages[0], dict) else {}
+    text = page.get("extract")
+    url = page.get("canonicalurl") or page.get("fullurl")
+    if not isinstance(text, str) or not text.strip() or not isinstance(url, str):
+        return None
+    links = page.get("langlinks") or []
+    other = None
+    if links and isinstance(links[0], dict) and links[0].get("title"):
+        other = (other_edition, str(links[0]["title"]))
+    return Article(url, text, other)
+
+
+# Question and filler words left out of the encyclopedia search for the subject.
+ASK_WORDS = frozenset(
+    (
+        "who whom whose when where which wich what whats how many much why did does do "
+        "done tell me about talk please can could you is are was were been be "
+        "qui quoi quand quel quelle quels quelles comment combien pourquoi ou c est ce cela ca "
+        "qu moi parle dis peux tu vous ete etait sont avait fait moment "
+        "wer wann wo welche welcher wie warum ist war quien cuando donde cual como "
+        "chi quando dove quale come perche"
+    ).split()
+)
+
+
+def subject_query(question: str) -> str:
+    """The question's words without question words and stop words ("first paris marathon held")."""
+    words = [
+        word
+        for word in normalized(question).split()
+        if len(word) > 1 and word not in STOP_WORDS and word not in ASK_WORDS
+    ]
+    return " ".join(words)[:200] or " ".join(question_entities(question))
+
+
+async def references(
+    question: str, language: str, urls: list[str], passages: list[str]
+) -> list[tuple[str, str]]:
+    """Full articles of the subject from the live encyclopedia, when the level allows it.
+
+    The articles the turn reached, the article found for the question's own words,
+    and the first one's counterpart in the other edition (English, or the answer's
+    language), at most REFERENCE_ARTICLES. Strict turns (and the local-only setup)
+    read no live source here: the check then uses what the turn retrieved.
+    """
+    if encyclopedia.source_plan() not in {"live", "live_then_local"}:
+        return []
+    edition = encyclopedia.wiki_language(language)
+    # The subject is read in the person's own words: a pasted text or a file is
+    # what they gave, never a search query (owner rule 2026-11-18).
+    question = own_words(question)
+
+    async def one(wiki: str, title: str) -> Article | None:
+        other = "en" if wiki != "en" else (edition if edition != "en" else "fr")
+        try:
+            return await _article(wiki, title, REFERENCE_SECONDS, other)
+        except reference_fetch.SourceError as exc:
+            LOGGER.info(
+                "unsourced_details_reference %s", json.dumps({"error": exc.code})
+            )
+            return None
+
+    async def searched() -> list[tuple[str, str]]:
+        # The question's words, then the names it gives: "signe traite maastricht
+        # france" finds the treaty, "Jensen Huang" the person.
+        queries = dict.fromkeys(
+            q
+            for q in (subject_query(question), " ".join(question_entities(question)))
+            if q
+        )
+        pages: list[tuple[str, str]] = []
+        for query in queries:
+            try:
+                found = await encyclopedia.search(
+                    query[:200], edition, REFERENCE_SECONDS
+                )
+            except reference_fetch.SourceError:
+                continue
+            pages += [
+                (edition, str(page["title"]))
+                for page in found
+                if "disambiguation" not in (page.get("pageprops") or {})
+            ][:1]
+        return list(dict.fromkeys(pages))
+
+    async def gather() -> list[tuple[str, str]]:
+        pages = _wiki_pages(urls, passages, edition)[:2]
+        pages += [page for page in await searched() if page not in pages]
+        found = [
+            article
+            for article in await asyncio.gather(
+                *(one(*page) for page in pages[:REFERENCE_ARTICLES])
+            )
+            if article is not None
+        ]
+        others = {article.other for article in found[:1] if article.other}
+        others -= set(pages)
+        found += [
+            article
+            for article in await asyncio.gather(*(one(*page) for page in others))
+            if article is not None
+        ]
+        unique = {article.url: article.text for article in found}
+        return list(unique.items())[:REFERENCE_ARTICLES]
+
+    try:
+        return await asyncio.wait_for(gather(), REFERENCE_SECONDS)
+    except TimeoutError:
+        LOGGER.info("unsourced_details_reference %s", json.dumps({"error": "late"}))
+    except privacy.PrivacyRefusal:
+        pass
+    return []
+
+
+def about_subject(url: str, question: str, answer: str) -> bool:
+    """An encyclopedia article whose title names something the question or the
+    answer names. A search on a computation's words reached "2026 Iran war" for
+    a count of days and "Stade de Penvillers" for a percentage (staging
+    2026-11-20): a number such a page happens to hold supports nothing. One
+    title word is enough, so the counterpart in another edition ("Bank of
+    France" for "Banque de France") still counts."""
+    match = WIKI_URL.match(url)
+    if match is None:
+        return True
+    title = re.sub(r"\([^)]*\)", " ", unquote(match[2]).replace("_", " "))
+    words = {
+        word
+        for word in normalized(title).split()
+        if word not in STOP_WORDS and word not in CONNECTORS and not word.isdigit()
+    }
+    named = set(normalized(question + " " + answer.split("<details>", 1)[0]).split())
+    return bool(words & named)
+
+
+def with_sources(answer: str, urls: list[str]) -> str:
+    """The articles read for the check join the list of consulted sources."""
+    closing = answer.rfind("\n</details>")
+    if closing < 0 or "<details>" not in answer:
+        return answer
+    listed = "".join(f"\n- <{url}>" for url in urls if f"<{url}>" not in answer)
+    return answer[:closing] + listed + answer[closing:]
+
+
+# The closing note of a streamed answer (streamed_check).
+STREAM_NOTE = {
+    "en": "Not found in the sources read: {details}",
+    "fr": "Non retrouvé dans les sources lues : {details}",
+    "de": "In den gelesenen Quellen nicht gefunden: {details}",
+    "es": "No encontrado en las fuentes leídas: {details}",
+    "it": "Non trovato nelle fonti lette: {details}",
+}
+
+
+def _listed(details: list[Detail]) -> str:
+    names = list(dict.fromkeys(detail.text for detail in details))
+    more = ", …" if len(names) > NOTE_DETAILS else ""
+    return ", ".join(names[:NOTE_DETAILS]) + more
+
+
+def streamed_check(
+    answer: str,
+    passages: list[str],
+    own_texts: list[str],
+    *,
+    language: str,
+    computed: list[str] | None = None,
+    given: list[str] | None = None,
+    skip: frozenset[str] = frozenset(),
+) -> tuple[str, Report]:
+    """The closing note of an answer already streamed, empty when all is sourced.
+
+    Text already sent cannot be taken back (owner decision 2026-11-21): once a
+    streamed answer ends, its specific details are looked up in the texts the
+    turn read, as for a held answer, and those none holds are named in one
+    short note in the person's language. Code only: no model call, no
+    encyclopedia read; a turn without a text read is not checked.
+    """
+    started = time.monotonic()
+    report = Report(mode="note")
+    if not answer.strip() or not passages:
+        report.revised = "skipped:no_source"
+        return "", report
+    today = time.strftime("%Y-%m-%d")
+    results = list(computed or [])
+    own = Evidence.of([*own_texts, *results, today])
+    worked = Computed.of(own_texts if given is None else given, results, today)
+    report.details = len(extract(answer))
+    found = unsupported(answer, Evidence.of(passages), own, worked, skip)
+    report.unsupported = report.unsupported_after = len(found)
+    for detail in found:
+        report.kinds[detail.kind] = report.kinds.get(detail.kind, 0) + 1
+    note = ""
+    if found:
+        template = STREAM_NOTE.get(language, STREAM_NOTE["en"])
+        note = "*" + template.format(details=_listed(found)) + "*"
+        report.marked = 1
+        report.revised = "noted"
+    else:
+        report.revised = "skipped:none"
+    report.seconds = report.match_seconds = time.monotonic() - started
+    LOGGER.info("unsourced_details_streamed %s", json.dumps(report.metadata()))
+    return note, report
+
+
+def with_note(answer: str, note: str, streamed: bool) -> str:
+    """The stored answer with its closing note, as the person reads it.
+
+    Streamed, the note came after everything sent; otherwise it goes before
+    the consulted-sources block.
+    """
+    body, separator, footer = answer.partition("<details>")
+    if streamed or not separator:
+        return answer.rstrip() + "\n\n" + note
+    return body.rstrip() + "\n\n" + note + "\n\n" + separator + footer
+
+
+async def review(
+    answer: str,
+    passages: list[str],
+    own_texts: list[str],
+    *,
+    profile: str,
+    language: str,
+    question: str = "",
+    urls: list[str] | None = None,
+    setting: str | None = None,
+    reference: bool = True,
+    computed: list[str] | None = None,
+    given: list[str] | None = None,
+    skip: frozenset[str] = frozenset(),
+) -> tuple[str, Report]:
+    """Apply the configured treatment to an answer's unsupported precise details.
+
+    ``computed``: the results of the turn's computation tools (COMPUTATION_TOOLS),
+    as text; ``given``: the person's own messages, whose numbers and dates the
+    answer may compute with (default: ``own_texts``).
+    """
+    started = time.monotonic()
+    report = Report(mode=setting or mode())
+    if report.mode == "off" or not answer.strip():
+        return answer, report
+    # Today's date is known to the answer (a "consulted on" date is no invention).
+    today = time.strftime("%Y-%m-%d")
+    results = list(computed or [])
+    own = Evidence.of([*own_texts, *results, today])
+    worked = Computed.of(own_texts if given is None else given, results, today)
+    evidence = Evidence.of(passages)
+    report.details = len(extract(answer))
+    # Without a retrieved text, what the person said and what the turn computed
+    # still hold their details: only the others are looked up (a date the
+    # question gave once counted as found in an unrelated article, which then
+    # joined the sources, staging 2026-11-20).
+    found = unsupported(answer, evidence, own, worked, skip)
+    report.match_seconds = time.monotonic() - started
+    if found and reference:
+        articles = [
+            (url, text)
+            for url, text in await references(question, language, urls or [], passages)
+            if about_subject(url, question, answer)
+        ]
+        if articles:
+            passages = [*passages, *(text for _, text in articles)]
+            evidence = Evidence.of(passages)
+            checked = unsupported(answer, evidence, own, worked, skip)
+            report.referenced = len(found) - len(checked)
+            if report.referenced:
+                # Only the articles that hold one of the details they supported
+                # join the consulted sources.
+                kept = {detail.key for detail in checked}
+                referenced = [d for d in found if d.key not in kept]
+                holding = [
+                    (url, text)
+                    for url, text in articles
+                    if any(
+                        supported(d, Evidence.of([text]), Evidence())
+                        for d in referenced
+                    )
+                ]
+                report.reference_urls = [url for url, _ in holding]
+                report.reference_texts = [text for _, text in holding]
+            found = checked
+    if not passages:
+        report.revised = "skipped:no_source"
+        report.seconds = time.monotonic() - started
+        return answer, report
+    report.unsupported = report.unsupported_after = len(found)
+    for detail in found:
+        report.kinds[detail.kind] = report.kinds.get(detail.kind, 0) + 1
+    if len(found) > max(3, UNCOVERED_SHARE * report.details):
+        report.revised = "skipped:uncovered"
+        final = answer
+        if report.mode in {"mark", "revise_mark"}:
+            # Not rewritten (most of it would go), never presented as sourced.
+            final, report.marked = uncovered_note(answer, found, language)
+        report.seconds = time.monotonic() - started
+        LOGGER.info("unsourced_details %s", json.dumps(report.metadata()))
+        return with_sources(final, report.reference_urls), report
+    final = answer
+    remaining = found
+    if found and report.mode in {"revise", "revise_mark"}:
+        body, separator, footer = answer.partition("<details>")
+        revised = await _revise(
+            body.rstrip(), found, passages, profile, language, report
+        )
+        if revised is not None:
+            # The second and last check: what the revision still states without
+            # a source, apart from what it marked as not verified.
+            checked_at = time.monotonic()
+            left = unsupported(revised, evidence, own, worked, skip)
+            flagged = [d for d in left if model_marked(d, revised)]
+            after = [d for d in left if not model_marked(d, revised)]
+            report.match_seconds += time.monotonic() - checked_at
+            reason = acceptable(body, revised, found, after, flagged)
+            if reason:
+                report.revised = "rejected:" + reason
+            else:
+                report.revised = "kept"
+                kept = {detail.key for detail in left}
+                report.removed = [d.text for d in found if d.key not in kept]
+                report.fixed = len(report.removed)
+                report.model_marked = len(flagged)
+                final = revised + ("\n\n" + separator + footer if separator else "")
+                remaining = after
+                report.unsupported_after = len(after)
+    elif not found:
+        report.revised = "skipped:none"
+    if remaining and report.mode in {"mark", "revise_mark"}:
+        final, report.marked = mark(final, remaining, language)
+    final = with_sources(final, report.reference_urls)
+    report.seconds = time.monotonic() - started
+    LOGGER.info("unsourced_details %s", json.dumps(report.metadata()))
+    return final, report
+
+
+# --- Provided documents and deliverables: the same check, the turn's evidence.
+# Kinds whose written form depends on the language: a name or a title an answer
+# translates from its document ("Conseil" for "Council") is no added detail.
+LANGUAGE_BOUND = frozenset({"name", "title"})
+# Formats whose text is read back and checked (a workbook's figures are its
+# calculations, checked by calculation_check).
+CHECKED_SUFFIXES = frozenset({".docx", ".pptx", ".pdf", ".md", ".txt", ".html"})
+
+
+def turn_passages(sources: object) -> list[str]:
+    """The texts a turn holds as evidence (document_quotes.Sources): documents
+    (provided or retrieved), pasted texts, and every tool result (pages read,
+    searches, computations)."""
+    from services.orchestrator.document_quotes import PASTED_MINIMUM
+
+    if sources is None:
+        return []
+    return [
+        *getattr(sources, "documents", []),
+        *(
+            text
+            for text in getattr(sources, "conversation", [])
+            if len(text) >= PASTED_MINIMUM
+        ),
+        *getattr(sources, "evidence", []),
+    ]
+
+
+def language_bound(text: str, passages: list[str]) -> frozenset[str]:
+    """The kinds left out when the text and its sources are in other languages."""
+    from packages.language import detected_language
+
+    written = detected_language(text[:4000])
+    sourced = detected_language("\n".join(passages)[:4000])
+    if written and sourced and written != sourced:
+        return LANGUAGE_BOUND
+    return frozenset()
+
+
+def external(detail: Detail) -> bool:
+    """A detail no text of the turn could hold but a source outside it: a
+    full date, a version, a quarter, a percentage or a scaled figure."""
+    if detail.kind in {"version", "quarter"}:
+        return True
+    if detail.kind == "date":
+        return bool(detail.value and detail.value[0])
+    if detail.kind != "number":
+        return False
+    words = normalized(detail.text).split()
+    return "%" in detail.text or (len(words) > 1 and words[-1] in SCALES)
+
+
+def deliverable_details(
+    text: str, passages: list[str], own_texts: list[str], given: list[str]
+) -> list[Detail]:
+    """The details of a produced file that the turn's evidence does not hold.
+
+    The file's text is read back from the built file (packages/doc_render/
+    readback.py) and its details are matched like an answer's, by code only.
+    A detail kept with the not-verified marker is the person's to judge. A turn
+    that read nothing still has its external figures checked (a percentage, a
+    dated event, a version): staging 2026-11-21, a Word report gave a foreign
+    pilot's dates and counts and a company's productivity gain, from no source.
+    """
+    today = time.strftime("%Y-%m-%d")
+    own = Evidence.of([*own_texts, today])
+    worked = Computed.of(given, [], today)
+    skip = language_bound(text, passages) if passages else frozenset()
+    found = unsupported(text, Evidence.of(passages), own, worked, skip)
+    found = _not_derived(text, found, passages)
+    if not passages:
+        found = [detail for detail in found if external(detail)]
+    return [detail for detail in found if not model_marked(detail, text)]
+
+
+def _not_derived(text: str, found: list[Detail], passages: list[str]) -> list[Detail]:
+    """The unsupported numbers left once those one operation gives from
+    sourced numbers are taken out (a total, a share, a per-person amount).
+
+    One operand is a sourced number the file itself states, the other one
+    too or one of the sources' first numbers: pairs of the sources' numbers
+    alone would make almost any small value derivable (an invented "42 %"
+    is 38 + 4 of a source)."""
+    missing = {detail.key for detail in found}
+    stated = list(
+        dict.fromkeys(
+            parsed[0]
+            for detail in extract(text)
+            if detail.kind == "number"
+            and detail.key not in missing
+            and "%" not in detail.text
+            and (parsed := _number_value(detail.text)) is not None
+        )
+    )[:BASE_VALUES]
+    if not stated:
+        return found
+    read: dict[float, None] = {}
+    for passage in passages:
+        for match in NUMBER.finditer(passage[:GIVEN_CHARACTERS]):
+            if len(read) >= TOOL_VALUES:
+                break
+            if (parsed := _number_value(match[0])) is not None:
+                read.setdefault(parsed[0])
+    others = list(dict.fromkeys([*stated, *read]))
+    derived = sorted(
+        {
+            value
+            for first in stated
+            for second in others
+            if second != first
+            for value in _operations(first, second)
+        }
+    )
+    kept = []
+    for detail in found:
+        parsed = _number_value(detail.text) if detail.kind == "number" else None
+        if parsed is not None and _within(derived, parsed[0], parsed[1] or 1.0):
+            continue
+        kept.append(detail)
+    return kept
+
+
+def listed(details: list[Detail]) -> str:
+    """The details as a note names them (at most NOTE_DETAILS)."""
+    return _listed(details)

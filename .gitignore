@@ -1,0 +1,15 @@
+.env
+secrets.env
+*.log
+BRAIN/*.json
+BRAIN/bench/
+__pycache__/
+node_modules/
+.venv/
+reports/*.html
+BRAIN/
+private/
+
+# Private setup staging files; successful setup atomically replaces .env.
+.atlas-setup.env
+.atlas-env-*

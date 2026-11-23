@@ -1,0 +1,227 @@
+{
+ "recorded": "2026-11-16, staging gateway: the picture plan (work_pictures.plan) of varied requests on two profiles; the deliverable_plan role (fast profile, reasoning off), 2026-11-16 after staging -91",
+ "profiles": {
+  "atlas-mistral": {
+   "picture_book_fr": {
+    "request": "fait moi un imagier en pdf pour ma nièce de 4 ans avc une image par mot : girafe, chapeau, citron, trompette, poire, escargot, boîte aux lettres, pomme de pin, lapin, tracteur, moulin à vent, bougie",
+    "earlier": [],
+    "answer": "",
+    "expected_pictures": 12,
+    "reply": {
+     "text": "{\"pictures\": [{\"label\": \"girafe\", \"description\": \"A tall yellow giraffe with brown patches reaching for leaves on a tree.\"}, {\"label\": \"chapeau\", \"description\": \"A blue felt hat with a wide brim and a ribbon.\"}, {\"label\": \"citron\", \"description\": \"A bright yellow lemon with one green leaf on a white background.\"}, {\"label\": \"trompette\", \"description\": \"A shiny golden trumpet with three valves.\"}, {\"label\": \"poire\", \"description\": \"A ripe green pear with a short brown stem.\"}, {\"label\": \"escargot\", \"description\": \"A small snail with a spiral brown shell on a green leaf.\"}, {\"label\": \"masque\", \"description\": \"A colorful carnival mask with eye holes and decorative patterns\"}, {\"label\": \"tuba\", \"description\": \"A snorkel mask with a breathing tube for underwater swimming\"}, {\"label\": \"pomme de pin\", \"description\": \"A brown pine cone lying on the forest floor.\"}, {\"label\": \"lapin\", \"description\": \"A white rabbit with long ears sitting in the grass.\"}, {\"label\": \"tracteur\", \"description\": \"A green farm tractor with big back wheels in a field.\"}, {\"label\": \"moulin à vent\", \"description\": \"A wooden windmill with four sails on a grassy hill.\"}, {\"label\": \"bougie\", \"description\": \"A lit white candle on a small round plate.\"}], \"style\": \"Bright, simple cartoon illustrations with thick outlines and soft pastel colors, perfect for a 3-year-old child's picture book\", \"emoji_requested\": false}",
+     "cost_eur": "0.002268735"
+    }
+   },
+   "follow_up_missing_pictures_fr": {
+    "request": "merci ! il manque des images, tu peux finir stp ?",
+    "earlier": [
+     "fait moi un imagier en pdf pour ma nièce de 4 ans avc une image par mot : girafe, chapeau, citron, trompette, poire, escargot, boîte aux lettres, pomme de pin, lapin, tracteur, moulin à vent, bougie"
+    ],
+    "answer": "Voici l'imagier PDF avec les 12 mots. [Télécharger imagier.pdf](...)",
+    "expected_pictures": 12,
+    "reply": {
+     "text": "{\"pictures\": [{\"label\": \"girafe\", \"description\": \"A tall yellow giraffe with brown patches reaching for leaves on a tree.\"}, {\"label\": \"chapeau\", \"description\": \"A blue felt hat with a wide brim and a ribbon.\"}, {\"label\": \"citron\", \"description\": \"A bright yellow lemon with one green leaf on a white background.\"}, {\"label\": \"trompette\", \"description\": \"A shiny golden trumpet with three valves.\"}, {\"label\": \"poire\", \"description\": \"A ripe green pear with a short brown stem.\"}, {\"label\": \"escargot\", \"description\": \"A small snail with a spiral brown shell on a green leaf.\"}, {\"label\": \"boîte aux lettres\", \"description\": \"A red mailbox on a wooden post in front of a garden.\"}, {\"label\": \"pomme de pin\", \"description\": \"A brown pine cone lying on the forest floor.\"}, {\"label\": \"lapin\", \"description\": \"A white rabbit with long ears sitting in the grass.\"}, {\"label\": \"tracteur\", \"description\": \"A green farm tractor with big back wheels in a field.\"}, {\"label\": \"moulin à vent\", \"description\": \"A wooden windmill with four sails on a grassy hill.\"}, {\"label\": \"bougie\", \"description\": \"A lit white candle on a small round plate.\"}], \"style\": \"Bright, simple cartoon illustrations with thick outlines and soft pastel colors, clear and cheerful, designed for a 3-year-old child\", \"emoji_requested\": false}",
+     "cost_eur": "0.00274057"
+    }
+   },
+   "poster_en": {
+    "request": "make an A4 poster as a PDF for our neighbourhood bike repair workshop, saturday 10am at the community hall, free, with a big illustration of a bicycle",
+    "earlier": [],
+    "answer": "",
+    "expected_pictures": 1,
+    "reply": {
+     "text": "{\"pictures\": [{\"label\": \"Bicycle\", \"description\": \"Large detailed illustration of a bicycle showing frame, two wheels, handlebars, seat and pedals, prominently centered on the poster\"}], \"style\": \"Friendly community workshop poster style with bold readable typography and a prominent central bicycle illustration\", \"emoji_requested\": false}",
+     "cost_eur": "0.00071638"
+    }
+   },
+   "slides_animals_en": {
+    "request": "can you make me a slide deck presenting 5 savanna animals, one slide per animal with a picture and two short facts",
+    "earlier": [],
+    "answer": "",
+    "expected_pictures": 5,
+    "reply": {
+     "text": "{\"pictures\": [{\"label\": \"Lion\", \"description\": \"A male lion with a full mane resting on golden savanna grass, looking directly at the camera in warm sunlight.\"}, {\"label\": \"African Elephant\", \"description\": \"A large African elephant with big ears and tusks walking across dry grassland with acacia trees behind.\"}, {\"label\": \"Giraffe\", \"description\": \"A tall giraffe with a spotted pattern bending its long neck down toward a small bush on the savanna.\"}, {\"label\": \"Zebra\", \"description\": \"A zebra with bold black and white stripes standing in tall grass, facing sideways in bright daylight.\"}, {\"label\": \"Cheetah\", \"description\": \"A cheetah with black tear marks on its face sitting alertly on open ground with a blurred savanna background.\"}], \"style\": \"Consistent photorealistic wildlife photography with warm golden savanna lighting across all five slides.\", \"emoji_requested\": false}",
+     "cost_eur": "0.00088774"
+    }
+   },
+   "report_no_pictures_fr": {
+    "request": "Rédige-moi un rapport Word de deux pages sur la gestion des déchets dans une petite commune",
+    "earlier": [],
+    "answer": "",
+    "expected_pictures": 0,
+    "reply": {
+     "text": "{\"pictures\": [], \"style\": \"\", \"emoji_requested\": false}",
+     "cost_eur": "0.00044506"
+    }
+   },
+   "table_no_pictures_fr": {
+    "request": "Fais moi un doc word qui compare 4 langages de programmation dans un tableau avec les colonnes nom, année de création, typage, usage principal",
+    "earlier": [],
+    "answer": "",
+    "expected_pictures": 0,
+    "reply": {
+     "text": "{\"pictures\": [], \"style\": \"\", \"emoji_requested\": false}",
+     "cost_eur": "0.000446845"
+    }
+   },
+   "emoji_asked_en": {
+    "request": "make me a one-page PDF checklist for packing a beach bag, with an emoji next to each item",
+    "earlier": [],
+    "answer": "",
+    "expected_pictures": 0,
+    "reply": {
+     "text": "{\"pictures\": [], \"style\": \"\", \"emoji_requested\": true}",
+     "cost_eur": "0.00035462"
+    }
+   }
+  },
+  "atlas-qwen": {
+   "picture_book_fr": {
+    "request": "fait moi un imagier en pdf pour ma nièce de 4 ans avc une image par mot : girafe, chapeau, citron, trompette, poire, escargot, boîte aux lettres, pomme de pin, lapin, tracteur, moulin à vent, bougie",
+    "earlier": [],
+    "answer": "",
+    "expected_pictures": 12,
+    "reply": {
+     "text": "{\n  \"pictures\": [\n    {\n      \"label\": \"girafe\",\n      \"description\": \"A tall yellow giraffe with brown patches reaching for leaves on a tree.\"\n    },\n    {\n      \"label\": \"chapeau\",\n      \"description\": \"A blue felt hat with a wide brim and a ribbon.\"\n    },\n    {\n      \"label\": \"citron\",\n      \"description\": \"A bright yellow lemon with one green leaf on a white background.\"\n    },\n    {\n      \"label\": \"trompette\",\n      \"description\": \"A shiny golden trumpet with three valves.\"\n    },\n    {\n      \"label\": \"poire\",\n      \"description\": \"A ripe green pear with a short brown stem.\"\n    },\n    {\n      \"label\": \"escargot\",\n      \"description\": \"A small snail with a spiral brown shell on a green leaf.\"\n    },\n    {\n      \"label\": \"boîte aux lettres\",\n      \"description\": \"A red mailbox on a wooden post in front of a garden.\"\n    },\n    {\n      \"label\": \"pomme de pin\",\n      \"description\": \"A brown pine cone lying on the forest floor.\"\n    },\n    {\n      \"label\": \"lapin\",\n      \"description\": \"A white rabbit with long ears sitting in the grass.\"\n    },\n    {\n      \"label\": \"tracteur\",\n      \"description\": \"A green farm tractor with big back wheels in a field.\"\n    },\n    {\n      \"label\": \"moulin à vent\",\n      \"description\": \"A wooden windmill with four sails on a grassy hill.\"\n    },\n    {\n      \"label\": \"bougie\",\n      \"description\": \"A lit white candle on a small round plate.\"\n    }\n  ],\n  \"style\": \"Simple, colorful, and friendly cartoon illustrations suitable for a 3-year-old child, with thick outlines and clear shapes.\",\n  \"emoji_requested\": false\n}",
+     "cost_eur": "0.0019332"
+    }
+   },
+   "follow_up_missing_pictures_fr": {
+    "request": "merci ! il manque des images, tu peux finir stp ?",
+    "earlier": [
+     "fait moi un imagier en pdf pour ma nièce de 4 ans avc une image par mot : girafe, chapeau, citron, trompette, poire, escargot, boîte aux lettres, pomme de pin, lapin, tracteur, moulin à vent, bougie"
+    ],
+    "answer": "Voici l'imagier PDF avec les 12 mots. [Télécharger imagier.pdf](...)",
+    "expected_pictures": 12,
+    "reply": {
+     "text": "{\n  \"pictures\": [\n    {\n      \"label\": \"girafe\",\n      \"description\": \"A tall yellow giraffe with brown patches reaching for leaves on a tree.\"\n    },\n    {\n      \"label\": \"chapeau\",\n      \"description\": \"A blue felt hat with a wide brim and a ribbon.\"\n    },\n    {\n      \"label\": \"citron\",\n      \"description\": \"A bright yellow lemon with one green leaf on a white background.\"\n    },\n    {\n      \"label\": \"trompette\",\n      \"description\": \"A shiny golden trumpet with three valves.\"\n    },\n    {\n      \"label\": \"poire\",\n      \"description\": \"A ripe green pear with a short brown stem.\"\n    },\n    {\n      \"label\": \"escargot\",\n      \"description\": \"A small snail with a spiral brown shell on a green leaf.\"\n    },\n    {\n      \"label\": \"boîte aux lettres\",\n      \"description\": \"A red mailbox on a wooden post in front of a garden.\"\n    },\n    {\n      \"label\": \"pomme de pin\",\n      \"description\": \"A brown pine cone lying on the forest floor.\"\n    },\n    {\n      \"label\": \"lapin\",\n      \"description\": \"A white rabbit with long ears sitting in the grass.\"\n    },\n    {\n      \"label\": \"tracteur\",\n      \"description\": \"A green farm tractor with big back wheels in a field.\"\n    },\n    {\n      \"label\": \"moulin à vent\",\n      \"description\": \"A wooden windmill with four sails on a grassy hill.\"\n    },\n    {\n      \"label\": \"bougie\",\n      \"description\": \"A lit white candle on a small round plate.\"\n    }\n  ],\n  \"style\": \"Simple, colorful, and friendly cartoon illustrations suitable for a 3-year-old child, with thick outlines and clear subjects.\",\n  \"emoji_requested\": false\n}",
+     "cost_eur": "0.0019554"
+    }
+   },
+   "poster_en": {
+    "request": "make an A4 poster as a PDF for our neighbourhood bike repair workshop, saturday 10am at the community hall, free, with a big illustration of a bicycle",
+    "earlier": [],
+    "answer": "",
+    "expected_pictures": 1,
+    "reply": {
+     "text": "{\"pictures\": [{\"label\": \"Bicycle\", \"description\": \"A large, detailed illustration of a bicycle suitable for a community workshop poster, showing the frame, wheels, handlebars, and seat clearly.\"}], \"style\": \"friendly community workshop poster style with bold lines and inviting colors\", \"emoji_requested\": false}",
+     "cost_eur": "0.0004236"
+    }
+   },
+   "slides_animals_en": {
+    "request": "can you make me a slide deck presenting 5 savanna animals, one slide per animal with a picture and two short facts",
+    "earlier": [],
+    "answer": "",
+    "expected_pictures": 5,
+    "reply": {
+     "text": "{\n  \"pictures\": [\n    {\n      \"label\": \"Lion\",\n      \"description\": \"A male lion with a large golden mane standing on a grassy savanna plain under a bright sun.\"\n    },\n    {\n      \"label\": \"Elephant\",\n      \"description\": \"An African elephant with large ears and tusks walking through dry savanna grass near an acacia tree.\"\n    },\n    {\n      \"label\": \"Giraffe\",\n      \"description\": \"A tall giraffe with a spotted coat eating leaves from the top of an acacia tree against a blue sky.\"\n    },\n    {\n      \"label\": \"Zebra\",\n      \"description\": \"A zebra with distinct black and white stripes grazing in a group on the open savanna.\"\n    },\n    {\n      \"label\": \"Cheetah\",\n      \"description\": \"A cheetah with a spotted coat and tear marks on its face sitting alertly on a small rocky mound.\"\n    }\n  ],\n  \"style\": \"Realistic wildlife photography style with natural lighting and warm savanna tones\",\n  \"emoji_requested\": false\n}",
+     "cost_eur": "0.0010944"
+    }
+   },
+   "report_no_pictures_fr": {
+    "request": "Rédige-moi un rapport Word de deux pages sur la gestion des déchets dans une petite commune",
+    "earlier": [],
+    "answer": "",
+    "expected_pictures": 0,
+    "reply": {
+     "text": "{\"pictures\": [], \"style\": \"\", \"emoji_requested\": false}",
+     "cost_eur": "0.000231"
+    }
+   },
+   "table_no_pictures_fr": {
+    "request": "Fais moi un doc word qui compare 4 langages de programmation dans un tableau avec les colonnes nom, année de création, typage, usage principal",
+    "earlier": [],
+    "answer": "",
+    "expected_pictures": 0,
+    "reply": {
+     "text": "{\"pictures\": [], \"style\": \"\", \"emoji_requested\": false}",
+     "cost_eur": "0.0002382"
+    }
+   },
+   "emoji_asked_en": {
+    "request": "make me a one-page PDF checklist for packing a beach bag, with an emoji next to each item",
+    "earlier": [],
+    "answer": "",
+    "expected_pictures": 0,
+    "reply": {
+     "text": "{\n  \"pictures\": [],\n  \"style\": \"\",\n  \"emoji_requested\": true\n}",
+     "cost_eur": "0.0002598"
+    }
+   }
+  },
+  "deliverable_plan role": {
+   "picture_book_fr": {
+    "request": "fait moi un imagier en pdf pour ma nièce de 4 ans avc une image par mot : girafe, chapeau, citron, trompette, poire, escargot, boîte aux lettres, pomme de pin, lapin, tracteur, moulin à vent, bougie",
+    "earlier": [],
+    "answer": "",
+    "expected_pictures": 12,
+    "reply": {
+     "text": "{\"pictures\": [{\"label\": \"girafe\", \"description\": \"A tall yellow giraffe with brown patches reaching for leaves on a tree.\"}, {\"label\": \"chapeau\", \"description\": \"A blue felt hat with a wide brim and a ribbon.\"}, {\"label\": \"citron\", \"description\": \"A bright yellow lemon with one green leaf on a white background.\"}, {\"label\": \"trompette\", \"description\": \"A shiny golden trumpet with three valves.\"}, {\"label\": \"poire\", \"description\": \"A ripe green pear with a short brown stem.\"}, {\"label\": \"escargot\", \"description\": \"A small snail with a spiral brown shell on a green leaf.\"}, {\"label\": \"boîte aux lettres\", \"description\": \"A red mailbox on a wooden post in front of a garden.\"}, {\"label\": \"pomme de pin\", \"description\": \"A brown pine cone lying on the forest floor.\"}, {\"label\": \"lapin\", \"description\": \"A white rabbit with long ears sitting in the grass.\"}, {\"label\": \"tracteur\", \"description\": \"A green farm tractor with big back wheels in a field.\"}, {\"label\": \"moulin à vent\", \"description\": \"A wooden windmill with four sails on a grassy hill.\"}, {\"label\": \"bougie\", \"description\": \"A lit white candle on a small round plate.\"}], \"style\": \"bright, simple, cartoon style for toddlers\", \"emoji_requested\": false}",
+     "cost_eur": "0.0004108"
+    }
+   },
+   "follow_up_missing_pictures_fr": {
+    "request": "merci ! il manque des images, tu peux finir stp ?",
+    "earlier": [
+     "fait moi un imagier en pdf pour ma nièce de 4 ans avc une image par mot : girafe, chapeau, citron, trompette, poire, escargot, boîte aux lettres, pomme de pin, lapin, tracteur, moulin à vent, bougie"
+    ],
+    "answer": "Voici l'imagier PDF avec les 12 mots. [Télécharger imagier.pdf](...)",
+    "expected_pictures": 12,
+    "reply": {
+     "text": "{\"pictures\": [{\"label\": \"girafe\", \"description\": \"A tall yellow giraffe with brown patches reaching for leaves on a tree.\"}, {\"label\": \"chapeau\", \"description\": \"A blue felt hat with a wide brim and a ribbon.\"}, {\"label\": \"citron\", \"description\": \"A bright yellow lemon with one green leaf on a white background.\"}, {\"label\": \"trompette\", \"description\": \"A shiny golden trumpet with three valves.\"}, {\"label\": \"poire\", \"description\": \"A ripe green pear with a short brown stem.\"}, {\"label\": \"escargot\", \"description\": \"A small snail with a spiral brown shell on a green leaf.\"}, {\"label\": \"boîte aux lettres\", \"description\": \"A red mailbox on a wooden post in front of a garden.\"}, {\"label\": \"pomme de pin\", \"description\": \"A brown pine cone lying on the forest floor.\"}, {\"label\": \"lapin\", \"description\": \"A white rabbit with long ears sitting in the grass.\"}, {\"label\": \"tracteur\", \"description\": \"A green farm tractor with big back wheels in a field.\"}, {\"label\": \"moulin à vent\", \"description\": \"A wooden windmill with four sails on a grassy hill.\"}, {\"label\": \"bougie\", \"description\": \"A lit white candle on a small round plate.\"}], \"style\": \"bright, simple, child-friendly cartoon style\", \"emoji_requested\": false}",
+     "cost_eur": "0.0004156"
+    }
+   },
+   "poster_en": {
+    "request": "make an A4 poster as a PDF for our neighbourhood bike repair workshop, saturday 10am at the community hall, free, with a big illustration of a bicycle",
+    "earlier": [],
+    "answer": "",
+    "expected_pictures": 1,
+    "reply": {
+     "text": "{\"pictures\": [{\"label\": \"Bicycle\", \"description\": \"A large, detailed illustration of a classic bicycle with wheels, frame, handlebars, and pedals, centered on the poster.\"}], \"style\": \"Clean, friendly, community-oriented, with bold colors and simple shapes\", \"emoji_requested\": false}",
+     "cost_eur": "0.0001828"
+    }
+   },
+   "slides_animals_en": {
+    "request": "can you make me a slide deck presenting 5 savanna animals, one slide per animal with a picture and two short facts",
+    "earlier": [],
+    "answer": "",
+    "expected_pictures": 5,
+    "reply": {
+     "text": "{\"pictures\": [{\"label\": \"Lion\", \"description\": \"Male lion with thick mane standing on savanna grass, golden light.\"}, {\"label\": \"Elephant\", \"description\": \"African elephant with large ears and trunk raised, dust around feet.\"}, {\"label\": \"Giraffe\", \"description\": \"Tall giraffe with long neck and spotted coat, eating leaves from acacia tree.\"}, {\"label\": \"Zebra\", \"description\": \"Black and white striped zebra standing in dry grass, head turned sideways.\"}, {\"label\": \"Cheetah\", \"description\": \"Cheetah with black tear marks, sprinting across open savanna, motion blur.\"}], \"style\": \"realistic wildlife photography, warm natural tones\", \"emoji_requested\": false}",
+     "cost_eur": "0.0002556"
+    }
+   },
+   "report_no_pictures_fr": {
+    "request": "Rédige-moi un rapport Word de deux pages sur la gestion des déchets dans une petite commune",
+    "earlier": [],
+    "answer": "",
+    "expected_pictures": 0,
+    "reply": {
+     "text": "{\"pictures\": [], \"style\": \"\", \"emoji_requested\": false}",
+     "cost_eur": "0.0001348"
+    }
+   },
+   "table_no_pictures_fr": {
+    "request": "Fais moi un doc word qui compare 4 langages de programmation dans un tableau avec les colonnes nom, année de création, typage, usage principal",
+    "earlier": [],
+    "answer": "",
+    "expected_pictures": 0,
+    "reply": {
+     "text": "{\"pictures\": [], \"style\": \"\", \"emoji_requested\": false}",
+     "cost_eur": "0.0001396"
+    }
+   },
+   "emoji_asked_en": {
+    "request": "make me a one-page PDF checklist for packing a beach bag, with an emoji next to each item",
+    "earlier": [],
+    "answer": "",
+    "expected_pictures": 0,
+    "reply": {
+     "text": "{\"pictures\": [], \"style\": \"\", \"emoji_requested\": true}",
+     "cost_eur": "0.0001348"
+    }
+   }
+  }
+ }
+}

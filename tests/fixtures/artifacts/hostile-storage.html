@@ -1,0 +1,22 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Hostile storage probe</title>
+</head>
+<body>
+  <h1>Storage probe</h1>
+  <p id="marker">Storage fixture ready</p>
+  <button id="run" type="button">Run</button>
+  <p id="result">not-run</p>
+  <p id="stored"></p>
+  <script>
+    document.getElementById("stored").textContent = String(localStorage.getItem("score"));
+    document.getElementById("run").addEventListener("click", () => {
+      localStorage.setItem("score", "42");
+      document.body.dataset.score = localStorage.getItem("score");
+      document.getElementById("result").textContent = "allowed";
+    });
+  </script>
+</body>
+</html>

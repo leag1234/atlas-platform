@@ -1,0 +1,306 @@
+"""Retrieval-owned target metadata and grants; contains no SSH credential bytes.
+
+Imported by retrieval only. The runner process uses signed public projections,
+never a connection to the project database.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+from uuid import uuid4
+
+from psycopg.types.json import Jsonb
+
+from services.retrieval.project_files import timestamp
+from services.retrieval.project_identity import ProjectError
+from services.retrieval.project_store import Scope, entity
+from services.runner.contract import Target
+
+Json = dict[str, Any]
+
+
+class Registry:
+    def __init__(self, scope: Scope) -> None:
+        self.scope = scope
+        self.org = scope.identity.org
+
+    def get(self, kind: str, identifier: str) -> Json:
+        if kind not in {"targets", "grants", "sessions", "commands"}:
+            raise ValueError("invalid_runner_entity")
+        args = [self.org, identifier]
+        if kind == "targets":
+            # Another member's personal machine does not exist for this caller.
+            args.append(self.scope.identity.member)
+            clause = " AND (owner_member_id IS NULL OR owner_member_id=%s)"
+        else:
+            args.append(self.scope.project_id)
+            clause = " AND project_id=%s"
+        row = self.scope.db.execute(
+            "SELECT data FROM atlas_projects.runner_"
+            + kind
+            + " WHERE org_id=%s AND id=%s"
+            + clause
+            + ("" if kind == "targets" else " FOR UPDATE"),
+            args,
+        ).fetchone()
+        if row is None:
+            raise ProjectError(404, "not_found")
+        return dict(row["data"])
+
+    def save(self, kind: str, value: Json, create: bool = False) -> None:
+        if kind not in {"targets", "grants", "sessions", "commands"}:
+            raise ValueError("invalid_runner_entity")
+        table = "atlas_projects.runner_" + kind
+        if create:
+            if kind == "targets":
+                self.scope.db.execute(
+                    "INSERT INTO "
+                    + table
+                    + "(org_id,id,data,owner_member_id) VALUES(%s,%s,%s,%s)",
+                    (
+                        self.org,
+                        value["id"],
+                        Jsonb(value),
+                        value.get("owner_member_id"),
+                    ),
+                )
+            else:
+                self.scope.db.execute(
+                    "INSERT INTO " + table + " VALUES(%s,%s,%s,%s)",
+                    (self.org, self.scope.project_id, value["id"], Jsonb(value)),
+                )
+        else:
+            value["revision"] += 1
+            value["updated_at"] = timestamp()
+            args: list[Any] = [Jsonb(value), self.org, value["id"]]
+            if kind == "targets":
+                args.append(self.scope.identity.member)
+                clause = " AND (owner_member_id IS NULL OR owner_member_id=%s)"
+            else:
+                args.append(self.scope.project_id)
+                clause = " AND project_id=%s"
+            self.scope.db.execute(
+                "UPDATE " + table + " SET data=%s WHERE org_id=%s AND id=%s" + clause,
+                args,
+            )
+
+    def new(self) -> Json:
+        return dict(entity(self.scope.identity.member, self.org), id=str(uuid4()))
+
+    def target(
+        self, data: Json, identifier: str | None = None, expected: str | None = None
+    ) -> Json:
+        self.scope.admin()
+        fields = Target.model_validate(data).model_dump()
+        if fields["jump_target_id"]:
+            jump = self.get("targets", fields["jump_target_id"])
+            if jump.get("owner_member_id") is not None:
+                raise ProjectError(404, "not_found")
+            if jump.get("jump_target_id") or jump["id"] == identifier:
+                raise ProjectError(
+                    422, "invalid_request", "Only one registered jump is supported"
+                )
+        reused = self.scope.db.execute(
+            "SELECT id FROM atlas_projects.runner_targets WHERE org_id=%s AND data->>'credential_ref'=%s AND id<>%s",
+            (
+                self.org,
+                fields["credential_ref"],
+                identifier or "00000000-0000-0000-0000-000000000000",
+            ),
+        ).fetchone()
+        if reused:
+            raise ProjectError(409, "credential_already_bound")
+        value = self.get("targets", identifier) if identifier else self.new()
+        if value.get("owner_member_id") is not None:
+            # A personal machine is never administered as an organization target.
+            raise ProjectError(404, "not_found")
+        if identifier:
+            self.scope.match(value, expected)
+            transport_fields = ("host", "port", "user", "work_root", "jump_target_id")
+            if any(value[key] != fields[key] for key in transport_fields):
+                usage = self.scope.db.execute(
+                    "SELECT * FROM atlas_projects.runner_usage(%s)", (identifier,)
+                ).fetchone()
+                if usage and usage["target_sessions"]:
+                    raise ProjectError(
+                        409, "runner_sessions_must_close_before_moving_target"
+                    )
+        value.update(fields, status="unavailable", last_probe=None)
+        self.save("targets", value, create=identifier is None)
+        self.scope.event(
+            "runner_target_registered"
+            if identifier is None
+            else "runner_target_changed"
+        )
+        return value
+
+    def grant(self, target: str, enabled: bool) -> Json:
+        self.scope.admin()
+        if self.get("targets", target).get("owner_member_id") is not None:
+            raise ProjectError(404, "not_found")
+        try:
+            value = self.get("grants", target)
+        except ProjectError as exc:
+            if exc.status != 404:
+                raise
+            value = dict(
+                self.new(),
+                id=target,
+                project_id=self.scope.project_id,
+                target_id=target,
+                granted_by=self.scope.identity.member,
+                enabled=enabled,
+                code_egress_approved_at=None,
+                allow_rules=[],
+            )
+            self.save("grants", value, create=True)
+        else:
+            value.update(enabled=enabled, code_egress_approved_at=None, allow_rules=[])
+            self.save("grants", value)
+        self.scope.event("runner_grant_changed", self.scope.project_id)
+        return value
+
+    def granted(self, target: str) -> tuple[Json, Json]:
+        """The target and the record of its use by this project, or 404.
+
+        An organization target needs the grant an administrator gave to the
+        project. A personal machine needs no grant: it serves its owner, once
+        verified, in every project where he works, and nobody else.
+        """
+        value = self.get("targets", target)
+        if value.get("owner_member_id") is not None:
+            if not self.usable(value):
+                raise ProjectError(404, "not_found")
+            return value, self.personal_grant(value)
+        grant = self.get("grants", target)
+        if not grant["enabled"]:
+            raise ProjectError(404, "not_found")
+        return value, grant
+
+    def usable(self, target: Json) -> bool:
+        """A personal machine serves its owner alone, after one verification."""
+        return bool(
+            target.get("owner_member_id") == self.scope.identity.member
+            and target.get("verified_at")
+        )
+
+    def private_chat_workspace(self) -> bool:
+        """Whether the scope is the caller's own hidden workspace, his alone."""
+        project = self.scope.project
+        if project is None:
+            return False
+        data = project["data"]
+        if not data.get("hidden") or data.get("owner_member_id") != (
+            self.scope.identity.member
+        ):
+            return False
+        row = self.scope.db.execute(
+            "SELECT count(*) AS count FROM atlas_projects.grants"
+            " WHERE org_id=%s AND project_id=%s AND member_id<>%s",
+            (self.org, self.scope.project_id, self.scope.identity.member),
+        ).fetchone()
+        return row is not None and row["count"] == 0
+
+    def personal_grant(self, target: Json) -> Json:
+        """Per-project state of a personal machine: code egress approval, rules.
+
+        Created on first use by the owner. It grants nothing by itself; every
+        read goes through `granted`, which checks the owner again.
+        """
+        try:
+            return self.get("grants", target["id"])
+        except ProjectError as exc:
+            if exc.status != 404:
+                raise
+        value = dict(
+            self.new(),
+            id=target["id"],
+            project_id=self.scope.project_id,
+            target_id=target["id"],
+            granted_by=self.scope.identity.member,
+            enabled=True,
+            personal=True,
+            # Owner decision 2026-11-11: in his private chat workspace, declaring
+            # and verifying the machine is the member's consent to send code
+            # there (no approval card exists in the chat). Anywhere else the
+            # first use still asks: the code of a project may belong to others.
+            # A connected computer works in its owner's own folder: no project
+            # file is sent there (remote_write_file sends what the agent wrote,
+            # bound to its command), so there is no code egress to approve.
+            code_egress_approved_at=timestamp()
+            if self.private_chat_workspace() or target.get("transport") == "relay"
+            else None,
+            allow_rules=[],
+        )
+        self.save("grants", value, create=True)
+        return value
+
+    def control(self, target: Json) -> Json:
+        """Broker permit for a probe, marked by who is entitled to ask for it."""
+        if target.get("owner_member_id") is not None:
+            return dict(
+                org_id=self.org,
+                target=target,
+                personal=True,
+                member_id=self.scope.identity.member,
+            )
+        return dict(org_id=self.org, target=target, admin=True)
+
+    def targets(self, model: bool = False, capability: str | None = None) -> list[Json]:
+        if not model:
+            self.scope.admin()
+        rows = self.scope.db.execute(
+            "SELECT data FROM atlas_projects.runner_targets WHERE org_id=%s AND (owner_member_id IS NULL OR owner_member_id=%s) ORDER BY id",
+            (self.org, self.scope.identity.member),
+        ).fetchall()
+        values = []
+        for row in rows:
+            value = dict(row["data"])
+            personal = value.get("owner_member_id") is not None
+            if personal and not model:
+                # Administration lists organization targets only.
+                continue
+            if capability and capability not in value["capabilities"]:
+                continue
+            if model:
+                if personal:
+                    if not self.usable(value):
+                        continue
+                else:
+                    try:
+                        if not self.get("grants", value["id"])["enabled"]:
+                            continue
+                    except ProjectError as exc:
+                        if exc.status == 404:
+                            continue
+                        raise
+                value = {
+                    k: value[k]
+                    for k in (
+                        "id",
+                        "name",
+                        "os",
+                        "arch",
+                        "shell",
+                        "capabilities",
+                        "permission_mode",
+                        "status",
+                    )
+                }
+                value.update(profiles=[], devices=[])
+                if personal:
+                    value["personal"] = True
+                    if row["data"].get("transport") == "relay":
+                        # The user's own computer: commands run in his folder.
+                        value.update(
+                            connected=bool(row["data"].get("relay_user")),
+                            folder=row["data"].get("work_root"),
+                        )
+            values.append(value)
+        return values
+
+    def resolve(self, name: str) -> str:
+        values = [t for t in self.targets(model=True) if name in {t["id"], t["name"]}]
+        if len(values) != 1:
+            raise ProjectError(404, "not_found", "No unique granted target matches")
+        return str(values[0]["id"])

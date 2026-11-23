@@ -1,0 +1,911 @@
+"""Local user-file container with host-installed, fail-closed network containment."""
+
+from contextlib import contextmanager
+from collections.abc import Iterator
+import json
+import os
+import socket
+import hmac
+import subprocess
+import select
+import socketserver
+import threading
+import re
+import posixpath
+from urllib.parse import unquote
+
+import uvicorn
+from packages.ports import atlas_ports
+from services.orchestrator.ui_injection import inject_atlas_ui
+from services.orchestrator.code_ui import legacy_project_route, project_mode
+from services.retrieval.project_identity import ProjectError
+
+NETWORK = "atlas-files"
+UPSTREAM_IMAGE = "ghcr.io/open-webui/open-terminal@sha256:3d52176700f2442e20556ef129ae980613389be773e269cf7fa0118f3b55669d"
+
+
+def work_image(value: str | None = None) -> str:
+    """The execution image for Work commands, the files terminal and code execution.
+
+    ATLAS_WORK_IMAGE names an image built from infra/docker/Dockerfile.work (the
+    upstream image plus the Go toolchain), pinned either by repository digest
+    (name@sha256:...) or, for a locally built image, by image ID (sha256:...).
+    Unset, the pinned upstream image is used: Python, Node.js and gcc, without Go.
+    """
+    image = (os.environ.get("ATLAS_WORK_IMAGE", "") if value is None else value).strip()
+    if not image:
+        return UPSTREAM_IMAGE
+    if re.fullmatch(r"(?:[^@\s]+@)?sha256:[0-9a-f]{64}", image) is None:
+        raise RuntimeError(
+            "invalid_configuration: ATLAS_WORK_IMAGE must be name@sha256:<64 hex> "
+            "or an image ID sha256:<64 hex>"
+        )
+    return image
+
+
+def toolchains(image: str) -> str:
+    """Languages Work commands can build and run offline in ``image``."""
+    return "Python 3, Node.js with npm, gcc/g++" + (
+        "" if image == UPSTREAM_IMAGE else " and Go"
+    )
+
+
+IMAGE = work_image()
+TOOLCHAINS = toolchains(IMAGE)
+
+
+def disable_webui_file_processing(header: bytes) -> bytes:
+    """Keep uploads as chat attachments; Atlas reads their originals itself.
+
+    Open WebUI defaults both upload processing switches to true.  Changing only the
+    request target lets the multipart stream pass through byte-for-byte, including
+    large files, while preventing its separate extraction/indexing pipeline.
+    """
+    request_line, separator, remainder = header.partition(b"\r\n")
+    fields = request_line.split(b" ", 2)
+    if len(fields) != 3 or fields[0].upper() != b"POST":
+        return header
+    target = fields[1]
+    path, query_marker, query = target.partition(b"?")
+    if path.rstrip(b"/") != b"/api/v1/files":
+        return header
+    rewritten: list[bytes] = []
+    seen = set[bytes]()
+    for item in query.split(b"&") if query_marker else []:
+        name = item.split(b"=", 1)[0]
+        lowered = name.lower()
+        if lowered in {b"process", b"process_in_background"}:
+            rewritten.append(name + b"=false")
+            seen.add(lowered)
+        else:
+            rewritten.append(item)
+    for name in (b"process", b"process_in_background"):
+        if name not in seen:
+            rewritten.append(name + b"=false")
+    fields[1] = path + b"?" + b"&".join(rewritten)
+    return b" ".join(fields) + separator + remainder
+
+
+def without_header(header: bytes, name: bytes) -> bytes:
+    """Remove every case-insensitive HTTP header line with ``name``."""
+    prefix = name.lower() + b":"
+    return b"\r\n".join(
+        line for line in header.split(b"\r\n") if not line.lower().startswith(prefix)
+    )
+
+
+def dictation_upgrade(target_path: str, header: bytes) -> bool:
+    """A WebSocket upgrade to the dictation relay, the only upgraded /api/atlas/ route."""
+    return (
+        target_path.split("?", 1)[0] == "/api/atlas/dictation/stream"
+        and re.search(rb"(?im)^upgrade:\s*websocket\s*$", header) is not None
+        and re.search(rb"(?im)^connection:[^\r\n]*\bupgrade\b", header) is not None
+    )
+
+
+def identity_allowed(header: bytes) -> bool:
+    """A front-door identity names a user, except for interface files and API keys.
+
+    nginx turns basic authentication off for "Bearer sk-" interface keys and for the
+    public interface files, so it sends an empty user ("@host") with the proxy secret;
+    the interface then checks the key itself, and the files are the same for everyone.
+    Any other request with an empty user is refused, whatever nginx sends.
+    """
+    if re.search(rb"(?im)^x-atlas-user:", header) is None:
+        return False
+    if named_user(header):
+        return True
+    if public_interface_file(header):
+        return True
+    return re.search(rb"(?im)^authorization:[ \t]*Bearer sk-\S", header) is not None
+
+
+def named_user(header: bytes) -> bool:
+    """The front door names a user ("ana@host"), not the empty user ("@host")."""
+    found = re.search(rb"(?im)^x-atlas-user:[ \t]*([^\r\n]*)", header)
+    user = found.group(1).strip() if found else b""
+    return bool(user) and not user.startswith(b"@")
+
+
+# Files every browser loads to start the interface, the same for every user: the
+# content-hashed build and its version file, the interface's static files (Open WebUI's
+# and the Atlas overlay mounted under /static/atlas/), the web app manifest, the
+# pictures at the root of the build (icon, default avatar, image placeholder), and the
+# Atlas page scripts and styles the relay injects into the page shell. The front door
+# serves exactly these without basic authentication (infra/stable/nginx/*.conf).
+PUBLIC_INTERFACE_FILES = re.compile(
+    r"/_app/immutable/[A-Za-z0-9_./-]+"
+    r"|/_app/version\.json"
+    r"|/static/[A-Za-z0-9_./-]+"
+    r"|/manifest\.json"
+    r"|/(?:favicon|user|image-placeholder)\.png"
+    r"|/api/atlas/keys/(?:client\.js|style\.css)"
+    r"|/api/atlas/(?:user-memory|voice)/client\.js"
+    r"|/project-mode/(?:client\.js|locale\.js|shell\.js|style\.css)"
+)
+
+
+def public_interface_file(header: bytes) -> bool:
+    """A read of an interface file, which holds no user data.
+
+    Phone browsers (Chrome on Android, measured 2026-11-15) fetch many of these files
+    without the basic credentials and do not retry module scripts after the 401, which
+    broke the whole interface, so the front door sends them without a user. Only GET
+    and HEAD, only these paths, after path normalization.
+    """
+    method = header.split(b" ", 1)[0].upper()
+    if method not in (b"GET", b"HEAD"):
+        return False
+    path = normalized_path(header)
+    return path is not None and PUBLIC_INTERFACE_FILES.fullmatch(path) is not None
+
+
+def anonymous_interface_read(header: bytes) -> bytes:
+    """Forward a read of an interface file without a user as an anonymous request.
+
+    No cookie, credential or identity reaches Open WebUI, so the answer cannot depend
+    on a session and is the one every visitor gets.
+    """
+    for name in (b"cookie", b"authorization", b"x-atlas-user"):
+        header = without_header(header, name)
+    return header
+
+
+# Listen backlog of the front relays (bounded by net.core.somaxconn).
+LISTEN_BACKLOG = 1024
+
+DOWNLOAD = re.compile(
+    r"/api/v1/terminals/atlas-files/files/serve/home/user/requests/"
+    r"(chatcmpl-[a-f0-9]{32})/[A-Za-z0-9][A-Za-z0-9_.-]*"
+)
+
+
+def normalized_path(header: bytes) -> str | None:
+    """The request path after repeated percent-decoding and dot removal."""
+    path = header.split(b" ", 2)[1].split(b"?", 1)[0].decode("latin1")
+    for _ in range(8):
+        decoded = unquote(path)
+        if decoded == path:
+            break
+        path = decoded
+    if unquote(path) != path or "\\" in path:
+        return None
+    return posixpath.normpath(path)
+
+
+def download_request(header: bytes) -> str | None:
+    """Request id of a generated-download route, as the relay resolves the path."""
+    path = normalized_path(header)
+    found = DOWNLOAD.fullmatch(path) if path is not None else None
+    return found.group(1) if found is not None else None
+
+
+def download_owned(header: bytes) -> bool:
+    """A generated download is served only to the identity that made the request.
+
+    Request ids are unguessable, but a link is not a credential: it is shared,
+    logged and kept in history.  Other routes are not download routes.
+    """
+    request_id = download_request(header)
+    if request_id is None:
+        return True
+    from services.orchestrator.request_owners import may_read
+
+    found = re.findall(rb"(?im)^x-atlas-user:[ \t]*([^\r\n]*)", header)
+    if len(found) != 1:
+        return False
+    return may_read(request_id, found[0].strip().decode("latin1"))
+
+
+# Types a browser shows without running anything; everything else is downloaded.
+INLINE_TYPES = (
+    "application/pdf",
+    "image/png",
+    "image/jpeg",
+    "image/gif",
+    "image/webp",
+    "text/plain",
+)
+MEDIA_TYPE = re.compile(
+    r"[A-Za-z0-9!#$&^_.+-]+/[A-Za-z0-9!#$&^_.+-]+(?:;[ ]?charset=[A-Za-z0-9_-]+)?"
+)
+NOT_FOUND = (
+    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n"
+    b"Cache-Control: private, no-store\r\nConnection: close\r\n\r\n"
+)
+
+
+def files_terminal() -> tuple[str, int]:
+    """The files terminal's loopback publisher, as the orchestrator reaches it."""
+    return "127.0.0.1", atlas_ports().port("terminal")
+
+
+def serve_download(
+    client: socket.socket, header: bytes, files: tuple[str, int]
+) -> None:
+    """Read one allowed download from the files terminal with its own key.
+
+    Stable mode configures no files terminal in Open WebUI, so it has no terminal
+    proxy, no terminal tools in chats and no key; the relay serves the single
+    allowed route itself, after the owner check.
+    """
+    import http.client
+    from urllib.parse import quote
+
+    method = header.split(b" ", 1)[0].decode("latin1").upper()
+    path = normalized_path(header)
+    key = os.environ.get("OPEN_TERMINAL_API_KEY", "")
+    if path is None or DOWNLOAD.fullmatch(path) is None or not key.strip():
+        client.sendall(NOT_FOUND)
+        return
+    relative = path.removeprefix("/api/v1/terminals/atlas-files/files/serve/")
+    connection = http.client.HTTPConnection(*files, timeout=30)
+    try:
+        connection.request(
+            method,
+            "/files/serve/" + quote(relative, safe="/"),
+            headers={"Authorization": "Bearer " + key, "Accept-Encoding": "identity"},
+        )
+        response = connection.getresponse()
+        if response.status != 200:
+            client.sendall(NOT_FOUND)
+            return
+        media = (response.getheader("content-type") or "").strip()
+        if not MEDIA_TYPE.fullmatch(media):
+            media = "application/octet-stream"
+        inline = media.split(";", 1)[0].lower() in INLINE_TYPES
+        filename = posixpath.basename(path)
+        head = [
+            b"HTTP/1.1 200 OK",
+            b"Content-Type: " + media.encode("latin1"),
+            b"X-Content-Type-Options: nosniff",
+            b"Cache-Control: private, no-store",
+            b"Content-Disposition: "
+            + (b"inline" if inline else b"attachment")
+            + b'; filename="'
+            # ASCII fallback without quotes or control characters, plus the exact
+            # UTF-8 name (RFC 6266/5987) so any file name is safe in the header.
+            + re.sub(r"[^A-Za-z0-9._ -]", "_", filename).encode("ascii")
+            + b"\"; filename*=UTF-8''"
+            + quote(filename, safe="").encode("ascii"),
+            b"Connection: close",
+        ]
+        length = response.getheader("content-length")
+        if length is not None and length.isdigit():
+            head.append(b"Content-Length: " + length.encode())
+        client.sendall(b"\r\n".join(head) + b"\r\n\r\n")
+        while chunk := response.read(65536):
+            client.sendall(chunk)
+    except (OSError, http.client.HTTPException):
+        client.sendall(NOT_FOUND)
+    finally:
+        connection.close()
+
+
+def stable_route_allowed(header: bytes) -> bool:
+    """Expose generated downloads, never the terminal's execution or browse API."""
+    method, target, _ = header.split(b" ", 2)
+    if project_mode() and legacy_project_route(
+        target.split(b"?", 1)[0].decode("latin1")
+    ):
+        return False
+    path = normalized_path(header)
+    if path is None or path == "/api/v1/auths/signup":
+        return False
+    if path.startswith("/api/v1/terminals"):
+        return method in (b"GET", b"HEAD") and (
+            path == "/api/v1/terminals" or DOWNLOAD.fullmatch(path) is not None
+        )
+    return True
+
+
+@contextmanager
+def loopback_forward(
+    binding: str, target: tuple[str, int]
+) -> Iterator[tuple[str, int]]:
+    """Publish an internal bridge API without giving it an outbound route."""
+    host, port = binding.rsplit(":", 1)
+    if host != "127.0.0.1":
+        raise ValueError("terminal_requires_loopback")
+    stopping = threading.Event()
+
+    class Handler(socketserver.BaseRequestHandler):
+        def handle(self) -> None:
+            try:
+                with socket.create_connection(target, timeout=5) as remote:
+                    peers = {self.request: remote, remote: self.request}
+                    while peers and not stopping.is_set():
+                        readable, _, _ = select.select(list(peers), [], [], 0.2)
+                        for source in readable:
+                            data = source.recv(65536)
+                            if data:
+                                peers[source].sendall(data)
+                            else:
+                                peers.pop(source).shutdown(socket.SHUT_WR)
+            except OSError:
+                # Closing both sockets exposes a transport failure to the caller.
+                self.request.close()
+
+    class Server(socketserver.ThreadingTCPServer):
+        daemon_threads = True
+        allow_reuse_address = True
+        # nginx opens one upstream connection per request and a page load sends
+        # 200-300 requests at once; the default backlog of 5 overflowed, the kernel
+        # dropped SYNs and browsers waited 1-31 s per retry (2026-11-15).
+        request_queue_size = LISTEN_BACKLOG
+
+    with Server((host, int(port)), Handler) as server:
+        worker = threading.Thread(target=server.serve_forever, daemon=True)
+        worker.start()
+        try:
+            yield str(server.server_address[0]), int(server.server_address[1])
+        finally:
+            stopping.set()
+            server.shutdown()
+            worker.join(timeout=5)
+
+
+@contextmanager
+def loopback_html_injector(
+    binding: str, target: tuple[str, int], files: tuple[str, int] | None = None
+) -> Iterator[tuple[str, int]]:
+    """TCP relay that rewrites only the initial uncompressed HTML response.
+
+    Upgrade connections and every non-HTML response are byte relays, preserving the
+    WebUI API and websocket behaviour while avoiding a fork of its application.
+    """
+    from services.orchestrator.code_ui import relay_header
+    from services.orchestrator.code_workspace import enabled as code_enabled
+
+    host, port = binding.rsplit(":", 1)
+    if host != "127.0.0.1":
+        raise ValueError("ui_injector_requires_loopback")
+    stable = os.environ.get("ATLAS_STABLE") == "1"
+    proxy_secret = os.environ.get("ATLAS_PROXY_SECRET", "")
+    if stable and not proxy_secret.strip():
+        raise RuntimeError("missing_configuration: ATLAS_PROXY_SECRET")
+    stopping = threading.Event()
+
+    class Handler(socketserver.BaseRequestHandler):
+        def handle(self) -> None:
+            client = self.request
+            try:
+                with socket.create_connection(target, timeout=5) as remote:
+                    remote.settimeout(None)
+                    head = b""
+                    while b"\r\n\r\n" not in head:
+                        chunk = client.recv(65536)
+                        if not chunk or len(head) > 1048576:
+                            return
+                        head += chunk
+                    header, marker, body = head.partition(b"\r\n\r\n")
+                    target_path = header.split(b" ", 2)[1].decode("latin1")
+                    if project_mode() and legacy_project_route(target_path):
+                        error = json.dumps(ProjectError(404, "not_found").body).encode()
+                        client.sendall(
+                            b"HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\n"
+                            b"Cache-Control: private, no-store\r\nConnection: close\r\nContent-Length: "
+                            + str(len(error)).encode()
+                            + b"\r\n\r\n"
+                            + error
+                        )
+                        return
+                    if target_path.startswith(
+                        ("/api/atlas/", "/internal/atlas/", "/project-mode")
+                    ) or (
+                        project_mode()
+                        and target_path.split("?", 1)[0] == "/v1/chat/completions"
+                    ):
+                        # The BFF verifies credentials and Origin against the original
+                        # browser Host. No private credential reaches retrieval's public routes.
+                        # The front door sets X-Atlas-User-Role for Open WebUI; project
+                        # routes derive roles from membership and refuse the header
+                        # (measured 2026-11-01: every /api/atlas/me answered 401).
+                        project_header = (
+                            without_header(
+                                without_header(header, b"connection"),
+                                b"x-atlas-user-role",
+                            )
+                            + b"\r\nConnection: close"
+                        )
+                        if dictation_upgrade(target_path, header):
+                            # The dictation WebSocket needs its upgrade; the byte relay
+                            # below carries the frames both ways.
+                            project_header = without_header(
+                                header, b"x-atlas-user-role"
+                            )
+                        if target_path.startswith("/api/atlas/v1/"):
+                            for name in (
+                                b"x-atlas-user",
+                                b"x-atlas-user-role",
+                                b"x-atlas-proxy-secret",
+                                b"x-openwebui-user-id",
+                                b"x-openwebui-user-email",
+                                b"x-atlas-project-identity",
+                                b"x-atlas-identity-secret",
+                            ):
+                                project_header = without_header(project_header, name)
+                        with socket.create_connection(
+                            ("127.0.0.1", atlas_ports().port("adapter")), timeout=5
+                        ) as adapter:
+                            adapter.settimeout(None)
+                            adapter.sendall(project_header + marker + body)
+                            self.relay(
+                                client,
+                                adapter,
+                                header.split(b" ", 1)[0],
+                                False,
+                                target_path,
+                            )
+                        return
+                    if header.split(b" ", 2)[1].startswith(b"/atlas-code/"):
+                        forwarded = relay_header(header)
+                        if forwarded is None:
+                            client.sendall(
+                                b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            )
+                            return
+                        with socket.create_connection(
+                            ("127.0.0.1", atlas_ports().port("adapter")), timeout=5
+                        ) as adapter:
+                            adapter.settimeout(None)
+                            adapter.sendall(forwarded + marker + body)
+                            self.relay(
+                                client,
+                                adapter,
+                                header.split(b" ", 1)[0],
+                                False,
+                                target_path,
+                            )
+                        return
+                    if stable:
+                        supplied_user = re.search(
+                            rb"(?im)^x-atlas-user:[^\r\n]+", header
+                        )
+                        supplied_secret = re.search(
+                            rb"(?im)^x-atlas-proxy-secret:\s*([^\r\n]*)", header
+                        )
+                        # The UI listener is loopback-only.  nginx, reached through
+                        # the restricted SSH tunnel, is the only peer permitted to
+                        # set this identity header.  Do not pass the shared secret
+                        # beyond this relay, and replace any supplied role value.
+                        if (
+                            not stable_route_allowed(header)
+                            or not supplied_user
+                            or not identity_allowed(header)
+                            or supplied_secret is None
+                            or not hmac.compare_digest(
+                                supplied_secret.group(1).strip().decode("latin1"),
+                                proxy_secret,
+                            )
+                        ):
+                            client.sendall(
+                                b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            )
+                            return
+                        if not download_owned(header):
+                            # Same answer as an unknown file: no owner oracle.
+                            client.sendall(NOT_FOUND)
+                            return
+                        if download_request(header) is not None:
+                            serve_download(client, header, files or files_terminal())
+                            return
+                        header = without_header(header, b"x-atlas-proxy-secret")
+                        header = without_header(header, b"x-atlas-user-role")
+                        if not named_user(header) and public_interface_file(header):
+                            header = anonymous_interface_read(header)
+                        else:
+                            header += b"\r\nX-Atlas-User-Role: user"
+                    header = disable_webui_file_processing(header)
+                    method = header.split(b" ", 1)[0].upper()
+                    upgrade = re.search(rb"(?im)^upgrade:", header) is not None
+                    # Ask WebUI for an uncompressed shell so the injection can update
+                    # its length. One request per connection, so every HTML response
+                    # is seen, however the browser reuses connections.
+                    header = re.sub(
+                        rb"(?im)^accept-encoding:[^\r\n]*",
+                        b"Accept-Encoding: identity",
+                        header,
+                    )
+                    if not upgrade:
+                        if re.search(rb"(?im)^connection:", header):
+                            header = re.sub(
+                                rb"(?im)^connection:[^\r\n]*",
+                                b"Connection: close",
+                                header,
+                            )
+                        else:
+                            header += b"\r\nConnection: close"
+                    remote.sendall(header + marker + body)
+                    self.relay(client, remote, method, upgrade, target_path)
+            except OSError:
+                pass
+            finally:
+                try:
+                    client.close()
+                except OSError:
+                    pass
+
+        def relay(
+            self,
+            client: socket.socket,
+            remote: socket.socket,
+            method: bytes,
+            upgrade: bool,
+            target_path: str,
+        ) -> None:
+            """Stream both directions at once; rewrite only a GET 200 HTML response."""
+            response = b""
+            head = b""
+            # -1: reading the response head, -2: plain relay, n >= 0: collecting body
+            expected = -1
+            peers = {client: remote, remote: client}
+            while peers and not stopping.is_set():
+                readable, _, _ = select.select(list(peers), [], [], 0.2)
+                for source in readable:
+                    data = source.recv(65536)
+                    if source is client:
+                        if data:
+                            remote.sendall(data)
+                        else:
+                            peers.pop(client, None)
+                            remote.shutdown(socket.SHUT_WR)
+                        continue
+                    if not data:
+                        if response:
+                            client.sendall(response)
+                        peers.clear()
+                        break
+                    if expected == -2:
+                        client.sendall(data)
+                        continue
+                    response += data
+                    if expected == -1 and b"\r\n\r\n" in response:
+                        head = response.partition(b"\r\n\r\n")[0]
+                        length = re.search(rb"\r\ncontent-length: (\d+)", head, re.I)
+                        status_ok = head.startswith((b"HTTP/1.1 200", b"HTTP/1.0 200"))
+                        html = b"content-type: text/html" in head.lower()
+                        path = target_path.split("?", 1)[0]
+                        disposition = (
+                            re.search(rb"(?im)^content-disposition:", head) is not None
+                        )
+                        if (
+                            method == b"GET"
+                            and not upgrade
+                            and status_ok
+                            and html
+                            and length
+                            and not path.startswith(("/api/", "/internal/"))
+                            and not disposition
+                        ):
+                            expected = int(length.group(1))
+                        else:
+                            client.sendall(response)
+                            response, expected = b"", -2
+                            continue
+                    if expected >= 0:
+                        body = response.partition(b"\r\n\r\n")[2]
+                        if len(body) >= expected:
+                            updated = inject_atlas_ui(
+                                body[:expected], stable=stable, code_mode=code_enabled()
+                            )
+                            new_head = re.sub(
+                                rb"(\r\ncontent-length: )\d+",
+                                lambda m: m.group(1) + str(len(updated)).encode(),
+                                head,
+                                flags=re.I,
+                            )
+                            client.sendall(
+                                new_head + b"\r\n\r\n" + updated + body[expected:]
+                            )
+                            response, expected = b"", -2
+
+    class Server(socketserver.ThreadingTCPServer):
+        daemon_threads = True
+        allow_reuse_address = True
+        # nginx opens one upstream connection per request and a page load sends
+        # 200-300 requests at once; the default backlog of 5 overflowed, the kernel
+        # dropped SYNs and browsers waited 1-31 s per retry (2026-11-15).
+        request_queue_size = LISTEN_BACKLOG
+
+    with Server((host, int(port)), Handler) as server:
+        worker = threading.Thread(target=server.serve_forever, daemon=True)
+        worker.start()
+        try:
+            yield str(server.server_address[0]), int(server.server_address[1])
+        finally:
+            stopping.set()
+            server.shutdown()
+            worker.join(timeout=5)
+
+
+def command(*args: str) -> str:
+    result = subprocess.run(args, capture_output=True, text=True)
+    if result.returncode:
+        raise RuntimeError("terminal_setup_failed:" + args[0])
+    return result.stdout.strip()
+
+
+def network_gateway() -> str:
+    network = atlas_ports().name(NETWORK)
+    value = json.loads(command("docker", "network", "inspect", network))[0]
+    if (
+        not value.get("Internal")
+        or value.get("Labels", {}).get("atlas.owner") != "files"
+    ):
+        raise RuntimeError("terminal_network_owner_mismatch")
+    return str(value["IPAM"]["Config"][0]["Gateway"])
+
+
+def firewall(pid: str, family: str, *args: str) -> str:
+    prefix = [] if os.geteuid() == 0 else ["sudo", "-n"]
+    return command(*prefix, "nsenter", "-t", pid, "-n", family, *args)
+
+
+def contain(name: str) -> None:
+    pid = command("docker", "inspect", "--format", "{{.State.Pid}}", name)
+    for family in ("iptables", "ip6tables"):
+        # The API is held behind a startup latch until BOTH families are closed.
+        # No new outbound connection is allowed, including Docker's DNS proxy.
+        firewall(pid, family, "-P", "OUTPUT", "DROP")
+        firewall(pid, family, "-F", "OUTPUT")
+        firewall(
+            pid,
+            family,
+            "-A",
+            "OUTPUT",
+            "-m",
+            "conntrack",
+            "--ctstate",
+            "ESTABLISHED,RELATED",
+            "-j",
+            "ACCEPT",
+        )
+        firewall(pid, family, "-A", "OUTPUT", "-j", "REJECT")
+        rules = firewall(pid, family, "-S", "OUTPUT")
+        if "-P OUTPUT DROP" not in rules or "-A OUTPUT -j REJECT" not in rules:
+            raise RuntimeError("terminal_containment_unverified")
+    command("docker", "exec", name, "touch", "/tmp/atlas-network-ready")
+
+
+def adapter_socket(port: int) -> socket.socket:
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind((network_gateway(), port))
+    listener.listen(128)
+    listener.setblocking(False)
+    return listener
+
+
+@contextmanager
+def terminal(name: str, binding: str) -> Iterator[None]:
+    from services.orchestrator.serving import service_oom_options, wait_http
+
+    ports = atlas_ports()
+    oom = service_oom_options()
+    network = ports.name(NETWORK)
+    name = ports.name(name)
+    if not os.environ.get("OPEN_TERMINAL_API_KEY", "").strip():
+        raise RuntimeError("missing_configuration: OPEN_TERMINAL_API_KEY")
+    exists = command(
+        "docker",
+        "network",
+        "ls",
+        "--filter",
+        "name=^" + network + "$",
+        "--format",
+        "{{.Name}}",
+    )
+    if not exists:
+        command(
+            "docker",
+            "network",
+            "create",
+            "--internal",
+            "--label",
+            "atlas.owner=files",
+            network,
+        )
+    network_gateway()
+    existing = command(
+        "docker",
+        "ps",
+        "-a",
+        "--filter",
+        "name=^/" + name + "$",
+        "--format",
+        "{{.Names}}",
+    )
+    if existing:
+        details = json.loads(command("docker", "inspect", name))[0]
+        if details["Config"].get("Labels", {}).get("atlas.owner") != "files":
+            raise RuntimeError("terminal_container_owner_mismatch")
+        command("docker", "rm", "-f", name)
+    started = False
+    try:
+        command(
+            "docker",
+            "run",
+            "-d",
+            "--name",
+            name,
+            "--label",
+            "atlas.owner=files",
+            "--network",
+            network,
+            "--network-alias",
+            "open-terminal",
+            "--cap-drop",
+            "ALL",
+            "--security-opt",
+            "no-new-privileges:true",
+            "--read-only",
+            "--memory",
+            "2g",
+            "--cpus",
+            "2",
+            "--pids-limit",
+            "128",
+            *oom,
+            "--tmpfs",
+            "/tmp:rw,nosuid,nodev,size=128m,uid=1000,gid=1000",
+            "-v",
+            ports.name("atlas-terminal-files") + ":/home/user",
+            "-e",
+            "OPEN_TERMINAL_API_KEY",
+            "-e",
+            "OPEN_TERMINAL_EXECUTE_TIMEOUT=30",
+            "--entrypoint",
+            "/bin/sh",
+            IMAGE,
+            "-c",
+            "while ! test -f /tmp/atlas-network-ready; do sleep 0.1; done; "
+            "exec python3 -m open_terminal run --host 0.0.0.0 --port "
+            + str(ports.port("terminal")),
+        )
+        started = True
+        contain(name)
+        details = json.loads(command("docker", "inspect", name))[0]
+        address = details["NetworkSettings"]["Networks"][network]["IPAddress"]
+        with loopback_forward(binding, (address, ports.port("terminal"))):
+            try:
+                wait_http("http://" + binding + "/docs", 30)
+            except RuntimeError:
+                logs = subprocess.run(
+                    ["docker", "logs", name], capture_output=True, text=True
+                )
+                detail = (logs.stdout + logs.stderr).replace(
+                    os.environ["OPEN_TERMINAL_API_KEY"], "[REDACTED]"
+                )
+                raise RuntimeError("terminal_start_failed: " + detail[-2000:]) from None
+            yield
+    finally:
+        if started and command(
+            "docker",
+            "ps",
+            "-a",
+            "--filter",
+            "name=^/" + name + "$",
+            "--format",
+            "{{.Names}}",
+        ):
+            command("docker", "stop", name)
+            command("docker", "rm", name)
+
+
+@contextmanager
+def user_interface(name: str, persistent: bool) -> Iterator[None]:
+    """Expose the native UI and adapter on the contained user-file network."""
+    from services.orchestrator.serving import (
+        docker,
+        stt_enabled,
+        wait_http,
+        webui,
+        stable_mode,
+    )
+    from services.orchestrator.webui import configure
+
+    ports = atlas_ports()
+    network = ports.name(NETWORK)
+    container = ports.name(name)
+    listener = adapter_socket(ports.port("adapter"))
+    adapter = uvicorn.Server(
+        uvicorn.Config(
+            "services.orchestrator.chat_api:app", log_level="error", access_log=False
+        )
+    )
+    worker = threading.Thread(
+        target=lambda: adapter.run(sockets=[listener]), daemon=True
+    )
+    worker.start()
+    tts_listener = None
+    tts = None
+    tts_worker = None
+    if os.environ.get("ATLAS_TTS") == "1":
+        tts_listener = adapter_socket(ports.port("tts"))
+        tts = uvicorn.Server(
+            uvicorn.Config(
+                "services.tts.service:app", log_level="error", access_log=False
+            )
+        )
+        tts_worker = threading.Thread(
+            target=lambda: tts.run(sockets=[tts_listener]), daemon=True
+        )
+        tts_worker.start()
+    stt_listener = None
+    stt = None
+    stt_worker = None
+    if stt_enabled():
+        stt_listener = adapter_socket(ports.port("stt"))
+        stt = uvicorn.Server(
+            uvicorn.Config(
+                "services.stt.service:app", log_level="error", access_log=False
+            )
+        )
+        stt_worker = threading.Thread(
+            target=lambda: stt.run(sockets=[stt_listener]), daemon=True
+        )
+        stt_worker.start()
+    previous_host_url = os.environ.get("ATLAS_WEBUI_URL")
+    started = False
+    try:
+        webui(name, persistent)
+        started = True
+        details = json.loads(docker("inspect", container))[0]
+        address = details["NetworkSettings"]["Networks"][network]["IPAddress"]
+        os.environ.setdefault(
+            "ATLAS_WEBUI_URL", f"http://{address}:{ports.port('chat_ui')}"
+        )
+        binding = "127.0.0.1:" + str(ports.port("chat_ui"))
+        if stable_mode():
+            endpoint = f"http://{address}:{ports.port('chat_ui')}"
+            wait_http(endpoint)
+            # Provision only over the private container network, before opening
+            # the relay. Guest requests always receive the ordinary user role.
+            configure(
+                endpoint,
+                {
+                    "X-Atlas-User": "atlas-bootstrap@localhost",
+                    "X-Atlas-User-Role": "admin",
+                },
+            )
+        with loopback_html_injector(binding, (address, ports.port("chat_ui"))):
+            if not stable_mode():
+                wait_http(ports.url("chat_ui"))
+            yield
+    finally:
+        if previous_host_url is None:
+            os.environ.pop("ATLAS_WEBUI_URL", None)
+        if started:
+            docker("stop", container)
+        adapter.should_exit = True
+        worker.join(timeout=10)
+        listener.close()
+        if tts is not None and tts_worker is not None and tts_listener is not None:
+            tts.should_exit = True
+            tts_worker.join(timeout=10)
+            tts_listener.close()
+        if stt is not None and stt_worker is not None and stt_listener is not None:
+            stt.should_exit = True
+            stt_worker.join(timeout=10)
+            stt_listener.close()

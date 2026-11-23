@@ -1,0 +1,1022 @@
+"""Code tool declarations, validated arguments, and single-use approval gate."""
+
+import asyncio
+import json
+from dataclasses import replace
+import logging
+import os
+import re
+import time
+import threading
+from typing import TYPE_CHECKING, Any, Literal
+
+if TYPE_CHECKING:
+    from services.orchestrator.work_execution import ExecutionGuard
+    from services.orchestrator.work_tool_selection import WorkToolSelection
+from uuid import uuid4
+
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
+
+from services.orchestrator.code_verification import Verification
+from services.orchestrator.code_workspace import Audit, Workspace, redact
+from services.orchestrator.loop import Call, Message, Reservation
+from services.orchestrator.stream_client import Sink
+from services.orchestrator.terminal_stack import TOOLCHAINS
+from decimal import Decimal
+
+
+# The machine is reachable when these errors come back: the command shape was refused before it
+# ran. The hint must make the model rewrite it, never tell the user it has no access.
+REMOTE_FIX_HINTS = {
+    "unsupported_shell_syntax": (
+        "The command was refused before running, the machine is still available. Allowed: simple "
+        "commands joined by |, &&, || or ;, and redirections to /dev/null or 2>&1. Not allowed: $, "
+        "backquotes, subshells, other redirections, variable assignments. Rewrite the command "
+        "within these rules and run it again."
+    ),
+    "unsupported_shell_indirection": (
+        "The command was refused before running, the machine is still available. Do not wrap "
+        "commands in sh, bash, env, eval or exec: run the program directly, then try again."
+    ),
+    "invalid_command": (
+        "The command could not be parsed (unbalanced quotes or an empty part). Fix it and run it again."
+    ),
+}
+# A remote call naming no known machine or target: the model guessed names
+# (the person's "Mac", "hardy") one after the other on staging (2026-11-13).
+UNKNOWN_TARGET_HINT = (
+    "No machine or target has this name. Call list_targets once and use an exact name from it. "
+    "If the user's machine is not there, ask in one short question for its address and account; "
+    "never try other guessed names."
+)
+# With a relay, a name the user gave is first tried from their connected
+# computer, where their own ssh settings resolve it (staging 2026-11-14).
+RELAY_TARGET_HINT = (
+    "No machine or target has this name. A machine of the user's local network is "
+    "reached through their connected computer: remote_run with that computer as "
+    "target (machine_list names it) and the command ssh <name> <command>; ask for "
+    "an address only if that ssh fails. If no computer is connected, ask in one "
+    "short question whether to connect their computer or for the machine's "
+    "address and account. Never try other guessed names."
+)
+
+
+def unknown_target_hint() -> str:
+    from services.orchestrator.work_machine_tools import relay_enabled
+
+    return RELAY_TARGET_HINT if relay_enabled() else UNKNOWN_TARGET_HINT
+
+
+def remote_target(arguments: str) -> str:
+    """The target named by a remote call, or an empty string."""
+    try:
+        value = json.loads(arguments or "{}")
+    except ValueError:
+        return ""
+    return str(value.get("target") or "") if isinstance(value, dict) else ""
+
+
+class Arguments(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+
+class Directory(Arguments):
+    path: str = Field(default=".", max_length=1000)
+
+
+class Read(Arguments):
+    path: str = Field(max_length=1000)
+    start_line: int = Field(default=1, ge=1)
+    end_line: int = Field(default=200, ge=1)
+
+
+class Search(Directory):
+    pattern: str = Field(min_length=1, max_length=200)
+
+
+class Edit(Arguments):
+    path: str = Field(max_length=1000)
+    old_text: str = Field(max_length=262144)
+    new_text: str = Field(max_length=262144)
+
+
+class Write(Arguments):
+    path: str = Field(max_length=1000)
+    content: str = Field(max_length=262144)
+
+
+class Command(Arguments):
+    command: str = Field(min_length=1, max_length=15000)
+    timeout_seconds: float = Field(default=30, gt=0, le=120)
+    # Compiling a standard library from source (go test on a cold cache) needs about
+    # 320 MiB of data; the container memory limit stays the hard ceiling.
+    memory_mb: int = Field(default=512, ge=32, le=512)
+
+
+class PlanItem(Arguments):
+    text: str = Field(min_length=1, max_length=500)
+    status: Literal["pending", "in_progress", "completed"]
+
+
+class Plan(Arguments):
+    items: list[PlanItem] = Field(max_length=40)
+
+
+class Approval(Arguments):
+    action: str = Field(min_length=1, max_length=2000)
+
+
+SCHEMAS: dict[str, type[Arguments]] = {
+    "list_dir": Directory,
+    "read_file": Read,
+    "search": Search,
+    "edit_file": Edit,
+    "write_file": Write,
+    "run_command": Command,
+    "update_plan": Plan,
+    "request_approval": Approval,
+}
+DESCRIPTIONS = {
+    "list_dir": "List the already-extracted workspace directory, bounded to 500 entries. File paths may be relative or under /workspace; no unpacking is needed.",
+    "read_file": "Read an already-extracted workspace UTF-8 file with 1-based inclusive line ranges; 256 KiB cap. Paths are relative or under /workspace.",
+    "search": "Search literal text recursively, returning bounded file:line matches.",
+    "edit_file": "Replace old_text exactly once; fails if absent or ambiguous; an empty old_text creates a missing or empty file; returns unified diff.",
+    "write_file": "Write a UTF-8 workspace file, at most 256 KiB; returns unified diff.",
+    "run_command": "Run a shell command in the workspace. Network access is disabled unless the owner enables filtered registry egress. Return exit code and bounded output. Run tests to verify your changes. Installed toolchains: "
+    + TOOLCHAINS
+    + "; standard-library programs and their tests build and run offline (for example go test ./..., node --test, npm test, python3 -m unittest). The first Go build of a session compiles the standard library: give it timeout_seconds 120.",
+    "update_plan": "Replace the pinned task list with pending, in_progress, or completed items.",
+    "request_approval": "Pause until the owner allows or denies the named action, or the approval expires. Approval does not grant network access.",
+}
+
+
+def declarations(*, scoped: bool = False) -> list[dict[str, object]]:
+    from services.orchestrator import project_document_tools
+
+    result: list[dict[str, object]] = [
+        {
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": (
+                    DESCRIPTIONS[name]
+                    + " For delete_file supply file_id, base_version, revision."
+                    " For overwrite also supply folder_id, path, sha256, size_bytes."
+                    " For delete_memory supply only memory_ids, memory_revision."
+                    " Always supply effect_kind and maximum_bytes; omit all irrelevant fields."
+                    if scoped and name == "request_approval"
+                    else DESCRIPTIONS[name]
+                ),
+                "parameters": (
+                    ModelApproval if scoped and name == "request_approval" else schema
+                ).model_json_schema(),
+            },
+        }
+        for name, schema in SCHEMAS.items()
+    ]
+    if scoped:
+        from services.orchestrator.work_forge_tools import declaration
+
+        result.append(declaration())
+        from services.orchestrator.work_remote_tools import (
+            declarations as remote_declarations,
+        )
+
+        result.extend(remote_declarations())
+        from services.orchestrator.work_machine_tools import (
+            declarations as machine_declarations,
+        )
+
+        result.extend(machine_declarations())
+        from services.orchestrator import work_pictures
+
+        if work_pictures.enabled():
+            result.append(work_pictures.declaration())
+    return result + (project_document_tools.declarations() if scoped else [])
+
+
+def test_command(command: str) -> bool:
+    """Recognize common test runners at command positions, not echoed claims."""
+    return (
+        re.search(
+            r"(?:^|[;&|]\s*)(?:python(?:3)?(?:\.\d+)?\s+(?:-m\s+(?:pytest|unittest)\b|[^\s]*test[^\s]*\.py\b)"
+            r"|(?:pytest|py.test|ctest|jest|vitest)\b|(?:npm|pnpm|yarn|cargo|go|make)\s+test\b)",
+            command.strip(),
+            re.I,
+        )
+        is not None
+    )
+
+
+class ApprovalGate:
+    def __init__(self) -> None:
+        self.pending: dict[str, asyncio.Future[bool]] = {}
+        self.lock = threading.Lock()
+
+    def answer(self, key: str, allow: bool) -> bool:
+        with self.lock:
+            future = self.pending.pop(key, None)
+        if future is None or future.done():
+            return False
+
+        def deliver() -> None:
+            if not future.done():
+                future.set_result(allow)
+
+        try:
+            future.get_loop().call_soon_threadsafe(deliver)
+        except RuntimeError:
+            return False
+        return True
+
+    async def wait(self, action: str, timeout: float, tools: "CodeTools") -> str:
+        key = uuid4().hex
+        future: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+        with self.lock:
+            self.pending[key] = future
+        try:
+            await tools.emit(
+                "approval",
+                tool="request_approval",
+                label=action,
+                status="running",
+                output={
+                    "approval_id": key,
+                    "action": action,
+                    "timeout_seconds": timeout,
+                },
+            )
+            try:
+                allowed = await asyncio.wait_for(future, timeout)
+                decision = "allowed" if allowed else "denied"
+            except TimeoutError:
+                decision = "timeout"
+            await tools.emit(
+                "approval",
+                tool="request_approval",
+                label=action,
+                status="completed",
+                output={"approval_id": key, "decision": decision},
+            )
+            return decision
+        finally:
+            with self.lock:
+                self.pending.pop(key, None)
+            if not future.done():
+                future.cancel()
+
+
+gate = ApprovalGate()
+
+
+class CodeTools:
+    def __init__(
+        self, workspace: Workspace, audit: Audit, sink: Sink | None = None
+    ) -> None:
+        self.workspace, self.audit, self.sink = workspace, audit, sink
+        self.test_evidence: list[dict[str, Any]] = []
+
+    async def emit(self, kind: str, **data: Any) -> None:
+        event = self.audit.record(kind, **data)
+        if self.sink:
+            await self.sink({"code": event})
+
+    def estimate(self, call: Call) -> Reservation:
+        return Reservation(0, Decimal(0))
+
+    async def execute(self, call: Call, timeout: float) -> Message:
+        started = time.monotonic()
+        args: dict[str, Any] = {}
+        await self.emit(
+            "tool",
+            tool=call.name,
+            label=call.name,
+            status="running",
+            arguments=call.arguments,
+            output={},
+        )
+        try:
+            schema = SCHEMAS.get(call.name)
+            if schema is None:
+                raise ValueError("unknown_code_tool")
+            args = schema.model_validate(json.loads(call.arguments)).model_dump()
+            if call.name == "update_plan":
+                from services.orchestrator import work_plan
+
+                review: dict[str, Any] = {}
+                shown = work_plan.current.get()
+                if isinstance(self, WorkTools) and shown is not None:
+                    # A chat turn: the plan the person sees is checked by the
+                    # code, and a step is never done without a tool call.
+                    review = shown.update(args["items"])
+                    if len(args["items"]) == len(shown.steps):
+                        args["items"] = [
+                            dict(item, status=status)
+                            for item, status in zip(args["items"], shown.statuses())
+                        ]
+                state = self.workspace.metadata()
+                state["plan"] = args["items"]
+                self.workspace.save(state)
+                result = dict(args, **review)
+                await self.emit(
+                    "plan",
+                    tool=call.name,
+                    label="Plan updated",
+                    status="completed",
+                    output=result,
+                )
+            elif call.name == "request_approval":
+                seconds = min(
+                    timeout, float(os.environ.get("ATLAS_CODE_APPROVAL_SECONDS", "120"))
+                )
+                result = {"decision": await gate.wait(args["action"], seconds, self)}
+            else:
+                if call.name == "run_command":
+                    args["timeout_seconds"] = min(
+                        args["timeout_seconds"], max(0.01, timeout - 2)
+                    )
+                result = await self.workspace.invoke(call.name, args, timeout)
+            result = redact(result)
+            if (
+                call.name == "run_command"
+                and result.get("exit_code") == 0
+                and not result.get("timed_out")
+            ):
+                if test_command(args["command"]):
+                    self.test_evidence.append(
+                        {"command": redact(args["command"]), **result}
+                    )
+            if "diff" in result:
+                await self.emit(
+                    "diff",
+                    tool=call.name,
+                    label=args["path"],
+                    status="completed",
+                    output={"diff": result["diff"]},
+                )
+        except TimeoutError:
+            result = {
+                "error": "code_tool_timeout",
+                "elapsed_seconds": time.monotonic() - started,
+                "limit_seconds": timeout,
+            }
+        except (ValueError, OSError, RuntimeError) as exc:
+            result = {"error": redact(str(exc))}
+        if isinstance(self, WorkTools) and args:
+            self.verification.observe(call.name, redact(args), result)
+        await self.emit(
+            "tool",
+            tool=call.name,
+            label=call.name,
+            status="failed"
+            if result.get("error")
+            or result.get("timed_out")
+            or result.get("exit_code", 0) != 0
+            else "completed",
+            output=result,
+        )
+        return dict(result)
+
+
+class OverwriteEffect(Arguments):
+    file_id: str
+    folder_id: str
+    path: str
+    base_version: str
+    revision: int = Field(ge=0)
+    sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    size_bytes: int = Field(ge=0)
+
+
+class DeleteEffect(Arguments):
+    file_id: str
+    base_version: str
+    revision: int = Field(ge=0)
+
+
+class MemoryEffect(Arguments):
+    memory_ids: list[str] = Field(max_length=100)
+    memory_revision: int = Field(ge=0)
+
+
+class ScopedApproval(Arguments):
+    action_kind: Literal["overwrite", "delete"]
+    effects: OverwriteEffect | DeleteEffect | MemoryEffect
+    maximum_bytes: int = Field(ge=0)
+
+
+class ModelApproval(Arguments):
+    effect_kind: Literal["overwrite", "delete_file", "delete_memory"]
+    maximum_bytes: int = Field(ge=0)
+    file_id: str | None = None
+    folder_id: str | None = None
+    path: str | None = None
+    base_version: str | None = None
+    revision: int | None = Field(default=None, ge=0)
+    sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+    size_bytes: int | None = Field(default=None, ge=0)
+    memory_ids: list[str] | None = Field(default=None, max_length=100)
+    memory_revision: int | None = Field(default=None, ge=0)
+
+    def canonical(self) -> dict[str, Any]:
+        variants: dict[
+            str, type[OverwriteEffect] | type[DeleteEffect] | type[MemoryEffect]
+        ] = {
+            "overwrite": OverwriteEffect,
+            "delete_file": DeleteEffect,
+            "delete_memory": MemoryEffect,
+        }
+        schema = variants[self.effect_kind]
+        fields = self.model_fields_set - {"effect_kind", "maximum_bytes"}
+        if fields != schema.model_fields.keys():
+            raise ValueError("Provide exactly the fields required by effect_kind")
+        effects = schema.model_validate(self.model_dump(include=fields))
+        return ScopedApproval(
+            action_kind="overwrite" if self.effect_kind == "overwrite" else "delete",
+            effects=effects,
+            maximum_bytes=self.maximum_bytes,
+        ).model_dump()
+
+
+def approval_arguments(arguments: str) -> dict[str, Any]:
+    # Preserve the strict internal interface while exposing only the flat form
+    # to the model. Both routes still cross the same strict broker boundary.
+    value = json.loads(arguments)
+    if isinstance(value, dict) and "effect_kind" in value:
+        return ModelApproval.model_validate_json(arguments).canonical()
+    return ScopedApproval.model_validate_json(arguments).model_dump()
+
+
+FILE_TOOLS = ("edit_file", "write_file")
+
+
+def with_search_language(call: Any, language: str) -> Any:
+    """A web search without its language takes the conversation's.
+
+    The search arguments require one; a model that left it out ended the whole
+    Work turn on a validation error (staging 2026-11-10).
+    """
+    if call.name != "web_search":
+        return call
+    try:
+        arguments = json.loads(call.arguments)
+    except ValueError:
+        return call
+    if not isinstance(arguments, dict) or arguments.get("lang"):
+        return call
+    return replace(call, arguments=json.dumps(dict(arguments, lang=language)))
+
+
+async def wait_for_approval(
+    execution: Any, tools: Any, approval: dict[str, Any], timeout: float
+) -> str:
+    """Wait for the broker's decision on a pending approval (bounded).
+
+    Shared by the scoped request_approval tool and the end-of-turn overwrite
+    approvals: emits the running/completed "approval" events and polls the
+    work session until the decision lands or the deadline expires.
+    """
+    await tools.emit(
+        "approval",
+        tool="request_approval",
+        label="Approval required",
+        status="running",
+        output=dict(approval=approval),
+    )
+    # Canonical mutations consume the authoritative decision. A tool
+    # response is never a capability or permission to bypass the broker.
+    deadline = time.monotonic() + min(timeout, 120)
+    decision = "expired"
+    while time.monotonic() < deadline:
+        await execution.check()
+        status, session = await execution.broker.public(
+            "GET", "work-sessions/" + execution.session["id"]
+        )
+        if status != 200:
+            from services.retrieval.project_identity import ProjectError
+
+            raise ProjectError(status, str(session.get("error", "not_found")))
+        current = next(
+            (a for a in session["pending_approvals"] if a["id"] == approval["id"]),
+            None,
+        )
+        if current is None:
+            decision = "denied"
+            break
+        if current["decision"] != "pending":
+            decision = current["decision"]
+            break
+        await asyncio.sleep(min(0.25, max(0, deadline - time.monotonic())))
+    await tools.emit(
+        "approval",
+        tool="request_approval",
+        label="Approval " + decision,
+        status="completed",
+        output=dict(approval=approval),
+    )
+    return decision
+
+
+class WorkTools(CodeTools):
+    """Adapt existing tool events once, before retrieval allocates durable sequences."""
+
+    def __init__(
+        self, workspace: Workspace, execution: Any, sink: Sink | None = None
+    ) -> None:
+        # Scoped Work never writes the legacy unscoped audit files.
+        self.workspace, self.execution, self.sink = workspace, execution, sink
+        self.test_evidence = []
+        self.verification = Verification()
+        self.deliverables: list[dict[str, Any]] = []
+        self.selection: WorkToolSelection | None = None
+        self.connectors: Any = None
+        self.validation_failures: dict[str, str] = {}
+        self.memory: Any = None
+        self.skills: Any = None
+        self.schedules: Any = None
+        self.nearby: Any = None
+        self.web: Any = None
+        self.web_lang = "en"
+        self.approvals_unattended = False
+        # The hidden chat project (chat_file_names.py): a taken name becomes a
+        # numbered copy. earlier_answers are this chat's answers, whose links
+        # say which files this conversation saved.
+        self.numbered_copies = False
+        self.earlier_answers: list[str] = []
+        # The turn changes something delivered earlier in the conversation: a
+        # file of the same format it delivered gets its next version.
+        self.revises_delivered = False
+        # Delivered files whose new version the person did not approve in
+        # project mode: nothing was overwritten, and the answer says so.
+        self.not_published: list[str] = []
+        # The file such a change starts from, read from its stored version
+        # (current_file.py), and compared with the new version before it is
+        # claimed.
+        self.current_file: Any = None
+        # The one office format the request names, as a suffix (".docx"), or None.
+        self.requested_suffix: str | None = None
+        # The request of the turn, read for what a workbook must calculate,
+        # and the reasons a publication was already refused for in this turn
+        # (each one is refused once; see calculation_check).
+        self.request_text = ""
+        self.calculation_refusals: set[str] = set()
+        # The check of a built file against the request (deliverable_check.py):
+        # the turn's model (its profile and spending), the conversation's
+        # earlier requests, the checks made and whether a file was refused.
+        self.check_model: Any = None
+        self.earlier_requests: list[str] = []
+        self.deliverable_checks = 0
+        self.deliverable_refused = False
+        # The files this turn published, by the name asked and the name saved
+        # (project_document_tools.revision_target): published again in the
+        # turn, a file is its next version. The title each attempt gave a
+        # file (kept_title): a rewrite without one keeps it.
+        self.turn_files: dict[str, str] = {}
+        # The files this turn created (not new versions of earlier ones).
+        self.turn_created: set[str] = set()
+        self.built_titles: dict[str, str] = {}
+        # Pictures drawn for a document (work_pictures.py): the conversation
+        # they belong to, and the items this turn had no time to draw.
+        self.picture_scope = ""
+        self.pictures_pending: list[str] = []
+        # The pictures the file needs, planned by code before the agent writes,
+        # and those drawn for it (reference -> item): the publication checks
+        # that they are placed.
+        self.picture_plan: Any = None
+        self.picture_plan_failed = False
+        self.pictures_prepared = False
+        self.pictures_earlier: dict[str, str] = {}
+        self.pictures_drawn: dict[str, str] = {}
+        self.remote_references: Any = None
+        # Conversation language, for the sentences of the machine tools.
+        self.lang = "en"
+        # Machines declared in this turn, and the install commands the person
+        # must still see (name -> command), for the final answer.
+        self.machines_declared: set[str] = set()
+        self.machine_commands: dict[str, str] = {}
+        # Machines found out of reach in this turn (name or host -> outcome):
+        # later calls for them answer at once instead of connecting again.
+        self.machines_unreachable: dict[str, dict[str, Any]] = {}
+        # A connected computer behind the chat: the questions this turn asked,
+        # and the person's yes to the previous one (work_remote_tools.py).
+        self.machine_approvals: dict[str, str] = {}
+        self.machine_approval: dict[str, Any] | None = None
+        # Commands the person approved that did not run (machine, command, error).
+        self.machine_approval_failures: dict[str, dict[str, str]] = {}
+        # Targets listed in this turn, and its connected computers (id or
+        # name -> folder) (work_remote_tools.py).
+        self.remote_targets: list[dict[str, Any]] | None = None
+        self.remote_in_place: dict[str, str] | None = None
+        # Turn-specific system text (the machine rules on a remote turn).
+        self.instructions = ""
+        # Set by the Work turn when the request asks for code to be run.
+        self.run_guard: ExecutionGuard | None = None
+        # Pages retrieved by this turn's web tools (D7 for a streamed document).
+        self.retrieved_urls: set[str] = set()
+
+    async def emit(self, kind: str, **data: Any) -> None:
+        output = redact(data.get("output", {}))
+        if kind == "tool" and data.get("tool") == "run_command" and "arguments" in data:
+            output = dict(output, arguments=redact(data["arguments"]))
+        if kind == "tool" and data.get("status") in {"completed", "failed"}:
+            tool = str(data.get("tool", ""))
+            if data["status"] == "failed" and output.get("error"):
+                self.validation_failures[tool] = str(output["error"])
+            else:
+                # A command that ran and exited non-zero or timed out is a result
+                # the model reports, not an unresolved tool error: verification
+                # tracks test outcomes. A later file write resolves a failed edit.
+                for name in FILE_TOOLS if tool in FILE_TOOLS else (tool,):
+                    self.validation_failures.pop(name, None)
+        mapped: dict[str, Any] = {}
+        for name in (
+            "items",
+            "approval",
+            "file_version_ids",
+            "steps",
+            "cost_eur",
+            "verification",
+        ):
+            if name in output:
+                mapped[name] = output[name]
+        for name in ("diff", "text", "detail"):
+            if isinstance(output.get(name), str) and output[name].strip():
+                mapped[name] = output[name][:16000]
+        if kind == "workspace":
+            mapped["workspace"] = self.execution.session["environment"]
+        if kind == "tool":
+            mapped["tool_result"] = json.dumps(output, ensure_ascii=False)[:16000]
+        if kind == "limit" and {"measured", "limit", "unit"} <= output.keys():
+            mapped["measurement"] = {
+                k: output[k] for k in ("measured", "limit", "unit")
+            }
+            if mapped["measurement"]["unit"] == "steps":
+                mapped["measurement"]["unit"] = "calls"
+        event = dict(
+            org_id=self.execution.broker.org,
+            project_id=self.execution.broker.project,
+            version=1,
+            seq=1,
+            session_id=self.execution.session["id"],
+            request_id=self.execution.request_id,
+            turn_id=None,
+            type=kind,
+            status=data.get("status", "completed"),
+            label=str(redact(data.get("label", kind)))[:500],
+            tool=data.get("tool"),
+            plan=[],
+            approval_id=output.get("approval", {}).get("id"),
+            job_id=None,
+            text=None,
+            error=None,
+            output=mapped,
+        )
+        result = await self.execution.broker.call(
+            "events", dict(self.execution.fence(), progress=[event], audit=[])
+        )
+        for persisted in result["events"]:
+            if self.sink:
+                await self.sink({"project": persisted})
+
+    async def execute(self, call: Call, timeout: float) -> Message:
+        await self.execution.check()
+        from services.orchestrator.api_key_edge import key_call
+
+        if key_call.get() and (
+            call.name == "mcp_call"
+            or call.name.startswith("mcp_")
+            or call.name == "switch_connector_group"
+        ):
+            return {"error": "insufficient_scope", "missing_scope": "connectors"}
+        from services.orchestrator import project_document_tools
+
+        if self.selection is not None and call.name not in self.selection.names:
+            return {
+                "error": "tool_not_selected",
+                "group": self.selection.group,
+                "next_step": "Use switch_tool_group to select the required tools",
+            }
+        if self.sink:
+            # The chat behind Work shows this step now (work_progress.py); some
+            # tools report only when done. Not persisted, no content.
+            await self.sink({"work_step": {"tool": call.name}})
+        if call.name in {"web_search", "web_fetch"}:
+            if self.web is None:
+                result: dict[str, object] = {
+                    "error": "tool_unavailable",
+                    "reason": "strict_privacy",
+                }
+            else:
+                result = dict(
+                    await self.web.execute(
+                        with_search_language(call, self.web_lang), timeout
+                    )
+                )
+                from services.orchestrator.document_stream import retrieved_urls
+
+                self.retrieved_urls |= retrieved_urls(result)
+            await self.emit(
+                "tool",
+                tool=call.name,
+                label=call.name,
+                status="failed" if result.get("error") else "completed",
+                output=result,
+            )
+            return result
+        if call.name == "publish_scheduled_file":
+            from services.retrieval.project_identity import ProjectError
+
+            arguments = json.loads(call.arguments)
+            try:
+                result = dict(
+                    await self.execution.broker.call(
+                        "scheduled-publish", dict(self.execution.fence(), **arguments)
+                    )
+                )
+            except ProjectError as exc:
+                # A refusal is the model's to report, not a crash of the whole
+                # run: a raised 409 ended a run as failed after its file was
+                # saved (staging 2026-11-16).
+                result = dict(exc.body)
+            await self.emit(
+                "tool",
+                tool=call.name,
+                label=call.name,
+                status="failed" if result.get("error") else "completed",
+                output=result,
+            )
+            return result
+        if self.connectors is not None and call.name in self.connectors.targets:
+            return dict(await self.connectors.execute(call, timeout))
+        if self.skills is not None:
+            if not await self.skills.authorized():
+                return {"error": "skill_authority_revoked"}
+            if call.name == "load_skill":
+                skill_result = await self.skills.execute(call, timeout)
+                await self.emit(
+                    "tool",
+                    tool=call.name,
+                    label=call.name,
+                    status="failed" if skill_result.get("error") else "completed",
+                    output=skill_result,
+                )
+                return dict(skill_result)
+            if self.skills.blocks(call.name):
+                return {"error": "skill_action_not_permitted"}
+        if call.name == "propose_scheduled_task" and self.schedules is not None:
+            return dict(await self.schedules.execute(call))
+        if call.name == "project_memory" and self.memory is not None:
+            return dict(await self.memory.execute(call))
+        if call.name == "switch_tool_group" and self.selection is not None:
+            from services.orchestrator.work_tool_selection import (
+                ToolSelectionError,
+            )
+
+            try:
+                result = self.selection.switch(call.arguments)
+            except ToolSelectionError as exc:
+                result = exc.result
+            except ValueError:
+                result = {
+                    "error": "invalid_tool_group",
+                    "reason": "arguments must contain a known group and optional focus only",
+                    "allowed_groups": [
+                        group
+                        for group in self.selection.groups
+                        if group != "remote" or self.selection.remote_enabled
+                    ],
+                    "next_step": "Use an allowed group; omit focus unless selecting a tool in that group.",
+                }
+            await self.emit(
+                "tool",
+                tool=call.name,
+                label=call.name,
+                status="failed" if result.get("error") else "completed",
+                output=result,
+            )
+            return result
+        if call.name in {"nearby_places", "geocode"}:
+            if self.nearby is None:
+                return {"error": "location_required"}
+            result = await self.nearby.execute(call, timeout)
+            await self.emit(
+                "tool",
+                tool=call.name,
+                label=call.name,
+                status="failed" if result.get("error") else "completed",
+                output=result,
+            )
+            return dict(result)
+        if call.name == "make_pictures":
+            from services.orchestrator import work_pictures
+
+            await self.emit(
+                "tool", tool=call.name, label=call.name, status="running", output={}
+            )
+            try:
+                async with asyncio.timeout(timeout):
+                    result = await work_pictures.execute(self, call.arguments, timeout)
+            except (ValueError, OSError, RuntimeError, TimeoutError) as exc:
+                result = {"error": redact(str(exc)) or "pictures_timeout"}
+            await self.emit(
+                "tool",
+                tool=call.name,
+                label=call.name,
+                status="failed" if result.get("error") else "completed",
+                output=result,
+            )
+            return dict(trust="untrusted", **result)
+        if call.name in project_document_tools.SCHEMAS:
+            from services.retrieval.project_identity import ProjectError
+
+            await self.emit(
+                "tool", tool=call.name, label=call.name, status="running", output={}
+            )
+            try:
+                async with asyncio.timeout(timeout):
+                    result = await project_document_tools.execute(
+                        self, call.name, call.arguments, timeout
+                    )
+            except ProjectError as exc:
+                result = dict(exc.body)
+            except (ValueError, OSError, RuntimeError, TimeoutError) as exc:
+                result = {"error": redact(str(exc)) or "document_tool_timeout"}
+            await self.emit(
+                "tool",
+                tool=call.name,
+                label=call.name,
+                status="failed" if result.get("error") else "completed",
+                output=result,
+            )
+            return dict(trust="untrusted", **result)
+        if call.name.startswith("machine_"):
+            from services.orchestrator import work_machine_tools
+
+            if call.name in work_machine_tools.SCHEMAS:
+                result = await work_machine_tools.execute(
+                    self, call.name, call.arguments
+                )
+                await self.emit(
+                    "tool",
+                    tool=call.name,
+                    label=call.name,
+                    status="failed" if result.get("error") else "completed",
+                    output=dict(
+                        machine=result,
+                        **({"error": result["error"]} if result.get("error") else {}),
+                    ),
+                )
+                return result
+        if call.name in {
+            "list_targets",
+            "remote_run",
+            "remote_status",
+            "remote_fetch",
+            "remote_write_file",
+        }:
+            from services.orchestrator import work_machine_tools, work_remote_tools
+            from services.retrieval.project_identity import ProjectError
+
+            target = remote_target(call.arguments)
+            try:
+                known = work_machine_tools.ended(self, target)
+                result = (
+                    known
+                    if known is not None and call.name in {"remote_run", "remote_fetch"}
+                    else await work_remote_tools.execute(
+                        self, call.name, call.arguments, timeout
+                    )
+                )
+            except ProjectError as exc:
+                result = dict(exc.body)
+                if target and result.get("error") == "not_found":
+                    result.setdefault("next_step", unknown_target_hint())
+            except (ValueError, OSError, RuntimeError, TimeoutError) as exc:
+                code = str(exc) or exc.__class__.__name__
+                logging.getLogger(__name__).warning(
+                    "remote tool failure class=%s code=%s",
+                    exc.__class__.__name__,
+                    code,
+                )
+                found = re.search(r"Value error, ([a-z_]+)", code)
+                code = found[1] if found else code
+                result = dict(
+                    error=code,
+                    next_step=REMOTE_FIX_HINTS.get(
+                        code,
+                        "Correct the command or target from this error; do not resend an identical request.",
+                    ),
+                )
+            if target and str(result.get("error")) in work_machine_tools.UNREACHABLE:
+                result = work_machine_tools.unreachable(self, result, target)
+            await self.emit(
+                "tool",
+                tool=call.name,
+                label=call.name,
+                status="failed" if result.get("error") else "completed",
+                output=dict(
+                    remote=result,
+                    **({"error": result["error"]} if result.get("error") else {}),
+                ),
+            )
+            return dict(
+                trust="untrusted", **{k: v for k, v in result.items() if k != "trust"}
+            )
+        if call.name == "forge_action":
+            from services.orchestrator import work_forge_tools
+            from services.retrieval.project_identity import ProjectError
+
+            try:
+                result = await work_forge_tools.execute(self, call.arguments, timeout)
+            except (ValueError, ProjectError) as exc:
+                result = (
+                    dict(exc.body)
+                    if isinstance(exc, ProjectError)
+                    else dict(error="invalid_tool_arguments")
+                )
+            await self.emit(
+                "tool",
+                tool=call.name,
+                label=call.name,
+                status="failed" if result.get("error") else "completed",
+                output=result,
+            )
+            return result
+        if call.name == "request_approval":
+            try:
+                args = approval_arguments(call.arguments)
+            except ValidationError as exc:
+                # Validation is a recoverable tool result, as for CodeTools and
+                # document tools. Never approve, coerce, or echo invalid inputs.
+                result = {
+                    "error": "invalid_tool_arguments",
+                    "details": exc.errors(include_input=False, include_url=False),
+                }
+                await self.emit(
+                    "tool",
+                    tool=call.name,
+                    label=call.name,
+                    status="failed",
+                    output=result,
+                )
+                return result
+            except ValueError:
+                result = {
+                    "error": "invalid_tool_arguments",
+                    "details": "Provide exactly the fields required by effect_kind",
+                }
+                await self.emit(
+                    "tool",
+                    tool=call.name,
+                    label=call.name,
+                    status="failed",
+                    output=result,
+                )
+                return result
+            self.validation_failures.pop(call.name, None)
+            approval = await self.execution.broker.call(
+                "approvals",
+                dict(
+                    self.execution.fence(),
+                    **args,
+                    approver_member_id=self.execution.session["lease"][
+                        "holder_member_id"
+                    ],
+                    destination=dict(kind="server", ref=self.execution.broker.project),
+                ),
+            )
+            decision = await wait_for_approval(self.execution, self, approval, timeout)
+            return dict(
+                approval_id=approval["id"],
+                action_digest=approval["action_digest"],
+                decision=decision,
+            )
+        if call.name == "run_command":
+            args = Command.model_validate_json(call.arguments).model_dump()
+            limits = self.execution.session["effective_limits"]
+            if limits["command_memory_bytes"] < 32 * 1024 * 1024:
+                from services.retrieval.project_identity import ProjectError
+
+                raise ProjectError(
+                    403,
+                    "policy_denied",
+                    "Command memory ceiling is below the worker minimum",
+                )
+            args["timeout_seconds"] = min(
+                args["timeout_seconds"], limits["command_seconds"]
+            )
+            args["memory_mb"] = min(
+                args["memory_mb"], limits["command_memory_bytes"] // (1024 * 1024)
+            )
+            from dataclasses import replace
+
+            call = replace(call, arguments=json.dumps(args))
+        result = await super().execute(call, timeout)
+        if self.selection is not None:
+            self.selection.verified = self.verification.status().status == "passed"
+        if call.name == "run_command" and self.verification.status().status == "passed":
+            result = dict(
+                result,
+                next_step="Tests passed. To publish, call forge_action with kind=publish_change for one approval and a Forgejo pull request. The scratch workspace has no Git remote or network credentials.",
+            )
+        return result
