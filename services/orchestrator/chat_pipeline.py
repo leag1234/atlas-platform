@@ -1969,6 +1969,12 @@ async def _process_request(request: ChatRequest, item: Interaction) -> None:
             await _process(request, item)
     else:
         await _process(request, item)
+    if item.task_type == "drawing" and item.state == "done":
+        from services.orchestrator.pictures.bare import bare, image_only
+
+        # "Just the image here": the picture alone (pictures/bare.py).
+        if image_only(request.user_text):
+            item.reponse = bare(item.reponse)
     partial_searches = tuple(
         dict.fromkeys(
             error.removeprefix("partial_search_failure:")

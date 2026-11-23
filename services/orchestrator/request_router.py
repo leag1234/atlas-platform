@@ -42,6 +42,7 @@ from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
 from packages.artifact_intent import Intent
 from packages import linear_scan, privacy
 from packages.closing_intent import polite_closing
+from packages.deferred_intent import creation_deferred
 from packages.model_json import object_content, unique_object
 from packages.work_intent import manages_machine
 from packages.writing_intent import plain_writing
@@ -629,6 +630,9 @@ def deliver_fallback(text: str) -> Decision | None:
     found = named_formats(text)
     if not found or work_reason(text) in ("remote", "run"):
         return None
+    if creation_deferred(text):
+        # The format is named for later, after the person's choice.
+        return Decision(kind="answer")
     return Decision.model_validate(
         {"kind": "file", "file_format": found[0] if len(found) == 1 else None}
     )
@@ -664,6 +668,17 @@ def _settle(text: str, routed: Decision | None) -> tuple[Decision | None, str]:
         return Decision(kind="remote"), "machine"
     if routed.kind in _REDELIVER and polite_closing(text):
         return Decision(kind="answer"), "closing"
+    if routed.kind in ("file", "app") and creation_deferred(text):
+        # "Propose two outlines here and wait for my choice before creating
+        # the deck": the options are this turn's answer, the file comes after
+        # the choice (packages/deferred_intent.py; class suite, staging -184:
+        # the deck was created twice before the outlines were shown).
+        return (
+            routed.model_copy(
+                update={"kind": "answer", "file_format": None, "needs_research": False}
+            ),
+            "deferred",
+        )
     if routed.kind in ("research", "answer") and not routed.follow_up:
         # A document the person asks to be made is delivered as that file;
         # research may complement it, never replace it (staging -179: "a
