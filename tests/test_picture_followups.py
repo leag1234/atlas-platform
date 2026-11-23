@@ -770,43 +770,120 @@ class FollowUpTests(Base):
 
 
 class CodeEngineIdenticalTests(Base):
-    async def test_an_identical_drawing_makes_no_new_version(self) -> None:
+    """A drawing by code that the painter gives back unchanged to a correction.
+
+    Staging -185: after a picture drawn by code (the image model had failed
+    its check), a complaint and then an acceptance were both answered "the
+    drawing came back identical, tell me precisely what should change": the
+    person had already said it. The method now changes once (drawn again from
+    the first request with the correction) before saying nothing changed.
+    """
+
+    async def changed_after(
+        self,
+        request: str,
+        correction: str,
+        *,
+        same_on_redraw: bool,
+        wall_clock_limit: float | None = None,
+    ) -> tuple[Interaction, store.PictureSet, Any]:
         from test_picture_turn import FakeGateway
 
         from services.orchestrator.pictures import turn
 
         class Same(FakeGateway):
             last = ""
+            edits = 0
+            redraws = 0
 
             async def __call__(
                 self, payload: dict[str, Any], seconds: float
             ) -> dict[str, Any]:
                 reply = await super().__call__(payload, seconds)
-                if "Change the picture as asked" in str(
-                    payload["messages"][-1]["content"]
-                ):
+                asked = str(payload["messages"][-1]["content"])
+                if "Change the picture as asked" in asked:
+                    self.edits += 1
                     reply["text"] = "```svg\n" + self.last + "\n```"
+                elif "Also apply this change" in asked:
+                    self.redraws += 1
+                    if same_on_redraw:
+                        reply["text"] = "```svg\n" + self.last + "\n```"
                 return reply
 
         with patch.dict(os.environ, {"ATLAS_PICTURES_CPU": ""}):
             gateway = Same("cats")
             item = Interaction()
-            await turn.process_picture_turn(
-                Request("des chats"), item, complete=gateway
-            )
+            await turn.process_picture_turn(Request(request), item, complete=gateway)
             picture_set = self.picture_set(item)
             gateway.last = picture_set.current_source
             changed = Interaction()
             done = await process_picture_followup(
-                Request("vas-y"), changed, current(item.reponse), complete=gateway
+                Request("c'est pas ça"),
+                changed,
+                current(item.reponse),
+                complete=gateway,
+                instruction=correction,
+                wall_clock_limit=wall_clock_limit,
             )
         self.assertTrue(done)
+        return changed, picture_set, gateway
+
+    async def test_an_identical_edit_is_drawn_again_from_the_request(self) -> None:
+        for request, correction in (
+            ("trois chats sur un muret", "Show three cats; the picture shows two."),
+            ("un chat avec deux nœuds rouges", "Give the cat two red bows, not one."),
+        ):
+            with self.subTest(request=request):
+                changed, picture_set, gateway = await self.changed_after(
+                    request, correction, same_on_redraw=False
+                )
+                after = store.load(picture_set.set_id)
+                assert after is not None
+                self.assertEqual(
+                    after.artifact_version, picture_set.artifact_version + 1
+                )
+                self.assertEqual((gateway.edits, gateway.redraws), (1, 1))
+                redraw = gateway.payloads[-1]["messages"]
+                # Drawn again from the request with the correction, never from
+                # the drawing that kept the fault.
+                self.assertIn(correction, str(redraw[-1]["content"]))
+                self.assertNotIn(
+                    picture_set.current_source,
+                    [str(m["content"]) for m in redraw],
+                )
+                self.assertIn("changé de méthode", changed.reponse)
+                self.assertIn("/versions/2/open", changed.reponse)
+
+    async def test_identical_twice_keeps_the_version_and_asks_nothing_again(
+        self,
+    ) -> None:
+        changed, picture_set, gateway = await self.changed_after(
+            "cinq chats endormis",
+            "Show five cats; four are drawn.",
+            same_on_redraw=True,
+        )
         after = store.load(picture_set.set_id)
         assert after is not None
+        self.assertEqual(after.artifact_version, picture_set.artifact_version)
         self.assertIn("picture_change_identical", changed.erreurs)
+        self.assertEqual((gateway.edits, gateway.redraws), (1, 1))
+        self.assertIn("Rien n'a été redessiné", changed.reponse)
+        self.assertNotIn("précisément ce qui doit changer", changed.reponse)
+        self.assertNotIn("/versions/2/", changed.reponse)
+
+    async def test_without_time_for_a_redraw_the_version_stays(self) -> None:
+        changed, picture_set, gateway = await self.changed_after(
+            "un chat sur un tabouret",
+            "Put the cat on a stool.",
+            same_on_redraw=False,
+            wall_clock_limit=80.0,
+        )
+        after = store.load(picture_set.set_id)
+        assert after is not None
+        self.assertEqual(after.artifact_version, picture_set.artifact_version)
+        self.assertEqual((gateway.edits, gateway.redraws), (1, 0))
         self.assertIn("identique", changed.reponse)
         self.assertNotIn("modifiée", changed.reponse)
-        self.assertEqual(after.artifact_version, picture_set.artifact_version)
 
 
 class GateEditTests(unittest.TestCase):
