@@ -538,9 +538,11 @@ def quote_gaps(tools: Any, content: Any, preview: bytes) -> list[str]:
     there, in a row, but not as typed. Code only.
     """
     request = getattr(tools, "request_text", "")
-    earlier = getattr(tools, "earlier_requests", None) or []
+    earlier = getattr(tools, "earlier_requests", None)
     requests = [
-        str(item) for item in [*earlier, request] if isinstance(item, str) and item
+        item
+        for item in [*(earlier if isinstance(earlier, (list, tuple)) else ()), request]
+        if isinstance(item, str) and item
     ]
     quotes = quoted_texts(requests)
     if not quotes:
@@ -588,7 +590,8 @@ def restated_gaps(suffix: str, content: Any, name: str = "") -> list[str]:
     made of the title's own words ("Packing" / "Pack the item for transport.")
     and was published as delivered. A section counts when its body is one
     short text whose longer words all come from its heading, the document
-    title or the file name; a deck's first slide (its cover) is not measured.
+    title or the file name; a deck's first slide (its cover) is not measured,
+    nor a file made only of labels (a picture book: each word under itself).
     """
     if content is None or not getattr(content, "sections", None):
         return []
@@ -596,6 +599,12 @@ def restated_gaps(suffix: str, content: Any, name: str = "") -> list[str]:
 
     stem = name.rsplit("/", 1)[-1].rsplit(".", 1)[0] if name else ""
     title = set(_folded(shown(content.title) + " " + stem).split())
+    # No section holds a sentence: the file is a list of labelled items.
+    labels_only = not any(
+        len(shown(text).split()) >= 3
+        for section in content.sections
+        for text in [*section.paragraphs, *section.bullets]
+    )
     restated: list[str] = []
     for index, section in enumerate(content.sections):
         if index == 0 and suffix == ".pptx":
@@ -617,8 +626,17 @@ def restated_gaps(suffix: str, content: Any, name: str = "") -> list[str]:
             or getattr(section, "chart", None) is not None
         ):
             continue
-        words = [word for word in _folded(shown(texts[0])).split() if len(word) > 3]
-        known = title | set(_folded(shown(section.heading)).split())
+        body, heading = _folded(shown(texts[0])), _folded(shown(section.heading))
+        words = [word for word in body.split() if len(word) > 3]
+        known = title | set(heading.split())
+        if body.strip(" .!?") == heading.strip(" .!?"):
+            # The heading again as the whole body: a label when the file is
+            # made of such labels (a picture book's words), an empty section
+            # when other sections of the same file say more.
+            if labels_only:
+                continue
+        elif len(words) < 2:
+            continue
         if words and len(words) <= 8 and all(_same_word(w, known) for w in words):
             restated.append(shown(section.heading))
     if not restated:
