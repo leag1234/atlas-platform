@@ -115,8 +115,8 @@ Checks, a fixed vocabulary that code validates (an invalid check becomes
   1 either way (about one page: 0 to 2 pages; about 300 words: 240 to 360);
   pages and words asked "exactly" read as about. Everything in the file
   counts: an unrequested section (a Sources page) that takes it over the size
-  fails the requirement, and the repair lists the sections. Found by the
-  frontier judge on staging: a deck asked with 5 slides came with 7, reports
+  fails the requirement, and the repair lists the sections. Found on
+  staging: a deck asked with 5 slides came with 7, reports
   asked at about one page came at 6 or 7 pages with a Sources page nobody
   asked for.
 - `judge`: the statement and the file go to one JSON call.

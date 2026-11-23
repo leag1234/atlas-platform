@@ -699,18 +699,3 @@ html.dark .atlas-plan-steps li[data-status="failed"] .atlas-plan-mark { color:#f
 @keyframes atlas-plan-pulse { 50% { opacity:.35; } }
 /* Reduced motion: no pulse. */
 @media (prefers-reduced-motion: reduce) { .atlas-plan-steps li[data-status="in_progress"] .atlas-plan-mark { animation:none; } }
-
-/* Live quality rating (staging only, tools/eval/live_judge): one muted line under the answer. */
-.atlas-quality { margin:.5rem 0 0; max-width:40rem; font-size:.8125rem; line-height:1.4; color:var(--atlas-muted); overflow-wrap:anywhere; }
-/* The score: a plain text button (dotted underline) that opens the details. */
-.atlas-quality-score { all:unset; cursor:pointer; color:inherit; border-bottom:1px dotted currentColor; }
-/* Keyboard focus on the score. */
-.atlas-quality-score:focus-visible { outline:2px solid var(--atlas-accent); outline-offset:2px; border-radius:4px; }
-/* The details: reason, worst issue and defect classes, in a quiet card. */
-.atlas-quality-detail { margin-top:.375rem; padding:.5rem .75rem; box-sizing:border-box; border:1px solid var(--atlas-border); border-radius:min(var(--atlas-radius),12px); background:var(--atlas-surface); color:var(--atlas-text); }
-/* Paragraphs of the details. */
-.atlas-quality-detail p { margin:0 0 .25rem; }
-/* No space after the last paragraph. */
-.atlas-quality-detail p:last-child { margin-bottom:0; }
-/* Class ids: muted. */
-.atlas-quality-detail .atlas-quality-classes { color:var(--atlas-muted); }

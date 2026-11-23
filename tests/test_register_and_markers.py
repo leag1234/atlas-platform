@@ -1,5 +1,5 @@
 """Service text follows the conversation's register; internal markers never
-reach the person (frontier judge on staging -145, classes C13 and C4).
+reach the person (staging -145, classes C13 and C4).
 
 C13: a conversation in the familiar form read the code's own text in the
 polite form: the trip notes asking to check the times with the operator, the

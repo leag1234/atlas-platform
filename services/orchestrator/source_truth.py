@@ -189,7 +189,7 @@ def canonical_url(url: str) -> str:
 
 # What stands for an address the guard could not trace, in the answer's
 # language: a plain phrase, never the bracketed English placeholder the person
-# read before (frontier judge C4, staging -145).
+# read before (class C4, staging -145).
 UNVERIFIED = {
     "en": "unverified source",
     "fr": "source non vérifiée",

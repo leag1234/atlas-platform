@@ -642,7 +642,7 @@ def media_note(language: str, media: list[Media], failures: list[MediaFailure]) 
     if not media and not failures:
         return ""
     # In the conversation's register (packages.addressing): the polite "as you
-    # stated" followed a request in the familiar form (frontier judge C13).
+    # stated" followed a request in the familiar form (class C13).
     labels = addressing.addressed_table(NOTE.get(language, NOTE["en"]), language)
     lines: list[str] = []
     if media:

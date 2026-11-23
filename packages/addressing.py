@@ -3,8 +3,8 @@
 A conversation in the familiar form (French and Italian tu, Spanish tu, German
 du) read code-written text in the polite one: the closing note of a trip that
 asks to check the times with the operator, the last step of a plan card (hand
-you the app), retry sentences (send your message again) (frontier judge,
-staging -145, class C13). Every service table is written in the polite form, the safe default; a
+you the app), retry sentences (send your message again) (staging -145,
+class C13). Every service table is written in the polite form, the safe default; a
 turn whose person writes in the familiar form reads it in that form.
 
 - ``register`` reads how one text addresses the person (moved here from
