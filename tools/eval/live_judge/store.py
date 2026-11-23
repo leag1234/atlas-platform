@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 
 FINAL = ("scored", "skipped_privacy", "skipped_empty", "failed")
-STATES = (*FINAL, "pending", "budget")
+STATES = (*FINAL, "pending", "budget", "evidence_missing")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS scores (
@@ -109,6 +109,14 @@ class Store:
                 f"INSERT INTO scores ({', '.join(cols)}) VALUES ({', '.join('?' * len(cols))}) "
                 f"ON CONFLICT(message_id) DO UPDATE SET {updates}",
                 [record[c] for c in cols],
+            )
+            self.db.commit()
+
+    def set_version(self, message_id: str, version: str) -> None:
+        with self._lock:
+            self.db.execute(
+                "UPDATE scores SET version = ? WHERE message_id = ?",
+                (version, message_id),
             )
             self.db.commit()
 

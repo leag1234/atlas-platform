@@ -27,6 +27,7 @@ from . import source, store
 PATH = "/api/atlas/quality/scores"
 MAX_IDS = 60
 TOKEN_TTL = 120.0
+MAX_ATTEMPTS = 3
 PUBLIC_STATES = ("scored", "pending", "budget", "failed", "skipped_privacy")
 
 
@@ -85,6 +86,11 @@ class Auth:
 
 def public(record: dict[str, Any]) -> dict[str, Any]:
     state = str(record["state"])
+    if state == "evidence_missing":
+        # Retried while attempts remain; then shown as unavailable, never as a score.
+        state = (
+            "failed" if int(record.get("attempts") or 0) >= MAX_ATTEMPTS else "pending"
+        )
     if state not in PUBLIC_STATES:
         return {"state": "none"}
     out: dict[str, Any] = {"state": state}

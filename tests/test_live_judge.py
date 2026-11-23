@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import io
 import json
 import os
@@ -89,6 +90,10 @@ def _message(
     db.commit()
 
 
+def _at(stamp: str) -> float:
+    return dt.datetime.fromisoformat(stamp).timestamp()
+
+
 class FakeResponses(BaseHTTPRequestHandler):
     scores: ClassVar[dict[str, int]] = {}
     override: ClassVar[dict[str, Any]] = {}
@@ -171,6 +176,7 @@ class LiveJudgeTest(unittest.TestCase):
             ledger_path=self.root / "ledger.jsonl",
             chat_ui_url="http://127.0.0.1:9",
             webui_container="atlas-chat-ui-test",
+            deploy_log=self.root / "deploys.log",
             webui_port=9,
             port=0,
             daily_cap_eur=daily,
@@ -561,6 +567,87 @@ class LiveJudgeTest(unittest.TestCase):
         finally:
             webui.shutdown()
             webui.server_close()
+
+    def test_extensionless_pictures_and_deliverables_are_found(self) -> None:
+        db = source.connect_ro(self.root / "webui" / "webui.db")
+        self.addCleanup(db.close)
+        key = "c" * 32
+        (self.root / "data" / "images" / f"{key}.png").write_bytes(PNG)
+        org, project = (
+            "11111111-1111-4111-8111-111111111111",
+            "22222222-2222-4222-8222-222222222222",
+        )
+        deliverable = "33333333-3333-4333-8333-333333333333"
+        version = "44444444-4444-4444-8444-444444444444"
+        blob = (
+            self.root
+            / "data"
+            / "project-data"
+            / "orgs"
+            / org
+            / "projects"
+            / project
+            / "blobs"
+        )
+        (blob / "55555555-5555-4555-8555-555555555555").mkdir(parents=True)
+        (blob / "55555555-5555-4555-8555-555555555555" / version).write_text(
+            "Compte rendu fictif"
+        )
+        paths = self.cfg().paths
+        paths.deliverable_version = {deliverable: version}.get
+        ev = evidence.Evidence()
+        text = (
+            f"![dessin](https://staging.example.test/images/{key}) "
+            f"[fichier](/api/atlas/orgs/{org}/projects/{project}/deliverables/{deliverable}/download)"
+        )
+        evidence.answer_artifacts(ev, text, db, paths)
+        self.assertEqual(ev.missing, [])
+        self.assertEqual(ev.images, 1)
+        self.assertTrue(
+            any("Compte rendu fictif" in p.get("text", "") for p in ev.parts)
+        )
+
+    def test_missing_evidence_is_never_scored(self) -> None:
+        now = int(time.time())
+        _message(self.db, "q", "user", "Dessine une horloge fictive.", None, now)
+        _message(
+            self.db,
+            "a",
+            "assistant",
+            f"Voici l'app : [ouvrir](/api/atlas/artifacts/{'d' * 32}/versions/1/open)",
+            "q",
+            now + 1,
+        )
+        answer = self.one("a")
+        assert answer is not None
+        eng = self.engine()
+        for attempt in range(1, 4):
+            record = eng.judge_one(answer)
+            self.assertEqual(
+                (record["state"], record["attempts"]), ("evidence_missing", attempt)
+            )
+            stored = eng.store.get("a")
+            assert stored is not None
+            self.assertEqual(
+                server.public(stored)["state"], "pending" if attempt < 3 else "failed"
+            )
+        self.assertEqual(FakeResponses.calls, [])
+        self.assertIn("app version 1 not found", record["error"])
+
+    def test_version_comes_from_the_deploy_log(self) -> None:
+        log = self.root / "deploys.log"
+        log.write_text(
+            "2026-01-02T10:00:00+00:00 tag-a 1111111 tests=after health=ok env=rendered\n"
+            "2026-01-02T10:20:00+00:00 tag-a posttests=PASS\n"
+            "2026-01-02T12:00:00+00:00 tag-b 2222222 tests=FAILED staging unchanged\n"
+            "2026-01-02T14:00:00+00:00 tag-c 3333333 tests=after health=ok env=rendered\n"
+        )
+        self.assertEqual(
+            engine.version_at(log, _at("2026-01-02T13:59:00+00:00")), "tag-a"
+        )
+        self.assertEqual(
+            engine.version_at(log, _at("2026-01-02T14:01:00+00:00")), "tag-c"
+        )
 
     def test_summaries_by_day_and_version(self) -> None:
         eng = self.engine()

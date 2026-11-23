@@ -19,6 +19,7 @@ import sqlite3
 import subprocess
 import tempfile
 import zipfile
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -30,7 +31,8 @@ from . import source
 HEX = r"[0-9a-f]{32}"
 UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 APP_LINK = re.compile(rf"/api/atlas/artifacts/({HEX})/versions/(\d{{1,4}})")
-IMAGE_LINK = re.compile(rf"/images/({HEX})\.(png|jpe?g|webp|gif)\b")
+# Pictures are linked with or without an extension (/images/<key> or /images/<key>.png).
+IMAGE_LINK = re.compile(rf"/images/({HEX})(?:\.(png|jpe?g|webp|gif))?(?![0-9A-Za-z/])")
 PICTURE_LINK = re.compile(rf"/images/picture/({HEX})/([1-9])\b")
 DELIVERABLE_LINK = re.compile(
     rf"/api/atlas/orgs/({UUID})/projects/({UUID})/deliverables/({UUID})"
@@ -70,6 +72,8 @@ class Paths:
     data_root: Path
     image_dir: Path
     webui_data: Path
+    # Deliverable id -> stored version id (the project database knows the mapping).
+    deliverable_version: Callable[[str], str | None] | None = None
 
 
 @dataclass
@@ -78,6 +82,9 @@ class Evidence:
     images: int = 0
     artifacts: int = 0
     notes: list[str] = field(default_factory=list)
+    # Artifacts the answer links to that the harness could not find or render: the
+    # judge is not called (a harness gap must never lower the score).
+    missing: list[str] = field(default_factory=list)
 
     def text(self, label: str, body: str) -> None:
         """Untrusted content, delimited as data (markers inside the body are neutralised)."""
@@ -223,9 +230,7 @@ def add_file(ev: Evidence, label: str, data: bytes, name: str = "") -> None:
     elif kind in ("pdf", "docx", "pptx", "xlsx", "odt"):
         text, pages = render_document(data, kind)
         if text is None and not pages:
-            ev.text(
-                label, f"[{kind} file {name}: it could not be rendered for the judge]"
-            )
+            ev.missing.append(f"{label}: {kind} not rendered")
             return
         ev.text(
             f"{label} ({kind}, text extracted from its PDF render)",
@@ -267,7 +272,7 @@ def _owui_file(
 ) -> None:
     rec = source.file_record(db, file_id)
     if rec is None:
-        ev.text(label, "[file not found]")
+        ev.missing.append(f"{label}: interface file not found")
         return
     path = _webui_path(paths, str(rec["path"]))
     name = str(rec["filename"])
@@ -287,7 +292,7 @@ def _owui_file(
     elif path is not None:
         add_file(ev, f"{label} {name}", path.read_bytes(), name)
     else:
-        ev.text(label, f"[{name}: content not available]")
+        ev.missing.append(f"{label}: interface file content not available")
 
 
 def _picture(paths: Paths, set_id: str, number: int) -> Path | None:
@@ -307,11 +312,30 @@ def _picture(paths: Paths, set_id: str, number: int) -> Path | None:
     return None
 
 
-def _latest_blob(folder: Path) -> Path | None:
-    if not folder.is_dir():
-        return None
-    files = [p for p in folder.iterdir() if p.is_file()]
-    return max(files, key=lambda p: p.stat().st_mtime) if files else None
+def _image_file(paths: Paths, key: str, ext: str | None) -> Path | None:
+    if ext:
+        path = paths.image_dir / f"{key}.{ext}"
+        return path if path.exists() else None
+    for suffix in ("png", "jpg", "jpeg", "webp", "gif"):
+        path = paths.image_dir / f"{key}.{suffix}"
+        if path.exists():
+            return path
+    return None
+
+
+def _deliverable_blob(
+    paths: Paths, org: str, project: str, deliverable: str
+) -> Path | None:
+    """The stored file of a project deliverable: blobs/<file>/<version of the deliverable>."""
+    blobs = paths.data_root / "orgs" / org / "projects" / project / "blobs"
+    version = (
+        paths.deliverable_version(deliverable) if paths.deliverable_version else None
+    )
+    if version and re.fullmatch(UUID, version):
+        for path in blobs.glob(f"*/{version}"):
+            if path.is_file():
+                return path
+    return None
 
 
 def answer_artifacts(
@@ -326,56 +350,43 @@ def answer_artifacts(
         return True
 
     for m in APP_LINK.finditer(answer_text):
-        if first(m.group(0)):
+        if first(m.group(1) + "/" + m.group(2)):
+            version = int(m.group(2))
             path = (
-                paths.data_dir
-                / "artifacts"
-                / "blobs"
-                / m.group(1)
-                / f"{int(m.group(2))}.html"
+                paths.data_dir / "artifacts" / "blobs" / m.group(1) / f"{version}.html"
             )
             if path.exists():
-                add_file(
-                    ev, f"Delivered app (version {int(m.group(2))})", path.read_bytes()
-                )
+                add_file(ev, f"Delivered app (version {version})", path.read_bytes())
             else:
-                ev.text("Delivered app", "[the linked app version is not stored]")
+                ev.missing.append(f"app version {version} not found")
     for m in IMAGE_LINK.finditer(answer_text):
-        if first(m.group(0)):
-            path = paths.image_dir / f"{m.group(1)}.{m.group(2)}"
-            if path.exists():
-                ev.artifacts += 1
-                ev.image(
-                    "Picture shown in the answer",
-                    path.read_bytes(),
-                    IMAGE_MIME[m.group(2)],
-                )
+        if first(m.group(1)):
+            image = _image_file(paths, m.group(1), m.group(2))
+            if image is None:
+                ev.missing.append("picture not found")
+                continue
+            ev.artifacts += 1
+            ext = image.suffix.lstrip(".")
+            ev.image("Picture shown in the answer", image.read_bytes(), IMAGE_MIME[ext])
     for m in PICTURE_LINK.finditer(answer_text):
-        if first(m.group(0)):
+        if first(m.group(1) + "/" + m.group(2)):
             pic = _picture(paths, m.group(1), int(m.group(2)))
-            if pic is not None:
-                ev.artifacts += 1
-                ev.image(
-                    f"Picture choice {m.group(2)} shown in the answer",
-                    pic.read_bytes(),
-                    "image/png",
-                )
+            if pic is None:
+                ev.missing.append("picture choice not found")
+                continue
+            ev.artifacts += 1
+            ev.image(
+                f"Picture choice {m.group(2)} shown in the answer",
+                pic.read_bytes(),
+                "image/png",
+            )
     for m in DELIVERABLE_LINK.finditer(answer_text):
         if first(m.group(3)):
-            folder = (
-                paths.data_root
-                / "orgs"
-                / m.group(1)
-                / "projects"
-                / m.group(2)
-                / "blobs"
-                / m.group(3)
-            )
-            blob = _latest_blob(folder)
-            if blob is not None:
-                add_file(ev, "Delivered file", blob.read_bytes())
-            else:
-                ev.text("Delivered file", "[the linked deliverable is not stored]")
+            blob = _deliverable_blob(paths, m.group(1), m.group(2), m.group(3))
+            if blob is None:
+                ev.missing.append("project deliverable not found")
+                continue
+            add_file(ev, "Delivered file", blob.read_bytes())
     for m in OWUI_FILE_LINK.finditer(answer_text):
         if first(m.group(1)):
             _owui_file(ev, db, paths, m.group(1), "File linked in the answer")

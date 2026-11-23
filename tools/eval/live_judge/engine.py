@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime as dt
 import logging
 import os
+import re
 import subprocess
 import threading
 import time
@@ -42,6 +43,7 @@ class Config:
     ledger_path: Path
     chat_ui_url: str
     webui_container: str
+    deploy_log: Path
     webui_port: int
     port: int
     daily_cap_eur: float
@@ -76,6 +78,9 @@ class Config:
                 data_root=Path(env.get("ATLAS_DATA_ROOT") or data_dir / "project-data"),
                 image_dir=Path(env.get("ATLAS_IMAGE_DIR") or data_dir / "images"),
                 webui_data=webui,
+                deliverable_version=lambda d: deliverable_version(
+                    f"atlas-chat-{base}-db", d
+                ),
             ),
             log_dir=Path(identity["ATLAS_INTERACTION_DIR"]),
             webui_db=webui / "webui.db",
@@ -90,6 +95,10 @@ class Config:
             # without the proxy secret; sessions are checked on the container itself.
             chat_ui_url=env.get("ATLAS_LIVE_JUDGE_WEBUI_URL", ""),
             webui_container=f"atlas-chat-ui-{base}",
+            deploy_log=Path(
+                env.get("ATLAS_LIVE_JUDGE_DEPLOY_LOG")
+                or "/opt/atlas-src/logs/staging-deploys.log"
+            ),
             webui_port=AtlasPorts(base).port("chat_ui"),
             port=int(env.get("ATLAS_LIVE_JUDGE_PORT") or PORT_OFFSET + base),
             daily_cap_eur=float(env.get("ATLAS_LIVE_JUDGE_DAILY_EUR") or 5.0),
@@ -153,6 +162,70 @@ def webui_url(cfg: Config) -> str:
     return f"http://{out[0]}:{cfg.webui_port}" if out else ""
 
 
+UUID_TEXT = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+
+
+def deliverable_version(container: str, deliverable: str) -> str | None:
+    """Stored version id of a project deliverable, read in a read-only transaction."""
+    if not UUID_TEXT.fullmatch(deliverable):
+        return None
+    sql = (
+        "SET default_transaction_read_only = on; "
+        "SELECT data->>'file_version_id' FROM atlas_projects.resources "
+        f"WHERE kind = 'deliverable' AND id = '{deliverable}';"
+    )
+    try:
+        out = subprocess.run(
+            ["docker", "exec", "-i", container, "psql", "-U", "postgres", "-At", "-q"],
+            input=sql,
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=True,
+        ).stdout.split()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    found = [v for v in out if UUID_TEXT.fullmatch(v)]
+    return found[0] if found else None
+
+
+DEPLOYED = re.compile(r"^(\S+) (\S+) [0-9a-f]{7,40} .*\bhealth=ok\b")
+_deploys: tuple[float, float, list[tuple[float, str]]] = (0.0, 0.0, [])
+
+
+def deploys(log: Path) -> list[tuple[float, str]]:
+    """(time, tag) of every successful staging deploy, oldest first (re-read when it changes)."""
+    global _deploys
+    try:
+        mtime = log.stat().st_mtime
+    except OSError:
+        return []
+    if _deploys[1] == mtime and time.time() - _deploys[0] < 60:
+        return _deploys[2]
+    out: list[tuple[float, str]] = []
+    for line in log.read_text("utf-8", errors="replace").splitlines():
+        m = DEPLOYED.match(line)
+        if not m:
+            continue
+        try:
+            out.append((dt.datetime.fromisoformat(m.group(1)).timestamp(), m.group(2)))
+        except ValueError:
+            continue
+    out.sort()
+    _deploys = (time.time(), mtime, out)
+    return out
+
+
+def version_at(log: Path, when: float) -> str:
+    """The staging tag that was serving at `when` (deploy log), else the checkout's tag."""
+    tag = ""
+    for stamp, name in deploys(log):
+        if stamp > when:
+            break
+        tag = name
+    return tag or version_tag()
+
+
 _version: tuple[float, str] = (0.0, "")
 
 
@@ -211,7 +284,7 @@ class Engine:
             "message_id": answer.message_id,
             "chat_id": answer.chat_id,
             "user_hash": answer.user_hash,
-            "version": version_tag(),
+            "version": version_at(self.cfg.deploy_log, float(end)),
             "answered_at": float(end),
             "task_type": str(meta.get("task_type") or ""),
             "automated": int(self.automated(answer)),
@@ -243,6 +316,17 @@ class Engine:
         finally:
             db.close()
         record["artifacts"] = ev.artifacts
+        if ev.missing:
+            # A harness gap (file not found or not rendered) never becomes a low score:
+            # tried again later, then shown as unavailable.
+            record["attempts"] += 1
+            record.update(
+                state="evidence_missing",
+                error="; ".join(ev.missing)[:300],
+                scored_at=time.time(),
+            )
+            self.store.put(record)
+            return record
         if not answer.text.strip() and not ev.artifacts:
             record.update(
                 state="scored",
@@ -388,7 +472,10 @@ class Engine:
         started = 0
         db = source.connect_ro(self.cfg.webui_db)
         try:
-            for row in self.store.rows(state="pending"):
+            rows = self.store.rows(state="pending") + self.store.rows(
+                state="evidence_missing"
+            )
+            for row in rows:
                 if int(row["attempts"] or 0) >= MAX_ATTEMPTS:
                     continue
                 answer = source.one(db, row["chat_id"], row["message_id"])
@@ -410,6 +497,10 @@ class Engine:
                 except Exception:  # noqa: BLE001 - a locked or restarting database is retried
                     LOG.exception("poll failed")
                 if time.time() - last_summary > 600:
+                    try:
+                        self.resume_pending(pool)
+                    except Exception:  # noqa: BLE001
+                        LOG.exception("retry failed")
                     try:
                         store.write_summaries(self.store, self.cfg.summary_dir)
                     except Exception:  # noqa: BLE001

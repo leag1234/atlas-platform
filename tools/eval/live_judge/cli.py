@@ -89,7 +89,7 @@ def cmd_backfill(args: argparse.Namespace) -> int:
     todo = []
     for answer in _range_answers(cfg, since, until):
         known = scores.get(answer.message_id)
-        if known is None or known["state"] in ("pending", "budget"):
+        if known is None or known["state"] in ("pending", "budget", "evidence_missing"):
             todo.append(answer)
     print(
         f"{len(todo)} answers to judge between {args.since} and {args.until or 'now'}"
@@ -124,6 +124,10 @@ def cmd_report(args: argparse.Namespace) -> int:
     cfg = engine.Config.from_env()
     scores = store.Store(cfg.store_path)
     rows = scores.rows(when(args.since), version=args.version)
+    if args.accounts != "all":
+        rows = [
+            r for r in rows if bool(r["automated"]) == (args.accounts == "automated")
+        ]
     scored = [r for r in rows if r["state"] == "scored" and r["score"] is not None]
     if args.cls:
         scored = [r for r in scored if args.cls in json.loads(r["classes"] or "[]")]
@@ -141,6 +145,14 @@ def cmd_report(args: argparse.Namespace) -> int:
         " ".join(f"{k}:{v}" for k, v in summary["distribution"].items()),
     )
     print("by class:", summary["by_class"])
+    print("by account:", summary["by_account"])
+    missing = [r for r in rows if r["state"] == "evidence_missing"]
+    if missing:
+        print(
+            f"evidence missing ({len(missing)}): check whether Atlas really stored them"
+        )
+        for r in missing[:10]:
+            print(f"   /c/{r['chat_id']} message {r['message_id']}: {r['error']}")
     print()
     worst = sorted(scored, key=lambda r: (r["score"], -r["answered_at"]))[: args.worst]
     for r in worst:
@@ -157,6 +169,20 @@ def cmd_report(args: argparse.Namespace) -> int:
         print(
             f"   {cfg.identity['ATLAS_PUBLIC_URL']}/c/{r['chat_id']}  message {r['message_id']}"
         )
+    return 0
+
+
+def cmd_retag(args: argparse.Namespace) -> int:
+    cfg = engine.Config.from_env()
+    scores = store.Store(cfg.store_path)
+    changed = 0
+    for r in scores.rows():
+        tag = engine.version_at(cfg.deploy_log, float(r["answered_at"]))
+        if tag != r["version"]:
+            scores.set_version(r["message_id"], tag)
+            changed += 1
+    print(f"{changed} answers re-tagged from {cfg.deploy_log}")
+    store.write_summaries(scores, cfg.summary_dir)
     return 0
 
 
@@ -238,7 +264,17 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--version")
     p.add_argument("--class", dest="cls")
     p.add_argument("--json", action="store_true")
+    p.add_argument(
+        "--accounts",
+        choices=("all", "human", "automated"),
+        default="all",
+        help="human: people's answers only; automated: test accounts only",
+    )
     p.set_defaults(func=cmd_report)
+    p = sub.add_parser(
+        "retag", help="set each stored answer's version from the deploy log"
+    )
+    p.set_defaults(func=cmd_retag)
     p = sub.add_parser("summary", help="write the daily and per-version summary files")
     p.add_argument("--day")
     p.set_defaults(func=cmd_summary)
