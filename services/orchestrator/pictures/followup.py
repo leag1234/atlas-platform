@@ -59,6 +59,9 @@ CHANGE = (
     "declared joints accordingly."
 )
 REDRAW = "\nAlso apply this change: {change}"
+# A change whose edit came back identical is drawn again from the request
+# only when the turn still has this much time for one more painter call.
+REDRAW_MIN_SECONDS = 60.0
 
 
 def messages(
@@ -80,11 +83,19 @@ def messages(
         )
     # Too large (or no stored drawing): the painter draws it again from the
     # first request with the change; never the conversation model.
+    return redraw_messages(picture_set, change), True
+
+
+def redraw_messages(picture_set: store.PictureSet, change: str) -> list[dict[str, str]]:
+    """The painter's first request with the change: the picture drawn again."""
+    first = painter.messages(
+        picture_set.request, picture_set.checklist, animal_kit=animal_kit_enabled()
+    )
     first[1] = {
         "role": "user",
         "content": first[1]["content"] + REDRAW.format(change=change),
     }
-    return first, True
+    return first
 
 
 async def process_picture_followup(
@@ -151,78 +162,101 @@ async def process_picture_followup(
     spend = Spend(min(own, cost_limit) if cost_limit is not None else own)
     limit = request.timeout_seconds if wall_clock_limit is None else wall_clock_limit
     seconds = max(30.0, min(240.0, limit - 40.0))
-    change, redrawn = messages(
-        picture_set, (instruction or "").strip() or request.user_text
-    )
+    wanted = (instruction or "").strip() or request.user_text
+    change, redrawn = messages(picture_set, wanted)
     unchanged = app_failure(
         "drawing", language, unchanged_version=picture_set.artifact_version
     )
     await _status("changing", language)
-    payload = {
-        "messages": change,
-        "tools": [],
-        "profile": painter_profile,
-        "max_tokens": painter.MAX_TOKENS,
-        "produces_files": True,
-        "timeout": min(seconds, 290.0),
-        "budget_eur": _budget(spend.remaining()),
-        "single_attempt": True,
-        "local_enabled": False,
-    }
-    try:
-        reply = await (complete or _gateway)(payload, seconds + 10)
-    except Exception as error:  # noqa: BLE001 - unchanged picture, or D5 refusal
-        code = _code(error)
-        if code in REFUSALS:
-            # The whole allowance was offered to this one call: a cost or
-            # quota refusal is the user's (D5), said with its measurements.
-            raise
-        item.erreurs.append("picture_change_" + code)
-        item.reponse, item.state = unchanged, "done"
-        return True
-    spend.settle(reply)
-    item.cout_eur = float(spend.total)
-    item.tokens = {"in": spend.tokens_in, "out": spend.tokens_out}
-    svg, how = salvage(extract_svg(str(reply.get("text") or "")))
-    if svg is None:
-        item.erreurs.append("picture_change_" + how.split(" ")[0])
-        item.reponse, item.state = unchanged, "done"
-        return True
-    try:
-        result = await run_job(
-            "draft",
-            {
-                "svg": svg,
-                "checklist": picture_set.checklist,
-                "living": picture_set.living,
-                "animal_kit": animal_kit_enabled(),
-                "bounded_contours": bounded_contours_enabled(),
-                "labels_group": painter.labels_group(picture_set.checklist),
-            },
-        )
-    except PictureJobError as error:
-        item.erreurs.append("picture_change_" + str(error))
-        item.reponse, item.state = unchanged, "done"
-        return True
-    prepared = prepare(
-        Block("svg", result["svg"], True), picture_set.title, picture_set.language
-    )
-    if prepared.problems:
-        item.erreurs.append("picture_change_invalid")
-        item.reponse, item.state = unchanged, "done"
-        return True
     try:
         previous = artifact_store.read(
             picture_set.artifact_id, owner, picture_set.artifact_version
         )
-        if previous.content == prepared.document.encode("utf-8"):
-            # The drawing came back identical: no new version, no claimed change.
-            item.erreurs.append("picture_change_identical")
+    except ArtifactError as error:
+        item.erreurs.append(error.code)
+        item.reponse, item.state = unchanged, "done"
+        return True
+    method_changed = False
+    while True:
+        payload = {
+            "messages": change,
+            "tools": [],
+            "profile": painter_profile,
+            "max_tokens": painter.MAX_TOKENS,
+            "produces_files": True,
+            "timeout": min(seconds, 290.0),
+            "budget_eur": _budget(spend.remaining()),
+            "single_attempt": True,
+            "local_enabled": False,
+        }
+        try:
+            reply = await (complete or _gateway)(payload, seconds + 10)
+        except Exception as error:  # noqa: BLE001 - unchanged picture, or D5 refusal
+            code = _code(error)
+            if code in REFUSALS:
+                # The whole allowance was offered to this one call: a cost or
+                # quota refusal is the user's (D5), said with its measurements.
+                raise
+            item.erreurs.append("picture_change_" + code)
+            item.reponse, item.state = unchanged, "done"
+            return True
+        spend.settle(reply)
+        item.cout_eur = float(spend.total)
+        item.tokens = {"in": spend.tokens_in, "out": spend.tokens_out}
+        svg, how = salvage(extract_svg(str(reply.get("text") or "")))
+        if svg is None:
+            item.erreurs.append("picture_change_" + how.split(" ")[0])
+            item.reponse, item.state = unchanged, "done"
+            return True
+        try:
+            result = await run_job(
+                "draft",
+                {
+                    "svg": svg,
+                    "checklist": picture_set.checklist,
+                    "living": picture_set.living,
+                    "animal_kit": animal_kit_enabled(),
+                    "bounded_contours": bounded_contours_enabled(),
+                    "labels_group": painter.labels_group(picture_set.checklist),
+                },
+            )
+        except PictureJobError as error:
+            item.erreurs.append("picture_change_" + str(error))
+            item.reponse, item.state = unchanged, "done"
+            return True
+        prepared = prepare(
+            Block("svg", result["svg"], True), picture_set.title, picture_set.language
+        )
+        if prepared.problems:
+            item.erreurs.append("picture_change_invalid")
+            item.reponse, item.state = unchanged, "done"
+            return True
+        if previous.content != prepared.document.encode("utf-8"):
+            break
+        # The drawing came back identical: no new version, no claimed change.
+        item.erreurs.append("picture_change_identical")
+        left = limit - (time.monotonic() - started) - 40.0
+        if redrawn or left < REDRAW_MIN_SECONDS:
+            # Already drawn again from the request, or no time to: said
+            # plainly, with what was tried, never a request to say again the
+            # correction the person already gave.
             item.reponse = text(
-                language, "same_drawing", version=picture_set.artifact_version
+                language,
+                "same_drawing_again" if method_changed else "same_drawing",
+                version=picture_set.artifact_version,
             )
             item.state = "done"
             return True
+        # The painter gave its own drawing back unchanged to a correction
+        # (staging -185: a counted correction answered twice with "came back
+        # identical, tell me what should change"). The method changes once:
+        # the picture is drawn again from the first request with the
+        # correction, which never starts from the drawing that kept the fault.
+        change, redrawn = redraw_messages(picture_set, wanted), True
+        method_changed = True
+        seconds = max(30.0, min(240.0, left))
+        await _status("changing", language)
+    try:
         stored = artifact_store.update(
             picture_set.artifact_id,
             owner,
@@ -241,7 +275,14 @@ async def process_picture_followup(
     picture_set.current_source = str(result.get("source") or svg)
     picture_set.image_key = image.rsplit("/", 1)[-1]
     await asyncio.to_thread(store.update, picture_set)
-    lines = [text(language, "redrawn" if redrawn else "changed")]
+    lines = [
+        text(
+            language,
+            "redrawn_after_same"
+            if method_changed
+            else ("redrawn" if redrawn else "changed"),
+        )
+    ]
     lines.append(f"![{picture_set.title}]({image})")
     lines.append(
         footer(

@@ -561,15 +561,25 @@ def repair_fits(tools: Any, publication_seconds: float) -> bool:
     return float(deadline) - time.monotonic() >= needed
 
 
-def keep_for_delivery(tools: Any, publication_seconds: float) -> bool:
+def keep_for_delivery(
+    tools: Any, publication_seconds: float, revision: dict[str, Any] | None = None
+) -> bool:
     """Publish this file with its gaps named when no repair fits in the turn.
 
     A refusal with no time left to repair ended the turn on its time limit
     with nothing delivered (staging -184: deck, three-page PDF, SVG file). The
     gaps still reach the answer (deliverable_check.decide's note): the file
     is delivered and what it lacks is said. Returns True when it decided so.
+
+    A new version identical to the current one is never kept this way: the
+    person already has that file, so delivering it again delivers nothing,
+    and the answers announced it as the change asked (staging -185, class
+    suite: corrections and complaints on decks and PDFs came back byte for
+    byte the same, three turns in a row). It is refused once, as before.
     """
     if getattr(tools, "deliverable_refused", False) is True:
+        return False
+    if isinstance(revision, dict) and revision.get("identical"):
         return False
     if repair_fits(tools, publication_seconds):
         return False
@@ -818,7 +828,7 @@ async def publish(
         checked = await review(document)
     # A repair that cannot fit in the turn is not asked: the file is
     # published with its gaps named (keep_for_delivery).
-    keep_for_delivery(tools, time.monotonic() - began)
+    keep_for_delivery(tools, time.monotonic() - began, revision)
     expectations.document_refusal(tools, ledger_results, checked.gaps)
     ledger_gaps = expectations.document_gaps(tools, ledger_results)
     if ledger_gaps:

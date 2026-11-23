@@ -133,6 +133,42 @@ class TurnTimeTests(unittest.TestCase):
         note = deliverable_check.decide(tools, outcome)
         self.assertIn("slide 3 has two bullets", note)
 
+    def test_an_identical_version_is_refused_even_late(self) -> None:
+        """Staging -185: a correction came back byte for byte the same file and
+        was delivered as the change; it is refused once, whatever the time."""
+        tools = SimpleNamespace(
+            deliverable_refused=False,
+            turn_deadline=time.monotonic() + 30,
+            writing_seconds=90.0,
+        )
+        self.assertFalse(project_document_tools.repair_fits(tools, 20))
+        same = {"identical": True, "removed": [], "replaced": [], "added": []}
+        self.assertFalse(project_document_tools.keep_for_delivery(tools, 20, same))
+        self.assertFalse(tools.deliverable_refused)
+        outcome = deliverable_check.Outcome(
+            gaps=[deliverable_check.IDENTICAL.format(name="harbour-lanterns.pptx")]
+        )
+        outcome.certain = list(outcome.gaps)
+        with self.assertRaises(ValueError):
+            deliverable_check.decide(tools, outcome)
+        # The repair came back identical again: published, the gap said.
+        self.assertFalse(project_document_tools.keep_for_delivery(tools, 20, same))
+        self.assertIn("identical", deliverable_check.decide(tools, outcome))
+        # A changed version late in the turn is still kept for delivery.
+        late = SimpleNamespace(
+            deliverable_refused=False,
+            turn_deadline=time.monotonic() + 30,
+            writing_seconds=90.0,
+        )
+        changed = {
+            "identical": False,
+            "removed": ["Old line"],
+            "replaced": [],
+            "added": [],
+        }
+        with self.assertLogs(project_document_tools.__name__, "WARNING"):
+            self.assertTrue(project_document_tools.keep_for_delivery(late, 20, changed))
+
 
 class PublicationTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:

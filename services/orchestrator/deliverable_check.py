@@ -659,6 +659,65 @@ def title_gaps(content: Any, name: str = "") -> list[str]:
     return [FILE_NAME_TITLE.format(title=title)] if slug_like(title, stem) else []
 
 
+ASKED_TITLE = (
+    'the title asked is "{asked}" but the file\'s title is "{title}": the '
+    "document's title (the title argument, shown first in the file) must be "
+    '"{asked}"; a section heading below it is not the title'
+)
+# A text in quotes: straight, curly, guillemets or German low quotes. A
+# straight apostrophe closes only before a non-letter ("Tom's" stays inside).
+QUOTED = re.compile(
+    r'"([^"\n]{2,160})"|\u201c([^\u201d\n]{2,160})\u201d'
+    r"|\u00ab\s*([^\u00bb\n]{2,160}?)\s*\u00bb|\u201e([^\u201c\u201d\n]{2,160})[\u201c\u201d]"
+    r"|\u2018([^\u2019\n]{2,160})\u2019|'([^\n]{2,160}?)'(?![^\W\d_])"
+)
+# The document's own title, named with the text it must be: "title it 'X'",
+# "change the title to 'X'", "titre « X »", "mit dem Titel „X“". A part's
+# title ("the title of slide 3", "le titre de la section 2") is not the
+# document's; a subtitle neither.
+_TITLE_ASKED = re.compile(
+    r"(?<![\w-])(?:title[sd]?|titre|intitul\w*|titel|betitel\w*|t[ií]tulo|titul\w*"
+    r"|titolo|intitol\w*)\b"
+    r"(?P<between>(?:\W+(?!(?:of|de|du|des|der|des|von|del|della|dello|di|for|pour)\b)"
+    r"[^\W\d_]+){0,4}?)\W*(?=[\"\u201c\u00ab\u201e\u2018'])",
+    re.IGNORECASE,
+)
+
+
+def quoted(text: str) -> list[str]:
+    """The texts in quotes of a message, in order."""
+    return [
+        next(group for group in match.groups() if group is not None).strip()
+        for match in QUOTED.finditer(text)
+    ]
+
+
+def asked_title(request: str) -> str:
+    """The document title the person gives in this message, "" when none."""
+    for match in _TITLE_ASKED.finditer(request):
+        found = QUOTED.match(request, match.end())
+        if found is not None:
+            return next(g for g in found.groups() if g is not None).strip()
+    return ""
+
+
+def asked_title_gaps(request: object, content: Any) -> list[str]:
+    """The title the person names is the file's title (staging -185).
+
+    "Change the title to 'X'" on a Word report changed the first section
+    heading below the title: the file showed the words asked, the check's gap
+    was dropped as shown in the file, and the old title stayed. The title is
+    measured here, on the built content, for every format that has one.
+    """
+    title = getattr(content, "title", None)
+    if not isinstance(request, str) or not isinstance(title, str):
+        return []
+    asked = asked_title(request)
+    if len(_squashed(asked)) < 2 or _squashed(asked) == _squashed(title):
+        return []
+    return [ASKED_TITLE.format(asked=asked, title=title)]
+
+
 def unit_gaps(tools: Any, content: Any, preview: bytes) -> list[str]:
     """A figure keeps the unit and currency of its source (figure_units.py),
     and what it counts (figure_nouns.py).
@@ -1064,6 +1123,22 @@ def _squashed(text: str) -> str:
     return "".join(ch for ch in text.casefold() if ch.isalnum())
 
 
+def _stale(gap: str, missing: str, shown_text: str) -> bool:
+    """Whether a gap quotes another text that the file still shows.
+
+    Such a gap is a replacement not made or text in the wrong place ("the
+    title still reads 'A'; it should be 'B'"), not an absence: the words asked
+    being somewhere in the file is no evidence against it (staging -185).
+    """
+    wanted = _squashed(missing)
+    for text in quoted(gap):
+        other = _squashed(text)
+        if len(other) >= 3 and other != wanted and wanted not in other:
+            if other in shown_text:
+                return True
+    return False
+
+
 def gaps_of(reply: str, text: str = "") -> list[str] | None:
     """The gaps of a reply, or None when it is not the expected JSON.
 
@@ -1099,6 +1174,7 @@ def gaps_of(reply: str, text: str = "") -> list[str] | None:
             and len(_squashed(missing)) >= 2
             and shown_text
             and _squashed(missing) in shown_text
+            and not _stale(gap, missing, shown_text)
         ):
             dropped += 1
             continue
@@ -1160,6 +1236,7 @@ async def review(
         + title_gaps(content, name)
         + quote_gaps(tools, content, preview)
         + restated_gaps(suffix, content, name)
+        + asked_title_gaps(getattr(tools, "request_text", ""), content)
         + form_gaps(suffix, content, raw, pictures)
         + (found_details := detail_gaps(tools, suffix, raw, sources, name))[0]
     )

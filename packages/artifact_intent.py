@@ -46,7 +46,18 @@ _SVG = re.compile(r"\bsvg\b")
 _SHOW = re.compile(
     r"\b(?:affiche\w*|montre\w*|show|display|render|zeige\w*|muestra\w*|mostra\w*)\b"
 )
-_TITLE_REQUEST = re.compile(r"\b(?:title|titre|titel|titulo|titolo)\b")
+# A request for a title ("suggest a title for a landing page") is a text for
+# the chat. A title the person gives for the app ("put the title 'X' at the
+# top") is part of the app: staging -185, with the routing call timed out, an
+# app request that named its title was answered as code in the chat.
+_TITLE_REQUEST = re.compile(
+    r"\b(?:suggest\w*|propos\w*|find|give me|write|invent\w*|need|want|ideas? for"
+    r"|ecris|ecrire|trouve\w*|donne\w*|sugger\w*|cherche\w*|idees? de"
+    r"|schreib\w*|schlag\w*|finde\w*|gib mir|erfind\w*|brauche"
+    r"|escrib\w*|propon\w*|sugier\w*|busca\w*|dame|necesito"
+    r"|scriv\w*|suggerisc\w*|trova\w*|dammi)"
+    r"\b(?:\W+\w+){0,3}?\W+(?:titles?|titres?|titel|titulos?|titol[oi])\b"
+)
 _PROJECT_OR_CODE_MODE = re.compile(
     r"\b(?:project|projet|projekt|proyecto|progetto|code mode|mode code"
     r"|api key|cle api|api-schlussel|clave api|chiave api)\b"
@@ -102,8 +113,13 @@ _CHECK = re.compile(
 # question. Staging -184 (class suite): such follow-ups to the conversation's
 # app were read as questions about it when the routing call had timed out, and
 # a plain answer claimed a change that was never made.
+# A greeting may open the request ("salut ! tu peux me faire ...?").
+_GREETING = (
+    r"(?:(?:hi|hello|hey|hiya|salut|bonjour|bonsoir|coucou|hallo|servus|moin"
+    r"|hola|buenas|ciao|salve|buongiorno)(?:\W+(?:there|toi|a toi|zusammen))?\W+)?"
+)
 _POLITE = re.compile(
-    r"^\W*(?:(?:please|pls|bitte|stp|svp|por favor|per favore)\W+)?"
+    r"^\W*" + _GREETING + r"(?:(?:please|pls|bitte|stp|svp|por favor|per favore)\W+)?"
     r"(?:can you|could you|would you|will you|can u"
     r"|kannst du|konntest du|konnen sie|konnten sie|wurdest du"
     r"|peux[- ]tu|pourrais[- ]tu|pouvez[- ]vous|pourriez[- ]vous|tu peux|tu pourrais"
@@ -157,6 +173,17 @@ def app_intent(text: str, history: Sequence[Mapping[str, object]]) -> Intent | N
     return None if plain_writing(normalized) else "available"
 
 
+# The infinitive a request worded as a question takes ("tu peux me faire",
+# "kannst du ... bauen", "puedes hacer"): a request only with the app named.
+_BUILD_INFINITIVE = re.compile(
+    r"\b(?:faire|creer|construire|coder|programmer|developper|ecrire|generer"
+    r"|preparer|put together|whip up|code up"
+    r"|machen|bauen|erstellen|programmieren|schreiben|basteln|entwickeln"
+    r"|hacer|crear|construir|programar|escribir|preparar|desarrollar"
+    r"|fare|creare|costruire|programmare|scrivere|preparare|sviluppare)\b"
+)
+
+
 def _polite_request(normalized: str, has_artifact: bool) -> bool:
     """A request worded as a question ("can you add ...?") that asks to do.
 
@@ -167,6 +194,10 @@ def _polite_request(normalized: str, has_artifact: bool) -> bool:
     if _POLITE.search(normalized) is None:
         return False
     if _CHANGE.search(normalized) or _ACTION.search(normalized):
+        return True
+    if _BUILD_INFINITIVE.search(normalized) and _APP.search(normalized):
+        # "Tu peux me faire une appli ...?": the infinitive of a building
+        # verb, with the app it builds named.
         return True
     return has_artifact and bool(_APP.search(normalized) and _CHECK.search(normalized))
 

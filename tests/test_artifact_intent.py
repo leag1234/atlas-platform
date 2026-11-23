@@ -170,3 +170,43 @@ class SvgIntentTests(unittest.TestCase):
         self.assertIsNone(
             app_intent("affiche-le ici", [{"role": "assistant", "content": "Bonjour"}])
         )
+
+
+class GreetedRequestTests(unittest.TestCase):
+    """Staging -185: with the routing call timed out, an app request worded as a
+    question after a greeting, built with an infinitive and naming the app's
+    title, was answered as code in the chat and no app was stored."""
+
+    def test_a_greeted_question_that_builds_an_app_creates_it(self) -> None:
+        requests = (
+            "salut ! tu peux me faire une petite appli pour compter les tours "
+            "de piste ? mets le titre « Tours Express » en haut stp",
+            "hello, could you build a tiny quiz about rivers? put the title "
+            "'River Run' at the top",
+            "Hallo! Kannst du mir ein kleines Spiel bauen, mit dem Titel "
+            "„Sternensammler“?",
+            "hola, ¿puedes hacer una calculadora de propinas con el título "
+            "«Propina Fácil»?",
+            "ciao! potresti creare un timer per la pasta? titolo «Al Dente» in alto",
+            "coucou, vous pouvez me coder un minuteur pour les œufs ?",
+        )
+        for text in requests:
+            with self.subTest(text=text):
+                self.assertEqual(app_intent(text, ()), "create")
+                # After an app it reaches the app path too, never the chat.
+                self.assertIn(app_intent(text, HISTORY), ("available", "modify"))
+
+    def test_greeted_questions_and_title_requests_stay_chat(self) -> None:
+        requests = (
+            "salut ! tu peux me faire un résumé de ce texte ?",
+            "bonjour, tu peux me dire ce qu'est une application web ?",
+            "hi, can you tell me what a dashboard is?",
+            "Propose-moi un titre pour mon jeu de cartes",
+            "Give me a title for my quiz app",
+            "Schlag mir einen Titel für mein Spiel vor",
+            "Dame un título para mi juego",
+            "Suggeriscimi un titolo per il mio quiz",
+        )
+        for text in requests:
+            with self.subTest(text=text):
+                self.assertIsNone(app_intent(text, ()))
