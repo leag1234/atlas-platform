@@ -29,7 +29,7 @@ are privileged access, not a guest isolation boundary.
    export WEB_SERVER_IP=WEB_SERVER_PUBLIC_IP
    git -C repo fetch --tags origin
    git -C repo show-ref --verify "refs/tags/$TAG"
-   gh -R leag1234/atlas run list --commit "$(git -C repo rev-parse "refs/tags/$TAG")" --status success
+   gh -R leag1234/atlas-platform run list --commit "$(git -C repo rev-parse "refs/tags/$TAG")" --status success
    ```
 
    Expected: the exact tag commit and a successful **CI** workflow URL matching that
