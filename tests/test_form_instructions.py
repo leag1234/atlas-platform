@@ -8,6 +8,7 @@ Fictional content only.
 """
 
 import tempfile
+from typing import Any
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -75,8 +76,8 @@ class RunningFooterTests(unittest.TestCase):
         self.assertEqual(back.footer, "Thursday studio, room B")
         for section in back.sections:
             self.assertNotIn("Thursday studio, room B", section.paragraphs)
-        for page in measure(raw).pages:
-            self.assertFalse(any("Thursday" in line.text for line in page.lines))
+        for printed in measure(raw).pages:
+            self.assertFalse(any("Thursday" in line.text for line in printed.lines))
         self.assertIn(
             "\\footer Thursday studio, room B", readback.editable(back)["content"]
         )
@@ -150,10 +151,11 @@ class BoxToTickTests(unittest.TestCase):
         boxes = [p for p in document.paragraphs if p.text.startswith((BOX, TICKED))]
         self.assertEqual(len(boxes), 2)
         for paragraph in boxes:
-            number = paragraph._p.pPr.numPr.numId.val
-            self.assertEqual(number, 0)
+            properties: Any = paragraph._p.pPr
+            self.assertEqual(properties.numPr.numId.val, 0)
         plain = [p for p in document.paragraphs if p.text == "Cut the block in two."]
-        self.assertIsNone(plain[0]._p.pPr.numPr)
+        properties = plain[0]._p.pPr
+        self.assertIsNone(None if properties is None else properties.numPr)
         bullets = readback.read(path.read_bytes(), ".docx").sections[-1].bullets
         self.assertEqual(
             bullets,
