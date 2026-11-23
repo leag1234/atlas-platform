@@ -41,6 +41,7 @@ CREATE TABLE IF NOT EXISTS scores (
   attempts INTEGER NOT NULL DEFAULT 0,
   error TEXT NOT NULL DEFAULT '',
   task_type TEXT NOT NULL DEFAULT '',
+  automated INTEGER NOT NULL DEFAULT 0,
   artifacts INTEGER NOT NULL DEFAULT 0,
   latency_s REAL
 );
@@ -166,6 +167,16 @@ def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "by_task_type": {
             k: {"n": len(v), "mean": round(statistics.fmean(v), 2)}
             for k, v in sorted(by_task.items())
+        },
+        "by_account": {
+            kind: {
+                "n": len(v),
+                "mean": round(statistics.fmean(v), 2) if v else None,
+            }
+            for kind, v in (
+                ("human", [int(r["score"]) for r in scored if not r["automated"]]),
+                ("automated", [int(r["score"]) for r in scored if r["automated"]]),
+            )
         },
         "cost_eur": round(sum(float(r["cost_eur"] or 0) for r in rows), 4),
     }

@@ -40,18 +40,23 @@ per minor defect, two to four per major one, 0 to 3 for a failed request, invent
 that matter or a claim without the deed. The defect classes are C1 to C15 of
 `frontier_judge/rubrics.json` and C16 to C19 of the class battery. C19 (slow answer) is
 added by code when the answer took more than 240 s. An empty answer scores 0 (C5)
-without a call. Scores below 5 get a second opinion from `gpt-6.2-astra` while the day's
-spend is under 60 % of the daily cap; the arbiter's grade is then the one shown (the
-first one is kept).
+without a call. A second opinion of `gpt-6.2-astra` on scores below 5 exists but is off
+by default (`ATLAS_LIVE_JUDGE_SECOND=1` turns it on; it then runs while the day's spend
+is under 60 % of the daily cap and its grade is the one shown).
 
 ## Spend
 
 Every call is reserved and settled in the offline judge's ledger
-(`/opt/atlas-src/eval/frontier-judge/ledger.jsonl`), so the monthly cap (150 EUR,
-`frontier_judge/models.json`) is shared. The daily cap is the ledger run cap of the run
-`live-judge-<UTC day>`: `ATLAS_LIVE_JUDGE_DAILY_EUR`, default 5 EUR. Once it is reached
-the answer is stored as `budget` and the interface shows "rating paused (budget)".
-`backfill` uses its own run and its own cap (default 2 EUR).
+(`/opt/atlas-src/eval/frontier-judge/ledger.jsonl`), whose monthly cap (150 EUR,
+`frontier_judge/models.json`) is shared. The live judge stops for the month when that
+ledger reaches 120 EUR (`ATLAS_LIVE_JUDGE_MONTH_STOP_EUR`), keeping a reserve for the
+offline judge. The daily cap is the ledger run cap of the run `live-judge-<UTC day>`:
+`ATLAS_LIVE_JUDGE_DAILY_EUR` (staging: 3 EUR). Answers of automated test accounts
+(`ATLAS_LIVE_JUDGE_TEST_ACCOUNTS`, name or address prefixes) are queued after the
+people's and judged only while the day's spend is under half of the cap
+(`ATLAS_LIVE_JUDGE_TEST_SHARE`), so the people's answers are scored first. Once a cap
+is reached the answer is stored as `budget` and the interface shows "rating paused
+(budget)". `backfill` uses its own run and its own cap (default 2 EUR).
 
 ## Store and history
 

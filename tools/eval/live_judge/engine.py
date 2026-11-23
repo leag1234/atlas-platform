@@ -47,8 +47,11 @@ class Config:
     usd_to_eur: float
     bulk_model: str
     arbiter_model: str
+    second_enabled: bool
     second_below: int
     second_share: float
+    test_accounts: tuple[str, ...]
+    test_share: float
     workers: int
     poll_seconds: float
 
@@ -84,12 +87,24 @@ class Config:
             chat_ui_url=AtlasPorts(base).url("chat_ui"),
             port=int(env.get("ATLAS_LIVE_JUDGE_PORT") or PORT_OFFSET + base),
             daily_cap_eur=float(env.get("ATLAS_LIVE_JUDGE_DAILY_EUR") or 5.0),
-            month_cap_eur=float(table["caps_eur"]["month"]),
+            # The live judge stops for the month below the shared cap, so the offline
+            # judge keeps a reserve (owner, 2026-11-23: stop at 120 of 150 EUR).
+            month_cap_eur=min(
+                float(table["caps_eur"]["month"]),
+                float(env.get("ATLAS_LIVE_JUDGE_MONTH_STOP_EUR") or 120.0),
+            ),
             usd_to_eur=float(table["usd_to_eur"]),
             bulk_model=str(table["roles"]["bulk"]),
             arbiter_model=str(table["roles"]["arbiter"]),
+            second_enabled=env.get("ATLAS_LIVE_JUDGE_SECOND") == "1",
             second_below=int(env.get("ATLAS_LIVE_JUDGE_SECOND_BELOW") or 5),
             second_share=float(env.get("ATLAS_LIVE_JUDGE_SECOND_SHARE") or 0.6),
+            test_accounts=tuple(
+                p.strip().lower()
+                for p in env.get("ATLAS_LIVE_JUDGE_TEST_ACCOUNTS", "").split(",")
+                if p.strip()
+            ),
+            test_share=float(env.get("ATLAS_LIVE_JUDGE_TEST_SHARE") or 0.5),
             workers=int(env.get("ATLAS_LIVE_JUDGE_WORKERS") or 3),
             poll_seconds=float(env.get("ATLAS_LIVE_JUDGE_POLL") or 10),
         )
@@ -170,6 +185,7 @@ class Engine:
             "version": version_tag(),
             "answered_at": float(end),
             "task_type": str(meta.get("task_type") or ""),
+            "automated": int(self.automated(answer)),
             "latency_s": round(float(end) - answer.created_at, 1)
             if answer.created_at
             else None,
@@ -215,6 +231,13 @@ class Engine:
         self.store.put(record)
         ledger = self.ledger()
         key = f"{answer.message_id}:{record['attempts']}"
+        if record["automated"] and not self._test_allowed(ledger):
+            # Human answers first: automated test accounts use only part of the day's cap.
+            record.update(
+                state="budget", error="daily share of automated accounts reached"
+            )
+            self.store.put(record)
+            return record
         try:
             first = judge.grade(
                 self.http,
@@ -238,7 +261,11 @@ class Engine:
             self.store.put(record)
             return record
         final = first
-        if first.score < self.cfg.second_below and self._second_allowed(ledger):
+        if (
+            self.cfg.second_enabled
+            and first.score < self.cfg.second_below
+            and self._second_allowed(ledger)
+        ):
             try:
                 second = judge.grade(
                     self.http,
@@ -267,6 +294,15 @@ class Engine:
         )
         self.store.put(record)
         return record
+
+    def automated(self, answer: source.Answer) -> bool:
+        """An answer of an automated test account (prefixes from ATLAS_LIVE_JUDGE_TEST_ACCOUNTS)."""
+        words = [w.split("@")[0] for w in answer.account.split()]
+        return any(w.startswith(p) for w in words for p in self.cfg.test_accounts)
+
+    def _test_allowed(self, ledger: Ledger) -> bool:
+        _month, run = ledger.totals()
+        return run < self.cfg.test_share * self.run_cap_eur
 
     def _second_allowed(self, ledger: Ledger) -> bool:
         _month, run = ledger.totals()
@@ -310,7 +346,8 @@ class Engine:
         finally:
             db.close()
         started = 0
-        for answer in answers:
+        # Human answers are queued before those of automated test accounts.
+        for answer in sorted(answers, key=self.automated):
             if self.due(answer, epoch) and self.submit(pool, answer):
                 started += 1
         if answers:

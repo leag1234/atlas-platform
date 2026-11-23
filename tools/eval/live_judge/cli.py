@@ -104,6 +104,7 @@ def cmd_backfill(args: argparse.Namespace) -> int:
         run_id=lambda: f"live-judge-backfill-{stamp}",
         run_cap_eur=args.cap,
     )
+    todo.sort(key=eng.automated)
     done = budget = 0
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
         for record in pool.map(eng.judge_one, todo):

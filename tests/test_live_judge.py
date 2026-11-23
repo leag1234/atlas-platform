@@ -45,11 +45,15 @@ def _owui(path: Path) -> sqlite3.Connection:
         CREATE TABLE chat_message (id TEXT PRIMARY KEY, chat_id TEXT, user_id TEXT, role TEXT,
           parent_id TEXT, content JSON, output JSON, model_id TEXT, files JSON, done BOOLEAN,
           usage JSON, meta JSON, created_at BIGINT, updated_at BIGINT);
+        CREATE TABLE "user" (id TEXT PRIMARY KEY, email TEXT, name TEXT);
         CREATE TABLE file (id TEXT PRIMARY KEY, user_id TEXT, filename TEXT, meta JSON,
           data JSON, path TEXT);
         """
     )
     db.execute("INSERT INTO chat VALUES (?, ?)", (CHAT, OWNER))
+    db.execute(
+        'INSERT INTO "user" VALUES (?, ?, ?)', (OWNER, "reader@example.test", "Reader")
+    )
     return db
 
 
@@ -172,8 +176,11 @@ class LiveJudgeTest(unittest.TestCase):
             usd_to_eur=1.0,
             bulk_model=str(table["roles"]["bulk"]),
             arbiter_model=str(table["roles"]["arbiter"]),
+            second_enabled=False,
             second_below=5,
             second_share=0.6,
+            test_accounts=("probe-",),
+            test_share=0.5,
             workers=1,
             poll_seconds=1,
         )
@@ -378,6 +385,7 @@ class LiveJudgeTest(unittest.TestCase):
 
     def test_low_score_gets_the_arbiter(self) -> None:
         eng = self.engine()
+        eng.cfg.second_enabled = True
         FakeResponses.scores = {eng.cfg.bulk_model: 3, eng.cfg.arbiter_model: 4}
         record = eng.judge_one(self.conversation())
         self.assertEqual(
@@ -385,6 +393,66 @@ class LiveJudgeTest(unittest.TestCase):
             [eng.cfg.bulk_model, eng.cfg.arbiter_model],
         )
         self.assertEqual((record["score"], record["first_score"]), (4, 3))
+
+    def test_arbiter_off_and_month_stop_by_default(self) -> None:
+        cfg = engine.Config.from_env(STAGING_ENV)
+        self.assertFalse(cfg.second_enabled)
+        self.assertEqual(cfg.month_cap_eur, 120.0)
+        self.assertEqual(cfg.test_accounts, ())
+        staging = guard.parse_env((REPO / "infra/instances/staging.env").read_text())
+        self.assertEqual(staging["ATLAS_LIVE_JUDGE_DAILY_EUR"], "3")
+        eng = self.engine()
+        FakeResponses.scores = {eng.cfg.bulk_model: 2}
+        record = eng.judge_one(self.conversation())
+        self.assertEqual((record["score"], len(FakeResponses.calls)), (2, 1))
+
+    def test_month_stop_keeps_the_offline_reserve(self) -> None:
+        eng = self.engine()
+        eng.cfg.month_cap_eur = 120.0
+        month = time.strftime("%Y-%m", time.gmtime())
+        entry = {
+            "kind": "spend",
+            "key": "offline",
+            "run": "offline-run",
+            "month": month,
+            "eur": 119.999,
+            "usd": 119.999,
+        }
+        eng.cfg.ledger_path.write_text(json.dumps(entry) + "\n")
+        record = eng.judge_one(self.conversation())
+        self.assertEqual(record["state"], "budget")
+        self.assertEqual(FakeResponses.calls, [])
+
+    def test_people_before_automated_accounts(self) -> None:
+        self.db.execute(
+            'UPDATE "user" SET email = ? WHERE id = ?', ("probe-7@example.test", OWNER)
+        )
+        self.db.commit()
+        eng = self.engine(daily=0.02)
+        answer = self.conversation()
+        self.assertTrue(eng.automated(answer))
+        month = time.strftime("%Y-%m", time.gmtime())
+        entry = {
+            "kind": "spend",
+            "key": "k",
+            "run": eng.run_id(),
+            "month": month,
+            "eur": 0.011,
+            "usd": 0.011,
+        }
+        eng.cfg.ledger_path.write_text(json.dumps(entry) + "\n")
+        record = eng.judge_one(answer)
+        self.assertEqual((record["state"], record["automated"]), ("budget", 1))
+        self.assertEqual(FakeResponses.calls, [])
+        self.db.execute(
+            'UPDATE "user" SET email = ? WHERE id = ?', ("reader@example.test", OWNER)
+        )
+        self.db.commit()
+        human = self.one("m4")
+        assert human is not None
+        self.assertFalse(eng.automated(human))
+        eng.run_cap_eur = 1.0
+        self.assertEqual(eng.judge_one(human)["state"], "scored")
 
     def test_daily_cap_suspends_without_sending(self) -> None:
         eng = self.engine(daily=0.0001)

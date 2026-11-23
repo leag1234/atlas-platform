@@ -46,6 +46,7 @@ class Answer:
     started_at: float | None = None
     ended_at: float | None = None
     output_tokens: int | None = None
+    account: str = ""
 
     @property
     def user_hash(self) -> str:
@@ -148,13 +149,15 @@ def _answer(db: sqlite3.Connection, row: sqlite3.Row) -> Answer:
         started_at=meta.get("response_started_at") if isinstance(meta, dict) else None,
         ended_at=meta.get("response_ended_at") if isinstance(meta, dict) else None,
         output_tokens=usage.get("output_tokens") if isinstance(usage, dict) else None,
+        account=f"{row['email'] or ''} {row['name'] or ''}".strip().lower(),
     )
 
 
 SELECT = (
     "SELECT m.id, m.chat_id, m.user_id, m.parent_id, m.content, m.model_id, m.meta, "
-    "m.usage, m.created_at, m.updated_at, c.user_id AS owner "
+    "m.usage, m.created_at, m.updated_at, c.user_id AS owner, u.email, u.name "
     "FROM chat_message m JOIN chat c ON c.id = m.chat_id "
+    'LEFT JOIN "user" u ON u.id = c.user_id '
 )
 
 
