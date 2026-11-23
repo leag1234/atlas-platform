@@ -16,7 +16,17 @@ from typing import Any
 
 from .cells import shown
 
-EXTENSIONS = (".pptx", ".docx", ".xlsx", ".pdf", ".md", ".csv", ".txt", ".html")
+EXTENSIONS = (
+    ".pptx",
+    ".docx",
+    ".xlsx",
+    ".pdf",
+    ".md",
+    ".csv",
+    ".txt",
+    ".html",
+    ".svg",
+)
 LETTERS = re.compile(r"[^\W\d_]")
 COPY = re.compile(r"\s\(\d+\)(?=(?:\.[A-Za-z]{2,4})?$)")
 

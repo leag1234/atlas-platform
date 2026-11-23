@@ -66,6 +66,7 @@ class RetrievalReopenTests(unittest.TestCase):
                 ".csv": "text/csv",
                 ".txt": "text/plain",
                 ".html": "text/html",
+                ".svg": "image/svg+xml",
             },
         )
         self.assertEqual(reopen_artifact(b"a,b\n1,2\n", ".csv"), b"a,b\n1,2\n")

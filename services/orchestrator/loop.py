@@ -61,6 +61,19 @@ from services.guardrails.input_filter import validate_input
 LONG_TOOL_SECONDS = {"make_pictures": 900.0}
 
 
+def turn_time(tools: object, left: float, writing: float) -> None:
+    """Record on the Work tools the turn's end and the last writing call's time.
+
+    The end is kept on the monotonic clock whatever clock the loop runs on
+    (tests inject their own). Tools that take no attribute are left alone.
+    """
+    try:
+        setattr(tools, "turn_deadline", time.monotonic() + max(0.0, left))
+        setattr(tools, "writing_seconds", max(0.0, writing))
+    except AttributeError:
+        pass
+
+
 def error_word(code: object) -> str | None:
     """The first word of a tool error message that is not itself a code.
 
@@ -704,6 +717,10 @@ async def run(
                             }
                         )
                     )
+                    # What a publication needs to know before it refuses its
+                    # file for a repair: the time the turn has left and what
+                    # writing the file took (project_document_tools.repair_fits).
+                    turn_time(tools, deadline - clock(), clock() - call_started)
                 else:
                     logging.getLogger(__name__).warning(
                         json.dumps(

@@ -94,6 +94,7 @@ from services.orchestrator.image_tool import (
 )
 from services.orchestrator.daily_budget import BudgetRefusal, DailyLedger
 from packages.artifact_intent import app_intent, svg_requested
+from packages.text_deliverables import names_markup_file
 from services.orchestrator.artifact_tools import current_artifact_message
 from services.orchestrator.app_turn import process_app_turn
 from services.orchestrator.appearance import (
@@ -3123,7 +3124,7 @@ async def _process(
                 request.user_text,
                 re.I,
             )
-        )
+        ) or names_markup_file(request.user_text)
         file_recovery_attempted = False
         file_recovery_failed = False
         if structured_presentation and tools.terminal is not None:

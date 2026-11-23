@@ -36,7 +36,7 @@ MAX_CELLS = 200_000
 MAX_PAGES = 300
 # The comparison works on words; beyond this many, on lines (cheaper, coarser).
 MAX_WORDS = 12_000
-TEXT_SUFFIXES = frozenset({".md", ".csv", ".txt", ".html"})
+TEXT_SUFFIXES = frozenset({".md", ".csv", ".txt", ".html", ".svg"})
 SUFFIXES = frozenset({".docx", ".pptx", ".xlsx", ".pdf", *TEXT_SUFFIXES})
 PICTURE = "[picture]"
 # The line of publish_document's Markdown that starts a new page.

@@ -177,6 +177,61 @@ def _item_key(item: Item, style: str) -> str:
     return hashlib.sha256(normal(item.label).encode()).hexdigest()
 
 
+def _same_item(label: str, other: str) -> bool:
+    """Two labels of one item: the words of one are all among the other's.
+
+    A follow-up plans the items of the same file in other words ("close-up of
+    the folded sheet with holes" for "folded sheet with holes"). Matched by
+    exact label only, the picture drawn before was drawn again, and the earlier
+    one was placed too: three pictures where two were asked (staging -184).
+    """
+    words, others = set(normal(label).split()), set(normal(other).split())
+    return bool(words and others) and (words <= others or others <= words)
+
+
+def _earlier_pictures(
+    items: list[Item], index: dict[str, dict[str, str]], folder: Path
+) -> dict[int, dict[str, str]]:
+    """Position of an item -> the picture this conversation drew for it.
+
+    The same label first; then a label in other words (_same_item), when it
+    pairs one item with one earlier picture only: an item that could be two
+    earlier pictures, or a picture two items could take, is drawn anew.
+    """
+
+    def drawn(entry: object) -> bool:
+        return (
+            isinstance(entry, dict)
+            and (folder / (str(entry.get("reference")) + ".jpg")).is_file()
+        )
+
+    found: dict[int, dict[str, str]] = {}
+    taken: set[str] = set()
+    for position, item in enumerate(items):
+        key = _item_key(item, "")
+        if key in index and drawn(index[key]):
+            found[position] = index[key]
+            taken.add(key)
+    candidates: dict[int, list[str]] = {}
+    for position, item in enumerate(items):
+        if position in found:
+            continue
+        candidates[position] = [
+            key
+            for key, entry in index.items()
+            if key not in taken
+            and drawn(entry)
+            and _same_item(item.label, str(entry.get("label", "")))
+        ]
+    for position, keys in candidates.items():
+        if len(keys) != 1:
+            continue
+        if sum(keys[0] in other for other in candidates.values()) != 1:
+            continue
+        found[position] = index[keys[0]]
+    return found
+
+
 def _index(folder: Path) -> dict[str, dict[str, str]]:
     try:
         value = json.loads((folder / "index.json").read_text())
@@ -340,13 +395,11 @@ async def execute(
     style = " ".join(request.style.split())
     results: list[dict[str, Any]] = []
     todo: list[tuple[int, Item, str]] = []
+    earlier = _earlier_pictures(list(request.items), index, folder)
     for position, item in enumerate(request.items):
         key = _item_key(item, style)
-        known = index.get(key)
-        if (
-            isinstance(known, dict)
-            and (folder / (str(known.get("reference")) + ".jpg")).is_file()
-        ):
+        known = earlier.get(position)
+        if known is not None:
             results.append(
                 dict(
                     label=item.label,
@@ -722,8 +775,10 @@ PLACE = (
     "that its picture will come."
 )
 EARLIER = (
-    " Pictures drawn earlier in this conversation, for items of the same "
-    "file: {pictures}. Place each one too, in the section of its item."
+    " Pictures drawn earlier in this conversation that the list above does "
+    "not hold: {pictures}. Place one only in the section of an item of the "
+    "file that has no picture above; never two pictures for one item, and "
+    "never more pictures than the request asks."
 )
 NO_PLAN = (
     "\n\nThe pictures this file needs could not be planned before you started. "

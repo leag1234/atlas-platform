@@ -142,6 +142,21 @@ def declarations() -> list[dict[str, object]]:
     ]
 
 
+# A named SVG file is published as its markup, like HTML (staging -184: the
+# format was missing, every attempt was refused as "Use Markdown content",
+# and the person got no file over four turns).
+DESCRIPTIONS["publish_document"] += (
+    " An SVG picture (.svg) is a text file too: send its complete markup as "
+    "content, one well-formed <svg> element with no DOCTYPE; the words it "
+    "must show are <text> elements inside it. It is delivered as a download."
+)
+PUBLISHED_SUFFIXES = (".docx", ".xlsx", ".pptx", ".pdf", *TEXT_MIMES)
+UNSUPPORTED_FORMAT = (
+    "unsupported_format: publish_document cannot write {suffix} files. It "
+    "writes {formats}: publish the file in one of them, or say plainly that "
+    "this format cannot be delivered."
+)
+
 UNKNOWN_REFERENCE = (
     "unknown_file_reference: file_id and version must be the two identifiers of "
     "one file of this session: the read_input that publish_document returned in "
@@ -339,6 +354,17 @@ async def execute(
         and isinstance(value, dict)
         and value.get("slides") is not None
     )
+    if name == "publish_document" and isinstance(value, dict):
+        # A format no publication writes is named as such: it was refused as
+        # "Use Markdown content for DOCX/PDF/XLSX", which the writer could not
+        # act on (staging -184, four refusals in a row).
+        asked = PurePosixPath(str(value.get("path", ""))).suffix.lower()
+        if asked and asked not in PUBLISHED_SUFFIXES:
+            raise ValueError(
+                UNSUPPORTED_FORMAT.format(
+                    suffix=asked, formats=", ".join(PUBLISHED_SUFFIXES)
+                )
+            )
     if name == "publish_document" and text_output(value):
         with explained(TextPublish):
             text_args = TextPublish.model_validate(value).model_dump(exclude_none=True)
@@ -510,6 +536,59 @@ def placed_pictures(tools: Any, content: Content) -> tuple[Content, dict[str, by
     return Content.model_validate(value), pictures
 
 
+# The publication itself (approval, upload, reopening, preview) keeps this
+# much of the tool's time: the checks share the rest. Staging -184: checks run
+# one after the other used the time to the end, and a rich deck came back with
+# no file at all after 4 min 15 s.
+PUBLISH_RESERVE_SECONDS = 25.0
+# A refusal asks for one more writing call and one more publication: it is
+# made only when the turn still has that time, with this margin.
+REPAIR_MARGIN_SECONDS = 15.0
+
+
+def repair_fits(tools: Any, publication_seconds: float) -> bool:
+    """Whether the turn has time left for the repair a refusal would ask.
+
+    The repair is the writing call again (as long as the one that wrote this
+    file, loop.turn_time) and this publication again. Without both measures
+    (outside a Work turn) a refusal stays possible, as before.
+    """
+    deadline = getattr(tools, "turn_deadline", None)
+    writing = getattr(tools, "writing_seconds", None)
+    if not isinstance(deadline, (int, float)) or not isinstance(writing, (int, float)):
+        return True
+    needed = float(writing) + max(0.0, publication_seconds) + REPAIR_MARGIN_SECONDS
+    return float(deadline) - time.monotonic() >= needed
+
+
+def keep_for_delivery(tools: Any, publication_seconds: float) -> bool:
+    """Publish this file with its gaps named when no repair fits in the turn.
+
+    A refusal with no time left to repair ended the turn on its time limit
+    with nothing delivered (staging -184: deck, three-page PDF, SVG file). The
+    gaps still reach the answer (deliverable_check.decide's note): the file
+    is delivered and what it lacks is said. Returns True when it decided so.
+    """
+    if getattr(tools, "deliverable_refused", False) is True:
+        return False
+    if repair_fits(tools, publication_seconds):
+        return False
+    tools.deliverable_refused = True
+    logging.getLogger(__name__).warning(
+        json.dumps(
+            {
+                "event": "repair_skipped",
+                "reason": "turn_time",
+                "publication_seconds": round(publication_seconds, 1),
+                "writing_seconds": round(
+                    float(getattr(tools, "writing_seconds", 0) or 0), 1
+                ),
+            }
+        )
+    )
+    return True
+
+
 async def publish(
     tools: Any,
     args: dict[str, Any],
@@ -523,7 +602,10 @@ async def publish(
     from services.orchestrator.file_results import project_deliverable_links
     from services.retrieval.project_identity import ProjectError
 
-    deadline = time.monotonic() + timeout
+    began = time.monotonic()
+    deadline = began + timeout
+    # The checks end here: the rest of the tool's time is the publication's.
+    checks_end = deadline - PUBLISH_RESERVE_SECONDS
 
     def remaining() -> float:
         seconds = deadline - time.monotonic()
@@ -672,49 +754,71 @@ async def publish(
     # The ledger's measures of this file (slides, rendered pages), set by
     # document_check: what the closing may say of its length.
     tools.file_measures = None
-    ledger_results = await expectations.document_check(
-        tools,
-        str(getattr(current, "name", "") or path)
-        if revision is not None
-        else str(path),
-        path.suffix,
-        content,
-        deliverable_check.drawn_text(content)
-        if content is not None
-        else bytes(document.preview).decode("utf-8", "replace"),
-        min(
-            expectations.EXTRACT_SECONDS
-            + expectations.JUDGE_SECONDS
-            + expectations.PAGE_SECONDS,
-            deadline - time.monotonic() - 40,
-        ),
-        raw=document.content,
-    )
-    if content is not None:
-        document, ledger_results = await compacted_to_size(
+
+    def review(built: Any) -> Any:
+        return deliverable_check.review(
             tools,
-            content,
             path.suffix,
-            document,
-            ledger_results,
-            source_texts if path.suffix == ".pptx" or not append_sources else [],
-            pictures,
-            deadline - time.monotonic() - 40,
+            content,
+            built.content,
+            built.preview,
+            list(left_out or ()),
+            pictures=pictures if content is not None else {},
+            revision=revision,
+            name=str(path),
+            sources=source_texts,
+            seconds=checks_end - time.monotonic(),
         )
-    checked = await deliverable_check.review(
-        tools,
-        path.suffix,
-        content,
-        document.content,
-        document.preview,
-        list(left_out or ()),
-        pictures=pictures if content is not None else {},
-        revision=revision,
-        name=str(path),
-        sources=source_texts,
-        # The publication itself keeps 20 seconds of the tool's time.
-        seconds=deadline - time.monotonic() - 20,
-    )
+
+    # The check against the request and the ledger of requirements read the
+    # same built file: they run side by side, not one after the other (each
+    # has its own time limit, both end before the publication's reserve).
+    built = document
+    reviewing = asyncio.ensure_future(review(built))
+    try:
+        ledger_results = await expectations.document_check(
+            tools,
+            str(getattr(current, "name", "") or path)
+            if revision is not None
+            else str(path),
+            path.suffix,
+            content,
+            deliverable_check.drawn_text(content)
+            if content is not None
+            else bytes(document.preview).decode("utf-8", "replace"),
+            min(
+                expectations.EXTRACT_SECONDS
+                + expectations.JUDGE_SECONDS
+                + expectations.PAGE_SECONDS,
+                checks_end - time.monotonic(),
+            ),
+            raw=document.content,
+        )
+        if content is not None:
+            document, ledger_results = await compacted_to_size(
+                tools,
+                content,
+                path.suffix,
+                document,
+                ledger_results,
+                source_texts if path.suffix == ".pptx" or not append_sources else [],
+                pictures,
+                checks_end - time.monotonic(),
+            )
+        checked = await reviewing
+    except BaseException:
+        reviewing.cancel()
+        raise
+    if document is not built:
+        # Laid out compact after the ledger's size check: the version
+        # published is checked again, in the time left, as its own check.
+        count = getattr(tools, "deliverable_checks", None)
+        if isinstance(count, int) and count > 0:
+            tools.deliverable_checks = count - 1
+        checked = await review(document)
+    # A repair that cannot fit in the turn is not asked: the file is
+    # published with its gaps named (keep_for_delivery).
+    keep_for_delivery(tools, time.monotonic() - began)
     expectations.document_refusal(tools, ledger_results, checked.gaps)
     ledger_gaps = expectations.document_gaps(tools, ledger_results)
     if ledger_gaps:
@@ -1192,6 +1296,10 @@ def revision_target(
     return str(path) if folder_id + "/" + str(path) in existing else None
 
 
+# The time an approval given on the person's behalf keeps before the deadline.
+REVISION_APPROVAL_SECONDS = 3.0
+
+
 async def publish_revision(
     tools: Any,
     publisher: Any,
@@ -1248,7 +1356,11 @@ async def publish_revision(
             execution,
             tools,
             overwrite_effects(file, document.content),
-            deadline - 20,
+            # Behind the chat (and for Atlas's own retry) the approval is given
+            # at once: 20 s kept for a card nobody answers turned a correction
+            # into a numbered copy near the end of a turn (staging -184,
+            # "expired"). In project mode the person needs time to answer.
+            deadline - (REVISION_APPROVAL_SECONDS if chat or own else 20),
             own=own,
         )
         if approval is None:

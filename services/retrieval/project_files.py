@@ -1114,8 +1114,9 @@ class ProjectFiles:
             + quote(file["relative_path"], safe=""),
             "X-Content-Type-Options": "nosniff",
         }
-        if version["mime"] == "text/html":
-            # Always a download; a browser that renders it anyway gets an opaque origin.
+        if version["mime"] in {"text/html", "image/svg+xml"}:
+            # Always a download; a browser that renders it anyway gets an opaque
+            # origin (an SVG document can carry script, like HTML).
             headers["Content-Security-Policy"] = "sandbox"
         status = 200
         if range_header:
