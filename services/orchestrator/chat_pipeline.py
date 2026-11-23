@@ -3003,6 +3003,8 @@ async def _process(
             document_quotes.observe({"summary": counted["summary"]})
             for check in _collectors():
                 check.computation(counted)
+    from services.orchestrator.chat_work import work_stopped_instruction
+
     try:
         if attachment_sources and model.sink:
             await model.sink({"phase": "synthesizing_document"})
@@ -3027,7 +3029,15 @@ async def _process(
             + (instruction() if links else "")
             + (policy_instruction() if image_discussion else "")
             + extended_instruction()
-            + (guest_capability_instruction() if not images_enabled() else "")
+            # What the instance delivers: with model routing, said whether or
+            # not pictures are enabled (staging -187: with pictures enabled the
+            # chat was never told that files are made, and denied it).
+            + (
+                guest_capability_instruction()
+                if not images_enabled() or request_router.enabled()
+                else ""
+            )
+            + work_stopped_instruction(request)
             + (diagram.instruction() if technical_diagram else "")
             + file_context
             + (
