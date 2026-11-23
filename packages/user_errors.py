@@ -21,7 +21,7 @@ _Sentence = TypeVar("_Sentence", bound=Callable[..., object])
 def _in_register(function: _Sentence) -> _Sentence:
     """The sentence in the register of the conversation (packages.addressing):
     every table here is written in the polite form, read in the familiar one
-    by a person who writes so (frontier judge C13, staging -145)."""
+    by a person who writes so (class C13, staging -145)."""
     signature = inspect.signature(function)
 
     @functools.wraps(function)

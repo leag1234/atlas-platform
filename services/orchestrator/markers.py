@@ -1,6 +1,6 @@
 """Internal markers and tool names never reach the person (class C4).
 
-The frontier judge (staging -145) found an app answer listing each embedded
+Staging -145 showed an app answer listing each embedded
 file with "[unverified source]" and a strict answer saying that the tool
 `web_search` was blocked. Both came from text written for the
 model or for the logs: the citation guard's English placeholder for an address

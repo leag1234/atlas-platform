@@ -770,7 +770,7 @@ async def process_app_turn(
             app_render.remember_version(artifact_id, version, candidate.report)
         # The addresses the note lists are the code's own downloads: the
         # citation guard keeps them (it wrote "[unverified source]" in their
-        # place, frontier judge C4, staging -145).
+        # place, class C4, staging -145).
         item.tool_urls.extend(
             url
             for url in dict.fromkeys(

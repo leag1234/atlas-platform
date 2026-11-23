@@ -708,7 +708,7 @@ class ChatPlan:
 
         The steps read in the conversation's register (packages.addressing):
         the code's own "Vous livrer l'application" followed a request in the
-        tu form (frontier judge C13, staging -145)."""
+        tu form (class C13, staging -145)."""
         return {
             "version": self.version,
             "title": self.title(),
