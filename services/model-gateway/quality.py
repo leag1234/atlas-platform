@@ -314,6 +314,8 @@ async def stream_quality(
     role = (
         request.vision_role
         if task == "vision"
+        else request.text_role
+        if request.text_role != "profile" and request.text_role in policy.models
         else policy.profile_roles.get(request.profile or "", task)
     )
     primary = policy.models[role]

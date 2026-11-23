@@ -160,7 +160,8 @@ class RouteTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await request_router.route(req), Decision(kind="drawing"))
             self.assertEqual(request_router.decision(req), Decision(kind="drawing"))
             await request_router.route(req)
-        gateway.assert_awaited_once()
+        # Both router roles are asked at once, and only once per turn.
+        self.assertEqual(gateway.await_count, 2)
         self.assertEqual(len(logs.output), 1)
         self.assertIn("request_router kind=drawing", logs.output[0])
         self.assertIn("fallback=none", logs.output[0])
@@ -213,7 +214,7 @@ class RouteTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(manages_machine(text))
         self.assertIn("forgetting", request_router.SYSTEM)
 
-    async def test_invalid_json_falls_back(self) -> None:
+    async def test_invalid_json_falls_back_to_the_local_classifier(self) -> None:
         req = request("Draw me a sheep")
         with (
             router_on(),
@@ -223,8 +224,27 @@ class RouteTests(unittest.IsolatedAsyncioTestCase):
             ),
             self.assertLogs("services.orchestrator.request_router", "INFO") as logs,
         ):
-            self.assertIsNone(await request_router.route(req))
+            self.assertEqual(await request_router.route(req), Decision(kind="drawing"))
+            self.assertEqual(request_router.decision(req), Decision(kind="drawing"))
+        self.assertIn("source=local", logs.output[0])
         self.assertIn("fallback=router_invalid_json", logs.output[0])
+
+    async def test_without_the_local_classifier_the_lexical_gates_decide(self) -> None:
+        req = request("Draw me a sheep")
+        with (
+            router_on(),
+            patch(
+                "services.orchestrator.request_router._gateway",
+                AsyncMock(return_value=reply("drawing, I think")),
+            ),
+            patch(
+                "services.orchestrator.router_local.decide",
+                side_effect=FileNotFoundError("router_examples.jsonl"),
+            ),
+            self.assertLogs("services.orchestrator.request_router", "INFO") as logs,
+        ):
+            self.assertIsNone(await request_router.route(req))
+        self.assertIn("source=lexical", logs.output[-1])
         self.assertIsNone(request_router.decision(req))
 
     async def test_timeout_falls_back_within_the_bound(self) -> None:
@@ -240,8 +260,9 @@ class RouteTests(unittest.IsolatedAsyncioTestCase):
             self.assertLogs("services.orchestrator.request_router", "INFO") as logs,
         ):
             started = asyncio.get_running_loop().time()
-            self.assertIsNone(await request_router.route(req))
+            self.assertEqual(await request_router.route(req), Decision(kind="app"))
             self.assertLess(asyncio.get_running_loop().time() - started, 2)
+        self.assertIn("source=local", logs.output[0])
         self.assertIn("fallback=timeout", logs.output[0])
 
     async def test_gateway_error_and_tool_call_fall_back(self) -> None:
@@ -254,7 +275,10 @@ class RouteTests(unittest.IsolatedAsyncioTestCase):
                     router_on(),
                     patch("services.orchestrator.request_router._gateway", gateway),
                 ):
-                    self.assertIsNone(await request_router.route(request("hello")))
+                    self.assertEqual(
+                        await request_router.route(request("hello")),
+                        Decision(kind="answer"),
+                    )
 
     async def test_turns_that_keep_their_handling_are_not_routed(self) -> None:
         gateway = AsyncMock(return_value=reply('{"kind": "answer"}'))

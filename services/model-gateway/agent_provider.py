@@ -144,6 +144,13 @@ class AgentRequest(BaseModel):
     vision_role: Literal["vision", "locate"] = Field(
         default="vision", exclude_if=lambda value: value == "vision"
     )
+    # Role of a profile call without an image: "router" and "router_alt" run on the
+    # models declared for the routing decision of a chat turn (routing.yaml,
+    # serverless.router and router_alt: small models on two providers, chosen for
+    # their latency); unset, the profile's own role answers.
+    text_role: Literal["profile", "router", "router_alt"] = Field(
+        default="profile", exclude_if=lambda value: value == "profile"
+    )
 
     @model_validator(mode="before")
     @classmethod
@@ -210,6 +217,7 @@ class AgentRequest(BaseModel):
                 or self.sampling_temperature is not None
                 or self.single_attempt
                 or self.vision_role != "vision"
+                or self.text_role != "profile"
             ):
                 raise ValueError("invalid_legacy_profile")
             self.reasoning_effort = "none"
