@@ -13,7 +13,7 @@ import aiohttp
 from aiohttp.abc import ResolveResult
 from aiohttp.resolver import ThreadedResolver
 
-USER_AGENT = "ATLAS-0/0.1 (+https://github.com/leag1234/atlas)"
+USER_AGENT = "ATLAS-0/0.1 (+https://github.com/leag1234/atlas-platform)"
 MAX_BYTES = 2_000_000
 CONNECT_TIMEOUT = 5
 SEARCH_TIMEOUT = 15
