@@ -22,9 +22,11 @@ import time
 from decimal import Decimal
 from typing import Any
 
+from packages.profiles import picture_profile
 from services.orchestrator.pictures import (
     animal_kit_enabled,
     bounded_contours_enabled,
+    cpu_checks,
     painter,
     store,
 )
@@ -62,6 +64,50 @@ REDRAW = "\nAlso apply this change: {change}"
 # A change whose edit came back identical is drawn again from the request
 # only when the turn still has this much time for one more painter call.
 REDRAW_MIN_SECONDS = 60.0
+# Drawings of one correction checked at most (the first and its retries).
+CHECKED_DRAWINGS = 3
+# Statements checked at most on one drawing.
+MAX_STATEMENTS = 8
+GAP_NOTE = (
+    "\nA check of your last drawing found that it does not show: {gaps}. "
+    "Make each of these plainly visible."
+)
+
+
+def statements_of(
+    picture_set: store.PictureSet, requirements: list[str] | None, change: str
+) -> list[str]:
+    """What a correction's drawing is checked against: the picture's own
+    statements, then what the person requires, once each; the change itself
+    when neither says anything."""
+    found: list[str] = []
+    for statement in [*picture_set.checks, *(requirements or [])]:
+        statement = " ".join(str(statement).split())
+        if statement and statement.casefold() not in {f.casefold() for f in found}:
+            found.append(statement)
+    if not found and change.strip():
+        found.append(" ".join(change.split())[:200])
+    return found[:MAX_STATEMENTS]
+
+
+async def _verified(
+    statements: list[str],
+    result: dict[str, Any],
+    profile: str | None,
+    spend: Any,
+    complete: Any,
+    errors: list[str],
+) -> tuple[list[str] | None, dict[str, str]]:
+    """(unmet, gaps) of one finished drawing; (None, {}) when unchecked."""
+    image = result.get("image")
+    if not statements or profile is None or not isinstance(image, dict):
+        return None, {}
+    data = image.get("data")
+    if image.get("mime") != "image/png" or not isinstance(data, str):
+        return None, {}
+    return await cpu_checks.check(
+        statements, data, profile, spend, complete or _gateway, errors
+    )
 
 
 def messages(
@@ -179,6 +225,14 @@ async def process_picture_followup(
         item.reponse, item.state = unchanged, "done"
         return True
     method_changed = False
+    # Verify before showing (docs/32): every drawing of a correction is
+    # checked by the vision call against the picture's cumulative statements;
+    # a miss is drawn again with the measured gap while the turn allows, and
+    # the answer is never an unverified drawing presented as the correction.
+    statements = statements_of(picture_set, requirements, wanted)
+    check_profile = picture_profile("picture_rewrite")
+    check_errors: list[str] = []
+    tried: list[dict[str, Any]] = []
     while True:
         payload = {
             "messages": change,
@@ -191,6 +245,7 @@ async def process_picture_followup(
             "single_attempt": True,
             "local_enabled": False,
         }
+        failure = ""
         try:
             reply = await (complete or _gateway)(payload, seconds + 10)
         except Exception as error:  # noqa: BLE001 - unchanged picture, or D5 refusal
@@ -199,65 +254,122 @@ async def process_picture_followup(
                 # The whole allowance was offered to this one call: a cost or
                 # quota refusal is the user's (D5), said with its measurements.
                 raise
-            item.erreurs.append("picture_change_" + code)
-            item.reponse, item.state = unchanged, "done"
-            return True
-        spend.settle(reply)
-        item.cout_eur = float(spend.total)
-        item.tokens = {"in": spend.tokens_in, "out": spend.tokens_out}
-        svg, how = salvage(extract_svg(str(reply.get("text") or "")))
-        if svg is None:
-            item.erreurs.append("picture_change_" + how.split(" ")[0])
-            item.reponse, item.state = unchanged, "done"
-            return True
-        try:
-            result = await run_job(
-                "draft",
-                {
-                    "svg": svg,
-                    "checklist": picture_set.checklist,
-                    "living": picture_set.living,
-                    "animal_kit": animal_kit_enabled(),
-                    "bounded_contours": bounded_contours_enabled(),
-                    "labels_group": painter.labels_group(picture_set.checklist),
-                },
+            failure = "picture_change_" + code
+        if not failure:
+            spend.settle(reply)
+            item.cout_eur = float(spend.total)
+            item.tokens = {"in": spend.tokens_in, "out": spend.tokens_out}
+            svg, how = salvage(extract_svg(str(reply.get("text") or "")))
+            if svg is None:
+                failure = "picture_change_" + how.split(" ")[0]
+        if not failure:
+            try:
+                result = await run_job(
+                    "draft",
+                    {
+                        "svg": svg,
+                        "checklist": picture_set.checklist,
+                        "living": picture_set.living,
+                        "animal_kit": animal_kit_enabled(),
+                        "bounded_contours": bounded_contours_enabled(),
+                        "labels_group": painter.labels_group(picture_set.checklist),
+                    },
+                )
+            except PictureJobError as error:
+                failure = "picture_change_" + str(error)
+        if not failure:
+            prepared = prepare(
+                Block("svg", result["svg"], True),
+                picture_set.title,
+                picture_set.language,
             )
-        except PictureJobError as error:
-            item.erreurs.append("picture_change_" + str(error))
+            if prepared.problems:
+                failure = "picture_change_invalid"
+        if failure:
+            item.erreurs.append(failure)
+            if tried:
+                break
             item.reponse, item.state = unchanged, "done"
             return True
-        prepared = prepare(
-            Block("svg", result["svg"], True), picture_set.title, picture_set.language
-        )
-        if prepared.problems:
-            item.erreurs.append("picture_change_invalid")
-            item.reponse, item.state = unchanged, "done"
-            return True
-        if previous.content != prepared.document.encode("utf-8"):
-            break
-        # The drawing came back identical: no new version, no claimed change.
-        item.erreurs.append("picture_change_identical")
         left = limit - (time.monotonic() - started) - 40.0
-        if redrawn or left < REDRAW_MIN_SECONDS:
-            # Already drawn again from the request, or no time to: said
-            # plainly, with what was tried, never a request to say again the
-            # correction the person already gave.
-            item.reponse = text(
-                language,
-                "same_drawing_again" if method_changed else "same_drawing",
-                version=picture_set.artifact_version,
+        if previous.content == prepared.document.encode("utf-8"):
+            # The drawing came back identical: no new version, no claimed change.
+            item.erreurs.append("picture_change_identical")
+            if tried:
+                break
+            if redrawn or left < REDRAW_MIN_SECONDS:
+                # Already drawn again from the request, or no time to: said
+                # plainly, with what was tried, never a request to say again
+                # the correction the person already gave.
+                item.reponse = text(
+                    language,
+                    "same_drawing_again" if method_changed else "same_drawing",
+                    version=picture_set.artifact_version,
+                )
+                item.state = "done"
+                return True
+            # The painter gave its own drawing back unchanged to a correction
+            # (staging -185): the method changes once, the picture is drawn
+            # again from the first request with the correction.
+            change, redrawn = redraw_messages(picture_set, wanted), True
+            method_changed = True
+            seconds = max(30.0, min(240.0, left))
+            await _status("changing", language)
+            continue
+        unmet, gaps = await _verified(
+            statements, result, check_profile, spend, complete, check_errors
+        )
+        tried.append(
+            {
+                "prepared": prepared,
+                "result": result,
+                "svg": svg,
+                "unmet": unmet,
+                "gaps": gaps,
+            }
+        )
+        left = limit - (time.monotonic() - started) - 40.0
+        if (
+            unmet is None
+            or not unmet
+            or len(tried) >= CHECKED_DRAWINGS
+            or left < REDRAW_MIN_SECONDS
+        ):
+            break
+        # A miss: the correction again, with what the check measured.
+        measured = GAP_NOTE.format(
+            gaps="; ".join(
+                statement
+                + (f" (it shows: {gaps[statement]})" if gaps.get(statement) else "")
+                for statement in unmet
             )
-            item.state = "done"
-            return True
-        # The painter gave its own drawing back unchanged to a correction
-        # (staging -185: a counted correction answered twice with "came back
-        # identical, tell me what should change"). The method changes once:
-        # the picture is drawn again from the first request with the
-        # correction, which never starts from the drawing that kept the fault.
-        change, redrawn = redraw_messages(picture_set, wanted), True
-        method_changed = True
+        )
+        change, redrawn = (
+            (redraw_messages(picture_set, wanted + measured), True)
+            if redrawn
+            else messages(picture_set, wanted + measured)
+        )
         seconds = max(30.0, min(240.0, left))
         await _status("changing", language)
+    item.erreurs.extend(check_errors)
+    from services.orchestrator.pictures.cpu_turn import ranked
+
+    best = ranked(tried)[0]
+    prepared, result, svg = best["prepared"], best["result"], best["svg"]
+    unmet, gaps = best["unmet"], best["gaps"]
+    unsatisfied = isinstance(unmet, list) and bool(unmet)
+    if unsatisfied and store.current_passed(picture_set):
+        # Never a verified picture replaced by one that fails its check.
+        item.erreurs.append("picture_change_kept")
+        item.reponse = text(
+            language,
+            "code_kept",
+            n=len(tried),
+            items=cpu_checks.gapped(language, list(unmet or []), gaps),
+            version=picture_set.artifact_version,
+        )
+        item.state = "done"
+        return True
     try:
         stored = artifact_store.update(
             picture_set.artifact_id,
@@ -276,17 +388,41 @@ async def process_picture_followup(
     picture_set.artifact_version = int(stored["version"])
     picture_set.current_source = str(result.get("source") or svg)
     picture_set.image_key = image.rsplit("/", 1)[-1]
+    picture_set.checks = list(statements)
+    picture_set.unmet = None if unmet is None else list(unmet)
+    picture_set.misses = picture_set.misses + 1 if unsatisfied else 0
     # A proposal is applied once (dialogue.follow_up): a new version ends it.
     picture_set.proposed = []
     await asyncio.to_thread(store.update, picture_set)
-    lines = [
-        text(
+    if unsatisfied:
+        item.erreurs.append("picture_change_unsatisfied")
+        checked = text(
             language,
-            "redrawn_after_same"
-            if method_changed
-            else ("redrawn" if redrawn else "changed"),
+            "code_unsatisfied",
+            n=len(tried),
+            items=cpu_checks.gapped(language, list(unmet or []), gaps),
         )
-    ]
+    elif unmet is None:
+        item.erreurs.append("picture_change_unchecked")
+        checked = text(
+            language, "code_check_unknown", items=cpu_checks.items(language, statements)
+        )
+    elif len(tried) > 1:
+        checked = text(
+            language,
+            "code_retried",
+            n=len(tried),
+            items=cpu_checks.items(language, statements),
+        )
+    else:
+        checked = ""
+    lead = text(
+        language,
+        "redrawn_after_same"
+        if method_changed
+        else ("redrawn" if redrawn else "changed"),
+    )
+    lines = [" ".join(filter(None, [lead, checked]))]
     lines.append(f"![{picture_set.title}]({image})")
     lines.append(
         footer(
