@@ -46,6 +46,7 @@ from .layout import (
     image_path,
     kept_with_next,
     pages,
+    picture_share,
     table_type,
 )
 from .schema import Content
@@ -228,7 +229,9 @@ SIDE_MARGIN_INCHES = 1.0
 # adds to the one before, inside the house style (staging -162 to -170):
 # 1 the spacing around headings and the title, 2 the page margins, 3 the
 # tables (cell padding, 9 pt cells), 4 the body type down to 10 pt, the
-# readable minimum. Headings and the title keep their size.
+# readable minimum. Headings and the title keep their size. Pictures shrink
+# from level 1 on (layout.PICTURE_SHARE), in a PDF report too: there they are
+# what the compact levels change.
 COMPACT_HEADING_SPACE = (6, 2)
 COMPACT_TITLE_SPACE_AFTER = 4
 COMPACT_MARGIN_INCHES = 0.75
@@ -236,6 +239,8 @@ COMPACT_TABLE_PT = 9
 COMPACT_CELL_TWIPS = 60
 COMPACT_BODY_PT = 10
 COMPACT_LEVELS = 4
+# The width of a picture in a Word report at the usual size, in inches.
+PICTURE_INCHES = 4.0
 
 
 def unnumbered(paragraph: Paragraph) -> None:
@@ -308,7 +313,7 @@ def build_document(
     points of a short list with each other (layout.kept_with_next).
     """
     breaks: dict[int, int] = {}
-    pages(content, root, geometry=report_geometry(content), breaks=breaks)
+    pages(content, root, geometry=report_geometry(content, compact), breaks=breaks)
     document = Document()
     document.core_properties.title = shown(content.title)
     wide = any(
@@ -397,7 +402,10 @@ def build_document(
                         if small:
                             run.font.size = DocPt(size)
         for value in section.images:
-            document.add_picture(str(image_path(root, value)), width=DocInches(4))
+            document.add_picture(
+                str(image_path(root, value)),
+                width=DocInches(PICTURE_INCHES * picture_share(compact)),
+            )
     if content.footer:
         # The running footer of every page (Content.footer): the page footer
         # of the document, never a paragraph of the body.
@@ -541,7 +549,7 @@ def render(
 
     With slides, a PDF has one slide-size page per slide, as the PPTX deck.
     With compact (a level, 1 to 4), a DOCX takes the compact report layout
-    (build_document).
+    (build_document) and a PDF report its smaller pictures (report_geometry).
     """
     content = Content.model_validate(content.model_dump())
     if path.suffix != ".pptx":
@@ -564,13 +572,16 @@ def render(
         content,
         image_root,
         tables=path.suffix != ".xlsx",
-        geometry=report_geometry(content)
+        geometry=report_geometry(content, compact)
         if path.suffix == ".pdf" and not slides
         else SLIDE,
     )
     builders: dict[str, Callable[[Content, Path, Path], None]] = {
         ".pptx": build_slides,
-        ".pdf": partial(build_pdf, geometry=SLIDE if slides else None),
+        ".pdf": partial(
+            build_pdf,
+            geometry=SLIDE if slides else report_geometry(content, compact),
+        ),
         ".docx": partial(build_document, compact=compact),
         ".xlsx": build_workbook,
     }

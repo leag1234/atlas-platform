@@ -77,8 +77,9 @@ RENDER_PROPERTIES = ("palette", "visible")
 PARTS = ("title", "section", "slide", "table", "picture", "chart", "text", "size")
 # Size and count requirements (part "size"), measured by code on the built
 # file: slides of the deck, pages of the rendered PDF, words of the text,
-# bullet items, table rows, sections.
-SIZE_UNITS = ("slides", "pages", "words", "items", "rows", "sections")
+# bullet items, table rows, sections, and the pictures the file shows
+# (counted on the built file: verify.printed_pictures).
+SIZE_UNITS = ("slides", "pages", "words", "items", "rows", "sections", "pictures")
 RELATIONS = ("exact", "about", "max", "min")
 MAX_SIZE = 100_000
 # "About N": within 20 % of N, and at least 1 either way.
@@ -527,7 +528,7 @@ APP_METHODS = """- "code": a test presses or sets an element in the running app.
 - "judge": only when nothing above fits (a style, a quality, a rule too complex to test)."""
 
 DOCUMENT_METHODS = """- "code": a part of the file's content. Fields: "part" (title, section, slide, table, picture, chart, text), "words" (1 to 4 words its heading or text contains, in the file's language), and "count" when the person asked for a number of such parts.
-- "code" with "part": "size" for every size or count the person asked for the whole file: "unit" (slides, pages, words, items, rows, sections), "count" (a number) and "relation" (exact, about, max, min). For example "cinq diapositives" is {"part": "size", "unit": "slides", "count": 5, "relation": "exact"}, "about one page" is {"part": "size", "unit": "pages", "count": 1, "relation": "about"}, "maximal 300 Wörter" is {"part": "size", "unit": "words", "count": 300, "relation": "max"}. A size is always its own requirement.
+- "code" with "part": "size" for every size or count the person asked for the whole file: "unit" (slides, pages, words, items, rows, sections, pictures), "count" (a number) and "relation" (exact, about, max, min). For example "cinq diapositives" is {"part": "size", "unit": "slides", "count": 5, "relation": "exact"}, "about one page" is {"part": "size", "unit": "pages", "count": 1, "relation": "about"}, "maximal 300 Wörter" is {"part": "size", "unit": "words", "count": 300, "relation": "max"}, "con tres fotos" is {"part": "size", "unit": "pictures", "count": 3, "relation": "exact"}. A number of pictures, images, photos or illustrations in the whole file is a size in pictures. A size is always its own requirement.
 - "judge": only when no part fits (a tone, a style, a quality). A length of the whole file (pages, slides, words, "short", "one page") is a size, never judge."""
 
 JUDGE_SYSTEM = (
@@ -921,6 +922,17 @@ def size_result(
     }[relation]
     how = f"the file has {measured} {unit}, {asked} were asked"
     over = measured > (size + over_margin if relation == "about" else size)
+    if unit == "pictures":
+        # Counted on the printed file; a picture is drawn before the file
+        # is written (work_pictures.py), never by the writer.
+        how += (
+            ": leave out the pictures the person did not ask for"
+            if over
+            else ": place every picture drawn for the file, one per item asked; "
+            "a picture that could not be drawn is said in the answer with "
+            "these numbers"
+        )
+        return Result(item.id, False, how)
     if over:
         headings = [
             str(section.heading)
@@ -1063,6 +1075,11 @@ def size_measures(content: Any, text: str) -> dict[str, int | None]:
         else None,
         "slides": None,
         "pages": None,
+        # The pictures placed in the content; the built file's own count
+        # replaces it when a number of pictures was asked (file_measures).
+        "pictures": sum(len(getattr(section, "images", ())) for section in sections)
+        if content is not None
+        else None,
     }
     return measures
 
@@ -1158,20 +1175,33 @@ def document_result(
             )
         return Result(item.id, True)
     if part == "picture":
-        ok = any(
-            getattr(section, "images", ())
+        # "count" is the number of pictures asked: a sheet asked with two
+        # pictures that placed one passed this check (it read only whether
+        # one was there).
+        placed = sum(
+            len(getattr(section, "images", ()))
+            for section in sections
+            if getattr(section, "images", ())
             and (
                 has(str(section.heading))
                 or any(has(str(label)) for label in section.images)
             )
-            for section in sections
         )
+        ok = placed >= max(1, count)
+        if ok:
+            return Result(item.id, True)
+        if count > 1:
+            return Result(
+                item.id,
+                False,
+                f"the file has {placed} pictures"
+                + (f" about {_quoted(check)}" if words else "")
+                + f", {count} were asked",
+            )
         return Result(
             item.id,
-            ok,
-            ""
-            if ok
-            else "no picture"
+            False,
+            "no picture"
             + (f" about {_quoted(check)}" if words else "")
             + " is in the file",
         )
@@ -1746,6 +1776,12 @@ async def file_measures(
     from services.orchestrator.deliverable_check import _units
 
     measures = size_measures(content, text)
+    if "pictures" in units and raw:
+        from packages.doc_render.verify import printed_pictures
+
+        printed = printed_pictures(raw, suffix)
+        if printed is not None:
+            measures["pictures"] = printed
     if raw and suffix == ".pptx":
         measures["slides"] = _units(raw, suffix)
     elif content is not None and suffix == ".pptx":
@@ -1881,7 +1917,9 @@ def document_refusal(
     requirement used the Work turn's steps, and it ended with no file.
     """
     turn = getattr(tools, "expectations", None)
-    unmet = failed(results)
+    unmet = [
+        result for result in failed(results) if not undrawn_pictures(tools, result)
+    ]
     if (
         not isinstance(turn, TurnLedger)
         or not unmet
@@ -1896,6 +1934,24 @@ def document_refusal(
     if other_gaps:
         text += " Also fix: " + "; ".join(other_gaps) + "."
     raise ValueError(text)
+
+
+def undrawn_pictures(tools: Any, result: Result) -> bool:
+    """Whether a file lacks pictures only because they could not be drawn
+    in this turn (work_pictures: not drawn in its time, or left out after
+    their redraws): a rewrite cannot place them, so the file is not refused
+    for them; the gap is still said with its measured numbers."""
+    turn = getattr(tools, "expectations", None)
+    pending = getattr(tools, "pictures_pending", None)
+    if not isinstance(turn, TurnLedger) or not isinstance(pending, list):
+        return False
+    item = turn.ledger.find(result.id)
+    if item is None or item.method != "code" or not pending:
+        return False
+    check = item.check
+    return check.get("part") == "picture" or (
+        check.get("part") == "size" and check.get("unit") == "pictures"
+    )
 
 
 def document_gaps(tools: Any, results: Sequence[Result]) -> list[str]:

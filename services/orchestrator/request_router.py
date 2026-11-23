@@ -642,6 +642,17 @@ _NAMED_FORMATS = tuple(
 )
 # The word processor's name, capitalised (lower case "word" is a common noun).
 _WORD = re.compile(r"(?<!\w)Word(?!\w)")
+# A web page's own format: "an HTML file", "als HTML-Datei", "index.html".
+_HTML = re.compile(r"(?<![\w/])(?:\w+\.)?x?html?5?(?!\w)", re.I)
+
+
+def names_html(text: str) -> bool:
+    """Whether a request names HTML as the format of what it asks, links aside."""
+    return any(
+        _HTML.search(word)
+        for word in text.split()
+        if "://" not in word and not word.casefold().startswith("www.")
+    )
 
 
 def named_formats(text: str) -> tuple[str, ...]:
@@ -754,6 +765,18 @@ def _settle(text: str, routed: Decision | None) -> tuple[Decision | None, str]:
                 ),
                 "named_run",
             )
+    if routed.kind == "file" and names_html(text) and not named_formats(text):
+        # A page or a small app asked "as a single HTML file" is the app
+        # panel's own format: it is built, opened and tried there, and
+        # downloads as that HTML file. Routed as a file, it was written as a
+        # project file with no preview and no try in a browser, and the
+        # person saw no app (staging -187).
+        return (
+            routed.model_copy(
+                update={"kind": "app", "file_format": None, "needs_research": False}
+            ),
+            "html_app",
+        )
     if routed.kind in _NOT_TEXT and not routed.follow_up and plain_writing(text):
         return (
             routed.model_copy(

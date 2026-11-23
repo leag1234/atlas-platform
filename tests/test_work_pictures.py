@@ -187,15 +187,50 @@ class WorkPictureTests(unittest.IsolatedAsyncioTestCase):
             items(1),
             900,
             server=server,
-            call=self.checker([True, False], [True, False]),
+            call=self.checker([True, False], [True, False], [True, False]),
         )
-        self.assertEqual(len(server.prompts), 2)
+        # Writing found: drawn twice more, with blank surfaces asked.
+        self.assertEqual(len(server.prompts), 3)
+        self.assertNotIn(work_pictures.BLANK_SURFACES, server.prompts[0])
+        self.assertTrue(server.prompts[1].endswith(work_pictures.BLANK_SURFACES))
         self.assertEqual(result["pictures"], [])
         self.assertEqual(result["left_out"], ["item 0"])
         self.assertNotIn("not_drawn", result)
         self.assertEqual(tools.pictures_pending, ["item 0"])
         self.assertIn("unreadable lettering", result["note"])
         self.assertTrue(server.prompts[0].endswith(work_pictures.NO_LETTERING))
+
+    async def test_writing_found_twice_is_drawn_a_third_time(self) -> None:
+        # A subject that carries print by nature (a ledger page) came with
+        # writing twice in a row and was left out: the file was a picture
+        # short. A third draw, blank surfaces asked, keeps it.
+        tools = tools_for("subject|chat-j", deadline=self.clock[0] + 600)
+        server = FakeServer(self.clock)
+        result = await work_pictures.execute(
+            tools,
+            items(2),
+            900,
+            server=server,
+            call=self.checker(True, [True, False], [True, False], True),
+        )
+        self.assertEqual(len(server.prompts), 4)
+        self.assertEqual(len(result["pictures"]), 2)
+        self.assertNotIn("left_out", result)
+        self.assertEqual(tools.pictures_pending, [])
+
+    async def test_no_third_draw_without_the_time_for_it(self) -> None:
+        # 75 s kept for the document: room for two draws of 20 s only.
+        tools = tools_for("subject|chat-k", deadline=self.clock[0] + 75 + 50)
+        server = FakeServer(self.clock)
+        result = await work_pictures.execute(
+            tools,
+            items(1),
+            900,
+            server=server,
+            call=self.checker([True, False], [True, False], True),
+        )
+        self.assertEqual(len(server.prompts), 2)
+        self.assertEqual(result["left_out"], ["item 0"])
 
     async def test_words_asked_inside_a_picture_are_drawn_and_checked(self) -> None:
         tools = tools_for("subject|chat-i", deadline=self.clock[0] + 600)

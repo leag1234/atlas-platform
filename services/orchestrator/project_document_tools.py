@@ -1116,13 +1116,22 @@ async def compacted_to_size(
     compact, and nothing more was tried. The levels are tried in turn, from
     the one after the file's own (renderer.COMPACT_LEVELS: spacing, margins,
     tables, body type down to 10 pt); the text is never cut by code.
+
+    Pictures shrink from the first level (layout.PICTURE_SHARE): a one-page
+    PDF asked with two pictures printed on two pages turn after turn, each
+    picture 320 points high, and the writer was told to cut its few words.
+    A PDF report (its pictures are what its levels change) and a report with
+    pictures try the levels whatever the overflow: the pictures can give
+    much more than spacing. The pages of a PDF are counted on the PDF built.
     """
     from services.orchestrator import expectations
 
     turn = getattr(tools, "expectations", None)
     measures = getattr(tools, "file_measures", None)
+    pictured = any(section.images for section in content.sections)
     if (
-        suffix != ".docx"
+        suffix not in {".docx", ".pdf"}
+        or (suffix == ".pdf" and not pictured)
         or seconds < 15
         or not isinstance(turn, expectations.TurnLedger)
         or not isinstance(measures, dict)
@@ -1130,7 +1139,7 @@ async def compacted_to_size(
         return document, results
     from packages.doc_render.renderer import COMPACT_LEVELS
 
-    built_level = compacted(document.content)
+    built_level = compacted(document.content) if suffix == ".docx" else 0
     if built_level >= COMPACT_LEVELS:
         return document, results
     failing = []
@@ -1156,7 +1165,7 @@ async def compacted_to_size(
         if isinstance(span, int) and span > 0
         else bool(words and capacity and words <= capacity * size * COMPACT_SHARE)
     )
-    if not words or not near:
+    if not pictured and (not words or not near):
         return document, results
     from services.orchestrator.presentation_delivery import build_project_document
     from services.retrieval import deliverable_render
@@ -1178,12 +1187,16 @@ async def compacted_to_size(
                 pictures=pictures,
                 compact=level,
             )
-            rendered = await asyncio.to_thread(
-                deliverable_render.render_pages,
-                compact.content,
-                suffix,
-                timeout=min(left / 2, expectations.PAGE_SECONDS),
-            )
+            if suffix == ".pdf":
+                total, filled = await asyncio.to_thread(_pdf_pages, compact.content)
+            else:
+                rendered = await asyncio.to_thread(
+                    deliverable_render.render_pages,
+                    compact.content,
+                    suffix,
+                    timeout=min(left / 2, expectations.PAGE_SECONDS),
+                )
+                total, filled = rendered.total, rendered.filled
         except Exception as error:  # noqa: BLE001 - the version as built stays
             log.warning(
                 json.dumps({"event": "compact_failed", "reason": str(error)[:40]})
@@ -1191,9 +1204,9 @@ async def compacted_to_size(
             return document, results
         new = dict(
             measures,
-            pages=rendered.total,
-            words_per_page=expectations.page_capacity(words, rendered.filled),
-            span_permille=round(sum(rendered.filled) * 1000),
+            pages=total,
+            words_per_page=expectations.page_capacity(words, filled),
+            span_permille=round(sum(filled) * 1000),
         )
         again = {
             item.id: expectations.size_result(item, content, "", new)
@@ -1205,7 +1218,7 @@ async def compacted_to_size(
                 {
                     "event": "compact_layout",
                     "level": level,
-                    "pages": [measures.get("pages"), rendered.total],
+                    "pages": [measures.get("pages"), total],
                     "fits": fits,
                 }
             )
@@ -1218,6 +1231,17 @@ async def compacted_to_size(
         expectations._plan_status(str(getattr(tools, "lang", "") or "en"), results)
         return compact, results
     return document, results
+
+
+def _pdf_pages(raw: bytes) -> tuple[int, tuple[float, ...]]:
+    """The pages of a built PDF and the share of each one its text spans."""
+    from packages.doc_render import form
+    from services.orchestrator.deliverable_check import _units
+
+    total = _units(raw, ".pdf")
+    if total is None:
+        raise ValueError("unreadable_pdf")
+    return total, tuple(form.measure(raw).filled())
 
 
 def measured_length(tools: Any, suffix: str, raw: bytes) -> dict[str, int]:
