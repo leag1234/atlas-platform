@@ -94,6 +94,10 @@ class PictureSet:
     # order: an acceptance applies them (dialogue.follow_up), a new version
     # ends them.
     proposed: list[str] = field(default_factory=list)
+    # The current version of a CPU set was drawn by code (the image model had
+    # missed a checked statement): later changes edit that drawing with the
+    # painter (followup.py), never go back to the image model that missed.
+    by_code: bool = False
 
 
 def current_unmet(picture_set: PictureSet) -> list[str]:

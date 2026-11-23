@@ -561,6 +561,51 @@ class FollowUpTests(Base):
         assert after is not None
         self.assertEqual(after.artifact_version, 2)
         self.assertEqual(after.misses, 0)
+        # Drawn by code now: its painter source is what a later change edits.
+        self.assertTrue(after.by_code)
+        self.assertTrue(after.current_source)
+
+    async def test_after_a_drawing_by_code_an_accepted_plan_edits_that_drawing(
+        self,
+    ) -> None:
+        """Staging -187: a plan accepted after the method changed to drawing by
+        code went back to the image model, which missed again, and nothing
+        changed. The drawing by code is edited instead (fictional subjects)."""
+        for subject, plan in (
+            ("trois lanternes vertes", ["Space the lanterns evenly"]),
+            ("cuatro cometas azules", ["Move the sun fully into the frame"]),
+        ):
+            with self.subTest(subject=subject):
+                memoise_drafts(self)
+                gateway = CheckingDialogueGateway(follow_reply("change", ""))
+                server = FakeServer()
+                first, picture_set = await self.start(gateway, server)
+                self.mark_missed(picture_set, [subject])
+                picture_set = store.load(picture_set.set_id) or picture_set
+                picture_set.misses = 1
+                store.update(picture_set)
+                history = [("user", subject), ("assistant", first.reponse)]
+                gateway.reply = rewrite_reply(prompt=FIRST, checks=[subject])
+                gateway.met = ['{"met": [true]}'] + ['{"met": [false]}'] * 3
+                with patch.object(picture_turn, "soft_seconds", lambda: 30.0):
+                    done, second = await self.follow(gateway, history, "toujours pas")
+                self.assertTrue(done)
+                coded = store.load(picture_set.set_id)
+                assert coded is not None and coded.by_code
+                coded.proposed = list(plan)
+                store.update(coded)
+                renders = len(server.renders)
+                gateway.follow = follow_reply("change", "")
+                history += [("user", "toujours pas"), ("assistant", second.reponse)]
+                done, accepted = await self.follow(gateway, history, "vas-y")
+                self.assertTrue(done)
+                after = store.load(picture_set.set_id)
+                assert after is not None
+                # No new image-model picture: the drawing was edited.
+                self.assertEqual(len(server.renders), renders)
+                self.assertEqual(after.artifact_version, 3)
+                self.assertEqual(after.proposed, [])
+                self.assertIn("/versions/3/open", accepted.reponse)
 
     async def test_an_accepted_proposal_is_applied_from_the_stored_plan(self) -> None:
         gateway = DialogueGateway(follow_reply("review"))

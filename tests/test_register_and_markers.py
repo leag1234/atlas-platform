@@ -364,3 +364,59 @@ class MarkerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LeadingImperativeTests(unittest.TestCase):
+    """Staging -187: a request that opens with a familiar imperative and no
+    pronoun ("dessine ...") was answered in the polite form. Fictional texts."""
+
+    def test_the_opening_verb_says_the_register(self) -> None:
+        from packages.addressing import register
+
+        for text, language, expected in (
+            ("dessine trois lanternes vertes sur un quai", "fr", "informal"),
+            ("salut, fais un poster pour la fête du verger", "fr", "informal"),
+            ("Dessinez un phare sous la pluie", "fr", "formal"),
+            ("Faites un plan du jardin partagé", "fr", "formal"),
+            ("dibuja cuatro cometas azules", "es", "informal"),
+            ("Dibuje un faro al atardecer", "es", "formal"),
+            ("disegna una barca con due vele", "it", "informal"),
+            ("Zeichne einen Fuchs im Schnee", "de", "informal"),
+            ("Zeichnen Sie einen Fuchs im Schnee", "de", "formal"),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(register(text, language), expected)
+
+    def test_no_opening_verb_says_nothing(self) -> None:
+        from packages.addressing import register
+
+        for text, language in (
+            ("Une maison au bord du canal", "fr"),
+            ("Liste des courses pour samedi", "fr"),
+            ("Quelle heure est-il à Lisbonne ?", "fr"),
+            ("Una casa junto al río", "es"),
+            ("Mi serve un faro", "it"),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(register(text, language), "")
+
+    def test_a_picture_text_follows_the_opening_verb(self) -> None:
+        from packages import addressing
+        from services.orchestrator.pictures.texts import text
+
+        for words, language, polite, familiar in (
+            ("dessine six lanternes", "fr", "Cliquez", "Clique"),
+            ("dibuja seis faroles", "es", "Dígame", "Dime"),
+        ):
+            with self.subTest(words=words):
+                token = addressing.begin([words], language)
+                try:
+                    shown = (
+                        text(language, "hint")
+                        + " "
+                        + text(language, "same_drawing", version=1)
+                    )
+                finally:
+                    addressing.end(token)
+                self.assertNotIn(polite, shown)
+                self.assertIn(familiar, shown)

@@ -137,7 +137,9 @@ async def process_picture_followup(
     ):
         # Not a picture by code, or a version this set does not know.
         return False
-    if picture_set.engine == "cpu":
+    if picture_set.engine == "cpu" and not (
+        picture_set.by_code and picture_set.current_source
+    ):
         from services.orchestrator.pictures import cpu_turn
 
         return await cpu_turn.change(
@@ -274,6 +276,8 @@ async def process_picture_followup(
     picture_set.artifact_version = int(stored["version"])
     picture_set.current_source = str(result.get("source") or svg)
     picture_set.image_key = image.rsplit("/", 1)[-1]
+    # A proposal is applied once (dialogue.follow_up): a new version ends it.
+    picture_set.proposed = []
     await asyncio.to_thread(store.update, picture_set)
     lines = [
         text(
