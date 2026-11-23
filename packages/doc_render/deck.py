@@ -35,7 +35,7 @@ from pptx.enum.text import MSO_ANCHOR, MSO_AUTO_SIZE, PP_ALIGN
 from pptx.oxml.ns import qn
 from pptx.util import Pt
 
-from .cells import Span, prose, shown
+from .cells import Span, checkbox, prose, shown
 from .layout import font, image_path, width_of
 from .schema import Content, Metric, Section, Table
 from .spacing import bound, words
@@ -251,7 +251,8 @@ def write(
             runs(paragraph, (Span(pair[1]),), size, color, bold)
         else:
             runs(paragraph, prose(text), size, color, bold)
-        if bullet:
+        if bullet and not checkbox(shown(text))[0]:
+            # A point to tick shows its box (cells.boxed), not a bullet.
             indent = size * 1.1
             properties = paragraph._p.get_or_add_pPr()
             properties.set("marL", str(Pt(indent)))
@@ -912,7 +913,13 @@ def cover(
         footer = frame(
             slide, 80, FOOTER_TOP, W - 400, 16, MSO_ANCHOR.MIDDLE, role="footer"
         )
-        write(footer, [content.title], 10, theme.on_primary_muted, gap=0)
+        write(
+            footer,
+            [content.footer or content.title],
+            10,
+            theme.on_primary_muted,
+            gap=0,
+        )
 
 
 def statement(
@@ -1086,6 +1093,9 @@ def build_deck(content: Content, path: Path, root: Path) -> None:
     number = 0
     count = len(content.sections)
     previous = ""
+    # The footer line of every content slide: the running footer asked
+    # (Content.footer), else the deck title.
+    running = content.footer or content.title
     for index, section in enumerate(content.sections):
         layout = kind(section, index, count)
         if layout == previous and layout in ("cards", "pillars"):
@@ -1102,9 +1112,9 @@ def build_deck(content: Content, path: Path, root: Path) -> None:
             if layout in ("cover", "closing"):
                 cover(slide, theme, content, section, layout == "closing")
             elif layout == "statement":
-                statement(slide, theme, section, content.title, number)
+                statement(slide, theme, section, running, number)
             elif layout in ("cards", "pillars", "process"):
-                chrome(slide, theme, section.heading, content.title, number)
+                chrome(slide, theme, section.heading, running, number)
                 {"cards": cards, "pillars": pillars, "process": process}[layout](
                     slide,
                     theme,
@@ -1112,7 +1122,7 @@ def build_deck(content: Content, path: Path, root: Path) -> None:
                     POINTS,
                 )
             else:
-                content_slide(slide, theme, root, section, content.title, number, piece)
+                content_slide(slide, theme, root, section, running, number, piece)
             if section.notes and piece is pieces[0]:
                 slide.notes_slide.notes_text_frame.text = "\n".join(
                     shown(note) for note in section.notes

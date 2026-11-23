@@ -27,16 +27,21 @@ from . import emoji
 from .cells import (
     PAGE_COLUMNS,
     SHEET_COLUMNS,
+    BOX,
     Reading,
     Span,
+    checkbox,
     prose,
     shown,
     whole_link,
 )
+from .glyphs import adapt
 from .layout import (
     Geometry,
     report_geometry,
     FONT,
+    FOOTER_BASELINE,
+    FOOTER_PT,
     SLIDE,
     image_path,
     kept_with_next,
@@ -150,7 +155,23 @@ def build_pdf(
                 )
                 continue
             canvas.setFont(FONT, block.size)
-            if block.bullet:
+            if block.check:
+                # A box to tick, ticked when written "[x]".
+                side = block.size * 0.75
+                left, bottom = g.margin + 1, g.height - top - block.size - 2
+                canvas.setLineWidth(0.8)
+                canvas.rect(left, bottom, side, side, fill=0, stroke=1)
+                if block.check != BOX:
+                    canvas.line(
+                        left + 2, bottom + side / 2, left + side / 2.5, bottom + 2
+                    )
+                    canvas.line(
+                        left + side / 2.5,
+                        bottom + 2,
+                        left + side - 1.5,
+                        bottom + side - 1.5,
+                    )
+            elif block.bullet:
                 canvas.circle(g.margin + 5, g.height - top - 8, 2, fill=1, stroke=0)
             for col, lines in enumerate(block.lines):
                 cell_width = block.width / len(block.lines)
@@ -169,6 +190,16 @@ def build_pdf(
                         line,
                         block.size,
                     )
+        if content.footer:
+            # The running footer, at the foot of every page (Content.footer).
+            canvas.setFont(FONT, FOOTER_PT)
+            draw_line(
+                canvas,
+                g.margin,
+                FOOTER_BASELINE,
+                adapt(shown(content.footer)),
+                FOOTER_PT,
+            )
         canvas.showPage()
     canvas.save()
 
@@ -205,6 +236,26 @@ COMPACT_TABLE_PT = 9
 COMPACT_CELL_TWIPS = 60
 COMPACT_BODY_PT = 10
 COMPACT_LEVELS = 4
+
+
+def unnumbered(paragraph: Paragraph) -> None:
+    """A list paragraph shown without its bullet (w:numId 0 ends numbering)."""
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+
+    properties = paragraph._p.get_or_add_pPr()
+    numbering = OxmlElement("w:numPr")
+    level = OxmlElement("w:ilvl")
+    level.set(qn("w:val"), "0")
+    number = OxmlElement("w:numId")
+    number.set(qn("w:val"), "0")
+    numbering.append(level)
+    numbering.append(number)
+    style = properties.find(qn("w:pStyle"))
+    if style is None:
+        properties.insert(0, numbering)
+    else:
+        style.addnext(numbering)
 
 
 def compact_level(document: Any) -> int:
@@ -324,6 +375,10 @@ def build_document(
             point = document.add_paragraph(style="List Bullet")
             write_runs(point, text)
             point.paragraph_format.keep_with_next = next(keep) or None
+            if checkbox(shown(text))[0]:
+                # A box to tick replaces the bullet: the list style without
+                # its numbering (numId 0), the box written as its character.
+                unnumbered(point)
         for table in section.tables:
             grid = document.add_table(rows=1, cols=len(table.headers))
             grid.style = "Table Grid"
@@ -343,6 +398,12 @@ def build_document(
                             run.font.size = DocPt(size)
         for value in section.images:
             document.add_picture(str(image_path(root, value)), width=DocInches(4))
+    if content.footer:
+        # The running footer of every page (Content.footer): the page footer
+        # of the document, never a paragraph of the body.
+        footer = document.sections[0].footer
+        footer.is_linked_to_previous = False
+        write_runs(footer.paragraphs[0], content.footer)
     if compact >= 3:
         for grid in document.tables:
             _cell_padding(grid, COMPACT_CELL_TWIPS)

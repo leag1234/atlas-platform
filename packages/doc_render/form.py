@@ -44,6 +44,9 @@ from typing import Any
 from .cells import shown
 from .schema import label
 
+# layout.FOOTER_ZONE: a line drawn under it is the running footer.
+FOOTER_ZONE = 26.0
+
 # A page spanned over less than this share of its height is nearly empty.
 NEAR_EMPTY = 0.25
 # The share of its height a full page spans: an A4 report page with 50 pt
@@ -172,6 +175,9 @@ def measure(source: bytes | Path) -> Form:
             if not value.strip():
                 return
             m = _matrix(tm, cm)
+            if m[5] < FOOTER_ZONE:
+                # The running footer (renderer.build_pdf) is no body text.
+                return
             # The vertical scale of the text space gives the drawn size.
             drawn = round(abs(float(size)) * math.hypot(m[2], m[3]), 1)
             if drawn <= 0:

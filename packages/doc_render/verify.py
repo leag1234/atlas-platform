@@ -12,7 +12,7 @@ from pptx.shapes.graphfrm import GraphicFrame
 from pypdf import PdfReader
 
 from . import emoji
-from .cells import shown
+from .cells import checkbox, shown
 from .schema import Content
 from .titles import slug_like
 from .spacing import unbound
@@ -111,6 +111,17 @@ def verify(
         text = ["\n".join(parts)]
         broken = unbound(text[0])
         unit = "document"
+        footers = "\n".join(
+            paragraph.text
+            for section in document.sections
+            for paragraph in section.footer.paragraphs
+        )
+        if (
+            expected is not None
+            and expected.footer
+            and "".join(shown(expected.footer).split()) not in "".join(footers.split())
+        ):
+            raise VerificationError("missing_footer")
     elif path.suffix == ".xlsx":
         workbook = load_workbook(path, data_only=False, read_only=True)
         try:
@@ -136,7 +147,9 @@ def verify(
     if expected_count is not None and len(text) != expected_count:
         raise VerificationError(f"unit_count_mismatch:{len(text)}:{expected_count}")
     if expected and path.suffix == ".pdf":
-        source = "\n".join(expected.texts())
+        source = "\n".join(
+            (*expected.texts(), *((shown(expected.footer),) if expected.footer else ()))
+        )
         broken = [
             word for value in text for word in split_words(page_lines(value), source)
         ]
@@ -150,7 +163,12 @@ def verify(
     if expected:
         # A PDF page draws its emoji as pictures (emoji.py): its text layer
         # holds the rest of each text.
-        drawn = emoji.without_pictures if path.suffix == ".pdf" else lambda value: value
+        # A box to tick is drawn as a shape there (cells.checkbox).
+        drawn = (
+            (lambda value: checkbox(emoji.without_pictures(value))[1])
+            if path.suffix == ".pdf"
+            else (lambda value: value)
+        )
         units = ["".join(value.split()) for value in text]
         if paginated:
             seen: set[str] = set()
@@ -176,6 +194,16 @@ def verify(
         ]
         if any("".join(value.split()) not in combined for value in wanted):
             raise VerificationError("missing_expected_text")
+        if (
+            expected.footer
+            and path.suffix == ".pdf"
+            and any(
+                "".join(drawn(shown(expected.footer)).split()) not in value
+                for value in units
+            )
+        ):
+            # The running footer is on every page.
+            raise VerificationError("missing_footer")
     found: tuple[str, ...] = ()
     if (
         report_root is not None

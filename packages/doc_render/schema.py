@@ -209,10 +209,19 @@ class Content(ContentModel):
     # Pages: the title stands alone on a first page (a title page), and the
     # first section starts on the next one. Only when it is asked for.
     cover: bool = Field(default=False, strict=True)
+    # Pages: a running footer printed at the foot of every page (a PDF and a
+    # DOCX page footer, a deck's footer line), never a line of the body. Asked
+    # "in the footer of both pages", it was written under the last paragraph
+    # of each page (staging -184): the content had no footer to fill.
+    footer: Text | None = None
 
     @model_validator(mode="after")
     def printable(self) -> Self:
         typed = self.typed()
+        if self.footer is not None and (
+            not self.footer.strip() or any(ord(c) < 32 for c in self.footer)
+        ):
+            raise ValueError("blank_or_control_text")
         for text in typed:
             if not text.strip() or any(ord(c) < 32 for c in text):
                 raise ValueError("blank_or_control_text")

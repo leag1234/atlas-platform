@@ -60,6 +60,7 @@ import io
 import json
 import logging
 import os
+import re
 import time
 from typing import Any
 
@@ -466,6 +467,165 @@ def form_gaps(
     return gaps
 
 
+QUOTED_CHANGED = (
+    "texts the person quoted to be written are changed in the file: {quotes} "
+    "(write each exactly as quoted, with its capitals and its final "
+    "punctuation, as a sentence or a point of its own)"
+)
+RESTATED = (
+    "slides or sections that only restate their own title: {headings} (give "
+    "each the content the request asks for: its steps, facts or examples)"
+)
+# A quoted text the check compares: at least this many words (a single quoted
+# word is a name or a heading, compared by the other checks).
+QUOTE_WORDS = 2
+QUOTES = re.compile(
+    r"\u00ab\s*([^\u00ab\u00bb\n]{3,300}?)\s*\u00bb"
+    r"|\u201e([^\u201c\u201d\u201e\n]{3,300}?)[\u201c\u201d]"
+    r"|\u201c([^\u201c\u201d\n]{3,300}?)\u201d"
+    r'|"([^"\n]{3,300}?)"'
+)
+# What differs between a typed and a drawn text without changing it.
+_TYPOGRAPHY = str.maketrans(
+    {
+        "\u2019": "'",
+        "\u2018": "'",
+        "\u00a0": " ",
+        "\u202f": " ",
+        "\u2009": " ",
+        "\u2013": "-",
+        "\u2014": "-",
+    }
+)
+
+
+def _verbatim(text: str) -> str:
+    return " ".join(text.translate(_TYPOGRAPHY).split())
+
+
+def _folded(text: str) -> str:
+    import unicodedata
+
+    plain = "".join(
+        char
+        for char in unicodedata.normalize("NFKD", text.casefold())
+        if not unicodedata.combining(char)
+    )
+    return " ".join(re.sub(r"[^\w]+", " ", plain).split())
+
+
+def quoted_texts(requests: list[str]) -> list[str]:
+    """The texts the person put between quotation marks, in order, once each."""
+    found: list[str] = []
+    for request in requests:
+        for match in QUOTES.finditer(request):
+            text = next(group for group in match.groups() if group is not None)
+            text = _verbatim(text)
+            if len(_folded(text).split()) >= QUOTE_WORDS and text not in found:
+                found.append(text)
+    return found
+
+
+def quote_gaps(tools: Any, content: Any, preview: bytes) -> list[str]:
+    """Quoted texts the file holds in other words' clothing: same words,
+    another case or punctuation.
+
+    Staging -184: four instructions quoted with their final period were
+    printed without it, and a sentence quoted to be written was merged into
+    another with a small letter; every check passed (the judge compares
+    meaning). A quote the file does not hold at all is not measured here (it
+    may be a remark, not a text to write): only a quote whose words are all
+    there, in a row, but not as typed. Code only.
+    """
+    request = getattr(tools, "request_text", "")
+    earlier = getattr(tools, "earlier_requests", None) or []
+    requests = [
+        str(item) for item in [*earlier, request] if isinstance(item, str) and item
+    ]
+    quotes = quoted_texts(requests)
+    if not quotes:
+        return []
+    text = (
+        drawn_text(content)
+        if content is not None
+        else bytes(preview).decode("utf-8", "replace")
+    )
+    lines = [_verbatim(line) for line in text.splitlines() if line.strip()]
+    folded_lines = [_folded(line) for line in lines]
+    whole = " ".join(lines)
+    changed = []
+    for quote in quotes:
+        if quote in whole:
+            continue
+        words = _folded(quote)
+        if any(words and f" {words} " in f" {line} " for line in folded_lines):
+            changed.append("\u00ab" + quote + "\u00bb")
+    if not changed:
+        return []
+    return [QUOTED_CHANGED.format(quotes=", ".join(changed[:6]))]
+
+
+def _same_word(word: str, known: set[str]) -> bool:
+    """The word, or another form of it (a shared stem of four letters or more
+    covering most of the shorter word: prepare, preparing, preparation)."""
+    if word in known:
+        return True
+    for other in known:
+        common = 0
+        for a, b in zip(word, other):
+            if a != b:
+                break
+            common += 1
+        if common >= 4 and common >= 0.75 * min(len(word), len(other)):
+            return True
+    return False
+
+
+def restated_gaps(suffix: str, content: Any, name: str = "") -> list[str]:
+    """Slides or sections whose only text says their title again.
+
+    Staging -184: a three-slide how-to deck held, under each title, one line
+    made of the title's own words ("Packing" / "Pack the item for transport.")
+    and was published as delivered. A section counts when its body is one
+    short text whose longer words all come from its heading, the document
+    title or the file name; a deck's first slide (its cover) is not measured.
+    """
+    if content is None or not getattr(content, "sections", None):
+        return []
+    from packages.doc_render.cells import shown
+
+    stem = name.rsplit("/", 1)[-1].rsplit(".", 1)[0] if name else ""
+    title = set(_folded(shown(content.title) + " " + stem).split())
+    restated: list[str] = []
+    for index, section in enumerate(content.sections):
+        if index == 0 and suffix == ".pptx":
+            continue
+        following = content.sections[index + 1 : index + 2]
+        if getattr(section, "continued", False) or (
+            following and getattr(following[0], "continued", False)
+        ):
+            # Part of a section that goes on around a picture, a list or a
+            # table (a picture book's caption under its picture): measured
+            # with the rest, which says more.
+            continue
+        texts = [*section.paragraphs, *section.bullets]
+        if (
+            len(texts) != 1
+            or section.tables
+            or section.images
+            or getattr(section, "metrics", ())
+            or getattr(section, "chart", None) is not None
+        ):
+            continue
+        words = [word for word in _folded(shown(texts[0])).split() if len(word) > 3]
+        known = title | set(_folded(shown(section.heading)).split())
+        if words and len(words) <= 8 and all(_same_word(w, known) for w in words):
+            restated.append(shown(section.heading))
+    if not restated:
+        return []
+    return [RESTATED.format(headings=", ".join(restated[:6]))]
+
+
 def title_gaps(content: Any, name: str = "") -> list[str]:
     """A title that is the file name or a slug (titles.py, staging -145).
 
@@ -670,6 +830,9 @@ def drawn_text(content: Any) -> str:
             "(speaker notes, not on the slide) " + shown(note)
             for note in getattr(section, "notes", ()) or ()
         )
+    footer = getattr(content, "footer", None)
+    if footer:
+        lines.append("(page footer, at the foot of every page) " + shown(footer))
     return "\n".join(lines)
 
 
@@ -977,6 +1140,8 @@ async def review(
         planned_gaps(tools, content)
         + unit_gaps(tools, content, preview)
         + title_gaps(content, name)
+        + quote_gaps(tools, content, preview)
+        + restated_gaps(suffix, content, name)
         + form_gaps(suffix, content, raw, pictures)
         + (found_details := detail_gaps(tools, suffix, raw, sources, name))[0]
     )
