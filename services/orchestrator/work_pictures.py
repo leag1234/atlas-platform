@@ -99,6 +99,19 @@ NO_LETTERING = (
     " The picture contains no text: no letters, numbers, words, signs, labels "
     "or captions anywhere."
 )
+# Said in the redraw of a picture whose check found writing in it. A subject
+# that carries print by nature (a page, a book, a card, a screen, a sign, a
+# package) came with pseudo-words twice in a row and was left out: a sheet
+# asked with two pictures had one, turn after turn (staging -184 to -187).
+BLANK_SURFACES = (
+    " Every surface in the picture (paper, pages, cards, screens, signs, "
+    "packages, fabric) is plain and blank, without any print or marks."
+)
+# Draws of one picture at most: a picture that misses its item is drawn once
+# more; one with writing in it, while the turn's time allows, twice more (a
+# picture left out makes the file short of the pictures asked).
+ATTEMPTS = 2
+LETTERING_ATTEMPTS = 3
 
 
 def lettering(item: Item) -> tuple[str, str]:
@@ -111,7 +124,8 @@ def lettering(item: Item) -> tuple[str, str]:
         )
     return (
         NO_LETTERING,
-        "The picture contains no letters, words, numbers or writing of any kind",
+        "The picture contains no letters, words, numbers or writing of any kind "
+        "(plain lines, patterns and textures are not writing)",
     )
 
 
@@ -464,7 +478,11 @@ async def execute(
         picture: Any = None
         verdict = "unchecked"
         garbled = False
-        for attempt in range(2):
+        attempt = 0
+        while attempt < (LETTERING_ATTEMPTS if garbled else ATTEMPTS):
+            attempt += 1
+            if garbled and not item.text and BLANK_SURFACES not in prompt:
+                prompt = prompt[: 1500 - len(BLANK_SURFACES)] + BLANK_SURFACES
             seed = int.from_bytes(os.urandom(4), "big") % 2**31
             try:
                 rendered = await server.render_set(
@@ -571,6 +589,10 @@ async def execute(
                 "reused": len(request.items) - len(todo),
                 "drawn": drawn,
                 "left": len(left_items),
+                # Left out after their redraws (writing in the picture), and
+                # kept though their check said they miss their item.
+                "left_out": len(omitted),
+                "unmatched": len(mismatched),
                 "seconds": round(time.monotonic() - started, 1),
                 "estimate": round(estimate, 1),
                 "check_eur": str(spend.total),

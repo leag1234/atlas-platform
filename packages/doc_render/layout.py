@@ -1,6 +1,6 @@
 """Measured layout shared by the PDF writer and slide builder."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 import re
 
@@ -103,14 +103,33 @@ def kept_with_next(section: object) -> tuple[bool, ...]:
     return tuple(flags)
 
 
-def report_geometry(content: Content) -> Geometry:
-    """The page of a PDF report: A4 portrait, landscape for a wide table."""
+# The share of their usual height pictures keep at each compact level of a
+# report (renderer.COMPACT_LEVELS). A one-page sheet asked with two pictures
+# printed on two pages: each picture took 320 points of the 742 of an A4
+# page, and the compact report changed only spacing and type. The pictures
+# are what a page with pictures can give: they shrink first, level by level,
+# never under 44 % (about 140 points high on A4).
+PICTURE_SHARE = (1.0, 0.8, 0.65, 0.53, 0.44)
+
+
+def picture_share(compact: int) -> float:
+    """The share of their usual size pictures keep at a compact level."""
+    return PICTURE_SHARE[max(0, min(len(PICTURE_SHARE) - 1, int(compact)))]
+
+
+def report_geometry(content: Content, compact: int = 0) -> Geometry:
+    """The page of a PDF report: A4 portrait, landscape for a wide table;
+    at a compact level, its pictures smaller (PICTURE_SHARE)."""
     wide = any(
         len(table.headers) > 8
         for section in content.sections
         for table in section.tables
     )
-    return A4_LANDSCAPE if wide else A4
+    page = A4_LANDSCAPE if wide else A4
+    share = picture_share(compact)
+    return (
+        page if share == 1.0 else replace(page, image_height=page.image_height * share)
+    )
 
 
 @dataclass(frozen=True)

@@ -224,3 +224,93 @@ def verify(
             )
         )
     return Verification(unit, len(text), tuple(text), paginated, tuple(broken), found)
+
+
+# A picture is drawn at least this many points wide and high. An emoji the
+# PDF writer draws as a small image (emoji.py) is at most PICTURE_SIZE (48
+# points); the smallest picture of a compact report is about 140 points high.
+PICTURE_POINTS = 60.0
+
+
+def _multiplied(
+    first: tuple[float, ...], second: tuple[float, ...]
+) -> tuple[float, ...]:
+    a, b, c, d, e, f = first
+    g, h, i, j, k, m = second
+    return (
+        a * g + b * i,
+        a * h + b * j,
+        c * g + d * i,
+        c * h + d * j,
+        e * g + f * i + k,
+        e * h + f * j + m,
+    )
+
+
+def _pdf_pictures(raw: bytes) -> int:
+    """The pictures a PDF prints: each image drawn at picture size, counted
+    once per time it is drawn (as pdfimages lists them), read from the page
+    content streams with the transformation in force when it is drawn."""
+    import io
+
+    from pypdf.generic import ContentStream
+
+    reader = PdfReader(io.BytesIO(raw))
+    count = 0
+    for page in reader.pages:
+        resources = page.get("/Resources")
+        resources = resources.get_object() if resources is not None else None
+        xobjects = resources.get("/XObject") if resources is not None else None
+        xobjects = xobjects.get_object() if xobjects is not None else None
+        if not xobjects:
+            continue
+        images = {
+            name
+            for name, reference in xobjects.items()
+            if reference.get_object().get("/Subtype") == "/Image"
+        }
+        contents = page.get_contents()
+        if not images or contents is None:
+            continue
+        matrix: tuple[float, ...] = (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+        saved: list[tuple[float, ...]] = []
+        for operands, operator in ContentStream(contents, reader).operations:
+            if operator == b"q":
+                saved.append(matrix)
+            elif operator == b"Q":
+                matrix = saved.pop() if saved else matrix
+            elif operator == b"cm" and len(operands) == 6:
+                matrix = _multiplied(tuple(float(v) for v in operands), matrix)
+            elif operator == b"Do" and operands and operands[0] in images:
+                a, b, c, d = matrix[:4]
+                width, height = (a * a + b * b) ** 0.5, (c * c + d * d) ** 0.5
+                if min(width, height) >= PICTURE_POINTS:
+                    count += 1
+    return count
+
+
+def printed_pictures(raw: bytes, suffix: str) -> int | None:
+    """How many pictures the built file shows, measured on the file itself:
+    the images a PDF draws at picture size, the pictures of a Word report,
+    the picture shapes of a deck; None when the file cannot be read."""
+    import io
+
+    try:
+        if suffix == ".pdf":
+            return _pdf_pictures(raw)
+        if suffix == ".docx":
+            return len(Document(io.BytesIO(raw)).inline_shapes)
+        if suffix == ".pptx":
+            from pptx.enum.shapes import MSO_SHAPE_TYPE
+
+            points = 12700 * PICTURE_POINTS
+            return sum(
+                1
+                for slide in Presentation(io.BytesIO(raw)).slides
+                for shape in slide.shapes
+                if shape.shape_type == MSO_SHAPE_TYPE.PICTURE
+                and min(int(shape.width or 0), int(shape.height or 0)) >= points
+            )
+    except Exception:  # noqa: BLE001 - an unreadable file is not measured
+        return None
+    return None
