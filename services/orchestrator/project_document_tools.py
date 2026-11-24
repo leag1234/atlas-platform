@@ -805,16 +805,29 @@ async def publish(
             raw=document.content,
         )
         if content is not None:
+            covered = (
+                source_texts if path.suffix == ".pptx" or not append_sources else []
+            )
             document, ledger_results = await compacted_to_size(
                 tools,
                 content,
                 path.suffix,
                 document,
                 ledger_results,
-                source_texts if path.suffix == ".pptx" or not append_sources else [],
+                covered,
                 pictures,
                 checks_end - time.monotonic(),
             )
+            if document is built:
+                document = await compacted_tail(
+                    tools,
+                    content,
+                    path.suffix,
+                    document,
+                    covered,
+                    pictures,
+                    checks_end - time.monotonic(),
+                )
         checked = await reviewing
     except BaseException:
         reviewing.cancel()
@@ -1231,6 +1244,116 @@ async def compacted_to_size(
         expectations._plan_status(str(getattr(tools, "lang", "") or "en"), results)
         return compact, results
     return document, results
+
+
+# A report whose last printed page holds only the tail of the text (a few
+# lines) while the whole fits one page less is laid out compact up to this
+# level (spacing, then margins), never smaller type: the person asked no size.
+TAIL_LEVELS = 2
+# The tail of a last page: at most this share of its height (about seven lines).
+TAIL_SHARE = 0.15
+
+
+async def compacted_tail(
+    tools: Any,
+    content: Content,
+    suffix: str,
+    document: Any,
+    covered: list[str],
+    pictures: dict[str, bytes],
+    seconds: float,
+) -> Any:
+    """The document laid out compact when its print has a nearly empty last
+    page that a compact layout removes (the print is measured after each level),
+    else the document as built.
+
+    Staging -189 (2026-11-24): a Word report with a title, a table and two
+    sections printed on two pages, the second holding three lines: LibreOffice's
+    print put the tail of the text after the page foot. The text is never cut
+    and the layout stays inside the house style (renderer.COMPACT_LEVELS 1 and
+    2). Skipped when the person asked a number of pages (a size requirement),
+    asked page breaks, or the turn has no time for a print.
+    """
+    from services.orchestrator import expectations
+
+    turn = getattr(tools, "expectations", None)
+    asked_pages = isinstance(turn, expectations.TurnLedger) and any(
+        item.method == "code"
+        and item.check.get("part") == "size"
+        and item.check.get("unit") == "pages"
+        for item in turn.ledger.active()
+    )
+    if (
+        suffix != ".docx"
+        or asked_pages
+        or seconds < 2 * COMPACT_STEP_SECONDS
+        or content.cover
+        or any(section.page_break for section in content.sections)
+    ):
+        return document
+    from services.orchestrator.presentation_delivery import build_project_document
+    from services.retrieval import deliverable_render
+
+    log = logging.getLogger(__name__)
+    started = time.monotonic()
+
+    def tail(filled: tuple[float, ...]) -> bool:
+        """A last page of a few lines."""
+        # The print is checked after each level: what does not fit is left.
+        return len(filled) >= 2 and 0 < filled[-1] <= TAIL_SHARE
+
+    try:
+        rendered = await asyncio.to_thread(
+            deliverable_render.render_pages,
+            document.content,
+            suffix,
+            timeout=min(seconds / 3, expectations.PAGE_SECONDS),
+        )
+    except Exception as error:  # noqa: BLE001 - the version as built stays
+        log.warning(json.dumps({"event": "tail_failed", "reason": str(error)[:40]}))
+        return document
+    if not tail(rendered.filled):
+        return document
+    from packages.doc_render.renderer import COMPACT_LEVELS
+
+    for level in range(compacted(document.content) + 1, TAIL_LEVELS + 1):
+        left = seconds - (time.monotonic() - started)
+        if left < COMPACT_STEP_SECONDS or level > COMPACT_LEVELS:
+            break
+        try:
+            compact = await asyncio.to_thread(
+                build_project_document,
+                content,
+                suffix,
+                covered,
+                max_bytes=16 * 1024 * 1024,
+                timeout=min(left / 2, 30),
+                pictures=pictures,
+                compact=level,
+            )
+            printed = await asyncio.to_thread(
+                deliverable_render.render_pages,
+                compact.content,
+                suffix,
+                timeout=min(left / 2, expectations.PAGE_SECONDS),
+            )
+        except Exception as error:  # noqa: BLE001 - the version as built stays
+            log.warning(json.dumps({"event": "tail_failed", "reason": str(error)[:40]}))
+            return document
+        fits = printed.total < rendered.total
+        log.warning(
+            json.dumps(
+                {
+                    "event": "tail_layout",
+                    "level": level,
+                    "pages": [rendered.total, printed.total],
+                    "fits": fits,
+                }
+            )
+        )
+        if fits:
+            return compact
+    return document
 
 
 def _pdf_pages(raw: bytes) -> tuple[int, tuple[float, ...]]:
