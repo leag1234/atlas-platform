@@ -108,8 +108,10 @@ FOLLOW_SYSTEM = (
     "'The car is red, not blue'. Never invent a correction nobody asked for or proposed. Empty "
     "only when nothing visual can be found (a plain retry).\n"
     "'requirements': everything the user wants the picture to show, from the "
-    "first request and every later correction, in English, one short "
-    "statement each, the latest wording when one replaces another.\n"
+    "first request and every later correction, one short statement each, "
+    "in the language of the user's own words (never English unless they "
+    "write English: the statements are shown to the user as they are), the "
+    "latest wording when one replaces another.\n"
     'Reply with JSON only: {"kind": "...", "change": "...", '
     '"requirements": ["..."]}'
 )

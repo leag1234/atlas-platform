@@ -77,11 +77,21 @@ GAP_NOTE = (
 def statements_of(
     picture_set: store.PictureSet, requirements: list[str] | None, change: str
 ) -> list[str]:
-    """What a correction's drawing is checked against: the picture's own
-    statements, then what the person requires, once each; the change itself
-    when neither says anything."""
+    """What a correction's drawing is checked against, and what the answer
+    quotes: statements in the person's language.
+
+    The picture's own statements come first: the rewrite wrote them in the
+    person's language and keeps them across the changes. What the person
+    requires (written in their language too, dialogue.FOLLOW_SYSTEM) joins
+    them when the picture has none. Two statements of one picture in two
+    wordings are never mixed: an answer quoted one of them in English in a
+    French conversation (staging -191). The change itself (English) is the
+    last resort, and is not quoted back as a constraint."""
+    own = [" ".join(str(s).split()) for s in picture_set.checks if str(s).strip()]
+    if own:
+        return own[:MAX_STATEMENTS]
     found: list[str] = []
-    for statement in [*picture_set.checks, *(requirements or [])]:
+    for statement in requirements or []:
         statement = " ".join(str(statement).split())
         if statement and statement.casefold() not in {f.casefold() for f in found}:
             found.append(statement)
