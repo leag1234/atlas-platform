@@ -1683,7 +1683,12 @@ async def _answer_constraints(
     request: ChatRequest, item: Interaction, holder: "_HeldAnswer | None"
 ) -> None:
     """The person's constraints on the reply, checked by code, repaired once,
-    the rest said (constraints/pipeline.py, docs/33)."""
+    the rest said (constraints/pipeline.py, docs/33).
+
+    Never makes the reply worse: a reply code wrote for a turn that stopped
+    (a failure or limit explanation) is not checked nor rewritten, and an
+    empty result never replaces the reply."""
+    from services.orchestrator import work_plan
     from services.orchestrator.constraints import pipeline as answer_constraints
     from services.orchestrator.deadline import remaining as time_left
 
@@ -1695,11 +1700,15 @@ async def _answer_constraints(
         *item.files,
         *(str(a.get("title") or a.get("id") or "") for a in item.artifacts),
     ]
+    plan = work_plan.current.get()
     spent: list[Decimal] = []
     outcome = await answer_constraints.enforce(
         [(m.role, m.text) for m in request.conversation_messages],
         item.reponse,
-        language=detected_language(item.reponse) or request.answer_language,
+        # The gap note is said in the person's language.
+        language=conversation_language(request.conversation_messages, request.ui_locale)
+        or detected_language(item.reponse)
+        or request.answer_language,
         # Made in this turn: a file, an app or picture version, a drawing,
         # or a deliverable the reply links to.
         produced=bool(
@@ -1713,13 +1722,22 @@ async def _answer_constraints(
         strict=privacy.owned_only(),
         seconds=min(40.0, max(0.0, (left if left is not None else 60.0) - 5.0)),
         spend=spent.append,
+        # The turn's plan stopped: the reply is code's explanation of what
+        # failed (staging -197: a provider refusal rewritten into an invented
+        # answer).
+        # A discarded plan (the chat answered by itself) has no steps left.
+        stopped=plan is not None
+        and plan.finished
+        and not plan.success
+        and bool(plan.steps),
     )
-    if not outcome.constraints:
-        return
-    logging.getLogger(__name__).info(outcome.log_line())
+    logging.getLogger(__name__).warning(outcome.log_line())
     if spent:
         item.cout_eur = float(Decimal(str(item.cout_eur)) + sum(spent, Decimal(0)))
-    item.reponse = outcome.answer
+    if not outcome.constraints:
+        return
+    if outcome.answer.strip():
+        item.reponse = outcome.answer
     if outcome.note:
         item.reponse = unsourced_details.with_note(item.reponse, outcome.note, streamed)
         if streamed and (current_sink := sink_context.get()) is not None:

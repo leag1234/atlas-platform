@@ -166,15 +166,65 @@ every constraint, whoever proposed it:
    was found. Code refuses a rewrite that drops or adds a link, drops a code
    block or adds a figure (list numbers aside). The rewrite is kept only if
    it meets strictly more constraints and breaks none that passed.
-8. What is still not met is said in one closing sentence in the person's
-   language, quoting their own words, for example
-   "This reply does not yet meet what you asked: “at most four steps”."
-   A reply already streamed only gets that sentence.
+8. What code decided is still not met is said in one closing sentence in
+   the person's language, impersonal (right in either register), naming what
+   is missing, for example "This reply does not yet meet the request:
+   sentences: 5, asked: at most 4." A reply already streamed only gets that
+   sentence.
 
 Holding: a reply is held (not streamed) while it is checked only when code
 found a constraint on it (`code`), or when the message has quotation marks
 or form words (`full`). The existing holder of checked answers does this
 (`chat_pipeline._HeldAnswer`); the reply is then sent whole.
+
+## 4 bis. Never worse (staging -197)
+
+The class suite on staging with `full` (-197 against -196) found the pass
+making replies worse. Causes and rules, all enforced by code:
+
+- A turn whose Work run stopped on provider refusals (HTTP 429) got code's
+  explanation as its reply; the pipeline checked that explanation against
+  the request, and the rewrite, which saw only the reply and the
+  constraints, replaced it with an invented answer off the subject, a copy
+  of the person's instruction as a line, and a false gap. Rule: a reply
+  code wrote for a stopped turn (its plan finished without success) is
+  neither checked nor rewritten.
+- Counts that describe one part of the reply ("one menu of four dishes
+  and one of six", "a closing sentence for the card", "three points in
+  each section") were checked on the whole reply. Rule: such constraints
+  are part-scoped (`Constraint.part`, `model.part_of`), as are exact counts
+  of one kind that cannot all hold on the whole reply. They are checked
+  per part when the reply's lists are delimited (each run of list items is
+  a part; "one" constraints are matched one to one with the parts, only
+  when their numbers are equal), otherwise undecided. The same rule sends
+  clashing layout counts of a file to the judge
+  (`expectations.layout_part_scoped`).
+- The rewrite gets the same conversation as the answer. It replaces the
+  reply only when code accepts it (`pipeline.refusal`: not empty, every
+  link, picture, file and code block kept, no content words absent from
+  the reply, the conversation and the asked texts beyond 20 %, no line
+  copied from the person's last message) and it passes strictly more
+  constraints, losing none that passed (`pipeline.better`). Code's own
+  repairs pass the same gate.
+- A gap is said only for a failure code decided; an undecided constraint
+  or a verifier's verdict never is.
+- An empty result never replaces the reply.
+- One `answer_constraints` line per turn (warning level, so it reaches the
+  journal), counts only: constraints by kind, part-scoped, passed, failed,
+  failed for certain, undecided, repairs attempted, kept, dropped and why,
+  calls, cost, seconds, or the reason the turn was skipped.
+
+Measured offline on the 16 turns of -197 where the pass ran (replies
+without their notes, earlier turns as history, `code` mode): gap notes 2
+to 0 (one false, a proposed sentence read as the reply's length; one true,
+a line written inside the paragraph above the link, now moved under it by
+code). The outlines turn with the readings its note shows: false gap on 3
+items to none; its stopped-turn explanation is left as written. The
+labelled cases of section 6 are unchanged (reading 43/44 and 43/43; 18/18
+and 17/17 violations, no false one). The empty reply of -197 (a request to
+resend a link) was not the pipeline: the chat model searched the web, every
+engine refused (upstream_blocked) and the turn ended on search_unavailable,
+an error event with no text.
 
 ## 5. What this slice covers
 
@@ -278,8 +328,8 @@ read as a list count.
   reasoning off, temperature 0, 0.01 EUR cap per call, 12 s, 12 s and 25 s,
   all within the turn's remaining time minus 5 s and 40 s at most. A failed
   call never blocks the turn. Their cost is added to the turn's cost.
-- Every turn with constraints logs one `answer_constraints` JSON line:
-  kinds, sources, passed, failed, unchecked, repair, calls, cost, seconds.
+- Every checked turn logs one `answer_constraints` JSON line, counts only
+  (section 4 bis).
 
 ## 8. Failure modes
 
@@ -289,7 +339,9 @@ read as a list count.
 | model reads a content wish as a form constraint | false failure | forbidden words must be quoted; part-of-reply starts go to the verifier; contradictions resolved before checks |
 | verifier passes without reading | false pass | verdict needs an evidence quotation found in the reply |
 | verifier fails without reason | needless repair | same rule: no evidence, no verdict |
-| repair breaks something | worse reply | kept only with strictly fewer failures and no regression |
+| repair breaks something | worse reply | kept only with strictly more passes, none lost, and accepted by `refusal` |
+| count of one part read as the whole reply's | false gap | part-scoped: per part when delimited, else undecided |
+| reply written by code for a stopped turn | invented answer | not checked nor rewritten |
 | repair invents a fact or drops a link | wrong reply | refused by code |
 | constraint of an earlier turn applied to a later reply | wrong repair | answer constraints bind their own turn unless said to last |
 | reply already streamed | no rewrite possible | closing sentence only |

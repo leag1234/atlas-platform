@@ -35,7 +35,13 @@ import time
 from typing import Any, Awaitable, Callable, Sequence
 
 from services.orchestrator.constraints import checks, phrases, verify
-from services.orchestrator.constraints.model import Constraint, merged
+from services.orchestrator.constraints.model import (
+    Constraint,
+    fold,
+    merged,
+    norm,
+    part_of,
+)
 from services.orchestrator.constraints.views import answer_view
 
 log = logging.getLogger(__name__)
@@ -91,29 +97,51 @@ class Outcome:
     calls: int = 0
     cost_eur: Decimal = Decimal(0)
     seconds: float = 0.0
+    # Why the pipeline did not check this reply ("stopped_turn": a reply code
+    # wrote for a turn that stopped, never rewritten).
+    skipped: str = ""
+    # The repairs tried ("code", "model") and why one was not kept.
+    attempted: list[str] = field(default_factory=list)
+    dropped: list[str] = field(default_factory=list)
 
     def unmet(self) -> list[Constraint]:
-        failed = {result.id for result in self.results if result.passed is False}
+        """What code decided, with certainty, is not met: never an undecided
+        constraint, never a verifier's verdict (the checker's own doubt)."""
+        failed = {
+            result.id
+            for result in self.results
+            if result.passed is False and result.by == "code"
+        }
         return [item for item in self.constraints if item.id in failed]
 
     def log_line(self) -> str:
+        """One line per turn, counts only: never the person's or the reply's
+        words."""
+        kinds: dict[str, int] = {}
+        for item in self.constraints:
+            kinds[item.kind] = kinds.get(item.kind, 0) + 1
         return json.dumps(
             {
                 "event": "answer_constraints",
                 "mode": mode(),
-                "constraints": [
-                    {"id": c.id, "kind": c.kind, "source": c.source}
-                    for c in self.constraints
-                ],
+                "skipped": self.skipped,
+                "constraints": len(self.constraints),
+                "kinds": kinds,
+                "from_model": sum(1 for c in self.constraints if c.source == "model"),
+                "part_scoped": sum(1 for c in self.constraints if c.part),
                 "passed": sum(1 for r in self.results if r.passed is True),
                 "failed": sum(1 for r in self.results if r.passed is False),
-                "unchecked": sum(1 for r in self.results if r.passed is None),
-                "repaired": self.repaired,
+                "failed_certain": len(self.unmet()),
+                "undecided": sum(1 for r in self.results if r.passed is None),
+                "repair_attempted": "+".join(self.attempted),
+                "repair_kept": self.repaired,
+                "repair_dropped": self.dropped,
                 "noted": bool(self.note),
                 "calls": self.calls,
                 "cost_eur": str(self.cost_eur),
                 "seconds": round(self.seconds, 2),
-            }
+            },
+            sort_keys=True,
         )
 
 
@@ -248,12 +276,80 @@ def consistent(found: Sequence[Constraint]) -> list[Constraint]:
     ]
 
 
+COUNT_KINDS = frozenset({"items", "sentences", "paragraphs"})
+
+
+def part_scoped(found: Sequence[Constraint]) -> list[Constraint]:
+    """Constraints about one PART of the reply are never checked against the
+    whole reply. A count or a list form is part-scoped when the person's words
+    describe a part ("one with four dishes and one with six", "the other
+    list", "three points in each section", "two menus"), or when the counts read
+    cannot all hold on the whole reply (two exact counts of the same thing
+    that differ, or the same count asked in two separate places)."""
+    marked = [
+        replace(item, part=part_of(item.quote))
+        if item.scope == "answer"
+        and item.kind in COUNT_KINDS | {"list_style"}
+        and not item.part
+        else item
+        for item in found
+    ]
+    for kind in COUNT_KINDS:
+        group = [
+            index
+            for index, item in enumerate(marked)
+            if item.scope == "answer"
+            and item.kind == kind
+            and item.relation == "exact"
+            and item.count is not None
+            and not item.part
+        ]
+        clash = any(
+            _apart(marked[a], marked[b])
+            for position, a in enumerate(group)
+            for b in group[position + 1 :]
+        )
+        if clash:
+            for index in group:
+                marked[index] = replace(marked[index], part="one")
+    styles = {
+        item.style
+        for item in marked
+        if item.scope == "answer" and item.kind == "list_style" and not item.part
+    }
+    if len(styles) > 1:
+        # Two list forms asked: each is about its own part.
+        marked = [
+            replace(item, part="one")
+            if item.scope == "answer" and item.kind == "list_style"
+            else item
+            for item in marked
+        ]
+    return marked
+
+
+def _apart(first: Constraint, second: Constraint) -> bool:
+    """Two exact counts of the same thing that cannot both describe the whole
+    reply: different numbers, or the same number in separate words (one
+    reading of the same words by code and by the model is one constraint)."""
+    if first.count != second.count:
+        return True
+    one, other = fold(first.quote), fold(second.quote)
+    if not one or not other or one in other or other in one:
+        return False
+    words, others = set(one.split()), set(other.split())
+    return len(words & others) < 0.5 * min(len(words), len(others))
+
+
 def check_all(
     items: Sequence[Constraint], answer: str, facts: dict[str, Any]
 ) -> dict[str, checks.Result]:
     view = answer_view(answer)
     facts = {**facts, "raw": answer}
-    return {item.id: checks.check(item, view, facts) for item in items}
+    whole = [item for item in items if not item.part]
+    results = {item.id: checks.check(item, view, facts) for item in whole}
+    results.update(checks.part_results([item for item in items if item.part], view))
+    return results
 
 
 # ---- repairs by code --------------------------------------------------------------
@@ -287,8 +383,6 @@ def code_repair(answer: str, failed: Sequence[Constraint]) -> str:
 
 
 def _line_after_file(answer: str, text: str) -> str:
-    from services.orchestrator.constraints.model import norm
-
     blocks = _paragraphs(answer)
     links = [index for index, block in enumerate(blocks) if _OWN_LINK.search(block)]
     if not links:
@@ -309,6 +403,24 @@ def _line_after_file(answer: str, text: str) -> str:
             if any(line.strip() for line in rest):
                 kept.append("\n".join(rest))
             continue
+        if index < links[0] and not _OWN_LINK.search(block):
+            # The asked line written as the last sentences of a paragraph
+            # above the link ("... as asked. Tested: no."): those sentences
+            # become the line under the link.
+            sentences = re.split(r"(?<=[.!?…])\s+", block.strip())
+            start = next(
+                (
+                    position
+                    for position, sentence in enumerate(sentences)
+                    if position
+                    and re.sub(r"^[\W_]+", "", norm(sentence)).startswith(wanted)
+                ),
+                None,
+            )
+            if start is not None:
+                moved.append(" ".join(sentences[start:]))
+                kept.append(" ".join(sentences[:start]))
+                continue
         kept.append(block)
     if not moved:
         return answer
@@ -326,28 +438,175 @@ _QUOTES = {
     "es": ("«", "»"),
     "it": ("«", "»"),
 }
+# Impersonal, so that it reads right in either register (tu or vous, du or
+# Sie, tu or usted): the note never addresses the person.
 _NOTE = {
-    "fr": "Cette réponse ne respecte pas encore ce que vous avez demandé : {items}.",
-    "en": "This reply does not yet meet what you asked: {items}.",
-    "de": "Diese Antwort erfüllt noch nicht, was Sie verlangt haben: {items}.",
-    "es": "Esta respuesta aún no cumple lo que pidió: {items}.",
-    "it": "Questa risposta non rispetta ancora quanto richiesto: {items}.",
+    "fr": "Cette réponse ne respecte pas encore la demande : {items}.",
+    "en": "This reply does not yet meet the request: {items}.",
+    "de": "Diese Antwort erfüllt die Anfrage noch nicht: {items}.",
+    "es": "Esta respuesta todavía no cumple la petición: {items}.",
+    "it": "Questa risposta non rispetta ancora la richiesta: {items}.",
 }
 _AND = {"fr": " et ", "en": " and ", "de": " und ", "es": " y ", "it": " e "}
+# What is missing, by kind: {q} the exact text or the person's words, {found}
+# what code measured, {want} what was asked.
+_MISSING: dict[str, dict[str, str]] = {
+    "fr": {
+        "starts_with": "elle ne commence pas par {q}",
+        "ends_with": "elle ne se termine pas par {q}",
+        "contains": "{q} n’y figure pas",
+        "excludes": "{q} y figure encore",
+        "sentences": "phrases : {found}, demandé : {want}",
+        "items": "éléments de liste : {found}, demandé : {want}",
+        "paragraphs": "paragraphes : {found}, demandé : {want}",
+        "part_items": "aucune liste de {want} éléments",
+        "part_each": "liste {k} : {found} éléments, demandé : {want}",
+        "list_style": "la liste n’a pas la forme demandée ({q})",
+        "order": "l’ordre demandé n’est pas suivi ({q})",
+        "after_file": "la ligne {q} n’est pas sous le lien du fichier",
+        "no_intro": "elle commence par une introduction",
+        "only": "elle ajoute du texte autour de ce qui était demandé",
+        "no_new_file": "un fichier a déjà été créé ou modifié",
+        "other": "{q}",
+    },
+    "en": {
+        "starts_with": "it does not begin with {q}",
+        "ends_with": "it does not end with {q}",
+        "contains": "{q} is missing",
+        "excludes": "{q} is still used",
+        "sentences": "sentences: {found}, asked: {want}",
+        "items": "list items: {found}, asked: {want}",
+        "paragraphs": "paragraphs: {found}, asked: {want}",
+        "part_items": "no list of {want} items",
+        "part_each": "list {k}: {found} items, asked: {want}",
+        "list_style": "the list is not in the form asked ({q})",
+        "order": "the order asked is not followed ({q})",
+        "after_file": "the line {q} is not under the file link",
+        "no_intro": "it begins with an introduction",
+        "only": "it adds text around what was asked",
+        "no_new_file": "a file was already created or changed",
+        "other": "{q}",
+    },
+    "de": {
+        "starts_with": "sie beginnt nicht mit {q}",
+        "ends_with": "sie endet nicht mit {q}",
+        "contains": "{q} fehlt",
+        "excludes": "{q} kommt noch vor",
+        "sentences": "Sätze: {found}, verlangt: {want}",
+        "items": "Listenpunkte: {found}, verlangt: {want}",
+        "paragraphs": "Absätze: {found}, verlangt: {want}",
+        "part_items": "keine Liste mit {want} Punkten",
+        "part_each": "Liste {k}: {found} Punkte, verlangt: {want}",
+        "list_style": "die Liste hat nicht die verlangte Form ({q})",
+        "order": "die verlangte Reihenfolge fehlt ({q})",
+        "after_file": "die Zeile {q} steht nicht unter dem Dateilink",
+        "no_intro": "sie beginnt mit einer Einleitung",
+        "only": "sie enthält mehr als das Verlangte",
+        "no_new_file": "eine Datei wurde bereits erstellt oder geändert",
+        "other": "{q}",
+    },
+    "es": {
+        "starts_with": "no empieza por {q}",
+        "ends_with": "no termina con {q}",
+        "contains": "falta {q}",
+        "excludes": "todavía aparece {q}",
+        "sentences": "frases: {found}, se pidió: {want}",
+        "items": "elementos de lista: {found}, se pidió: {want}",
+        "paragraphs": "párrafos: {found}, se pidió: {want}",
+        "part_items": "ninguna lista de {want} elementos",
+        "part_each": "lista {k}: {found} elementos, se pidió: {want}",
+        "list_style": "la lista no tiene la forma pedida ({q})",
+        "order": "no sigue el orden pedido ({q})",
+        "after_file": "la línea {q} no está debajo del enlace del archivo",
+        "no_intro": "empieza con una introducción",
+        "only": "añade texto alrededor de lo pedido",
+        "no_new_file": "ya se creó o modificó un archivo",
+        "other": "{q}",
+    },
+    "it": {
+        "starts_with": "non inizia con {q}",
+        "ends_with": "non finisce con {q}",
+        "contains": "manca {q}",
+        "excludes": "compare ancora {q}",
+        "sentences": "frasi: {found}, richiesto: {want}",
+        "items": "elementi dell’elenco: {found}, richiesto: {want}",
+        "paragraphs": "paragrafi: {found}, richiesto: {want}",
+        "part_items": "nessun elenco di {want} elementi",
+        "part_each": "elenco {k}: {found} elementi, richiesto: {want}",
+        "list_style": "l’elenco non ha la forma richiesta ({q})",
+        "order": "non segue l’ordine richiesto ({q})",
+        "after_file": "la riga {q} non è sotto il link del file",
+        "no_intro": "inizia con un’introduzione",
+        "only": "aggiunge testo attorno a quanto richiesto",
+        "no_new_file": "un file è già stato creato o modificato",
+        "other": "{q}",
+    },
+}
+_WANT = {
+    "fr": {"exact": "{n}", "max": "{n} au plus", "min": "au moins {n}"},
+    "en": {"exact": "{n}", "max": "at most {n}", "min": "at least {n}"},
+    "de": {"exact": "{n}", "max": "höchstens {n}", "min": "mindestens {n}"},
+    "es": {"exact": "{n}", "max": "como máximo {n}", "min": "al menos {n}"},
+    "it": {"exact": "{n}", "max": "al massimo {n}", "min": "almeno {n}"},
+}
 LABEL_CHARACTERS = 90
+_FOUND = re.compile(r"^(?:page \d+: )?(\d+) ")
+_PART_FOUND = re.compile(r"^list (\d+): (\d+) ")
 
 
-def note(language: str, unmet: Sequence[Constraint]) -> str:
+def _clip(text: str) -> str:
+    text = " ".join(text.split()).rstrip(" .;,")
+    if len(text) > LABEL_CHARACTERS:
+        text = text[: LABEL_CHARACTERS - 1].rstrip() + "…"
+    return text
+
+
+def missing(
+    language: str, item: Constraint, result: checks.Result | None = None
+) -> str:
+    """What is missing, in the person's language, for one constraint."""
+    language = language if language in _MISSING else "en"
+    table = _MISSING[language]
+    left, right = _QUOTES[language]
+    quoted = (
+        item.text
+        if item.kind
+        in {"starts_with", "ends_with", "contains", "excludes", "after_file"}
+        else item.label()
+    )
+    q = f"{left}{_clip(quoted)}{right}"
+    if item.kind in COUNT_KINDS and item.count is not None:
+        want = _WANT[language][item.relation].format(n=item.count)
+        if item.part:
+            if item.kind != "items":
+                return table["other"].format(q=q)
+            part = _PART_FOUND.match(result.evidence) if result is not None else None
+            if item.part == "each" and part is not None:
+                return table["part_each"].format(
+                    k=part.group(1), found=part.group(2), want=want
+                )
+            return table["part_items"].format(want=want)
+        found = _FOUND.match(result.evidence) if result is not None else None
+        if found is not None:
+            return table[item.kind].format(found=found.group(1), want=want)
+        return table["other"].format(q=q)
+    return table.get(item.kind, table["other"]).format(q=q)
+
+
+def note(
+    language: str,
+    unmet: Sequence[Constraint],
+    results: dict[str, checks.Result] | None = None,
+) -> str:
+    """One closing sentence naming what is missing, for what code decided is
+    not met; empty when nothing is."""
     if not unmet:
         return ""
     language = language if language in _NOTE else "en"
-    left, right = _QUOTES[language]
-    labels: list[str] = []
-    for item in unmet[:4]:
-        label = item.label().rstrip(" .;,")
-        if len(label) > LABEL_CHARACTERS:
-            label = label[: LABEL_CHARACTERS - 1].rstrip() + "…"
-        labels.append(f"{left}{label}{right}")
+    results = results or {}
+    labels = list(
+        dict.fromkeys(missing(language, item, results.get(item.id)) for item in unmet)
+    )[:4]
     text = (
         ", ".join(labels[:-1])
         + (_AND[language] if len(labels) > 1 else "")
@@ -356,11 +615,79 @@ def note(language: str, unmet: Sequence[Constraint]) -> str:
     return _NOTE[language].format(items=text)
 
 
+# ---- what a repair may not do ---------------------------------------------------------
+
+_LINK_TARGET = re.compile(r"\]\(([^)\s]+)\)")
+_URL = re.compile(r"https?://[^\s)\]>]+")
+_FENCED = re.compile(r"(`{3,}|~{3,})[^\n]*+\n.*?\1", re.S)
+_CONTENT_WORD = re.compile(r"[^\W\d_]{5,}")
+NEW_WORDS_SHARE = 0.2
+NEW_WORDS_FLOOR = 2
+PARROT_WORDS = 3
+
+
+def delivered(answer: str) -> set[str]:
+    """What the reply delivers and a repair must keep: links (files, app
+    versions, pictures, sources) and code blocks."""
+    found = set(_LINK_TARGET.findall(answer)) | set(_URL.findall(answer))
+    found |= {match.group(0) for match in _FENCED.finditer(answer)}
+    return found
+
+
+def _words(text: str) -> set[str]:
+    plain = re.sub(r"\]\([^)]*\)", "]", text)
+    return set(_CONTENT_WORD.findall(fold(plain)))
+
+
+def refusal(
+    original: str,
+    repaired: str,
+    person: Sequence[str],
+    shown: str,
+    allowed: Sequence[str],
+) -> str:
+    """Why a repaired reply may not replace the original ("" when it may).
+
+    A repair changes the form, never the subject or the content: it keeps
+    every delivered item, adds no content the reply, the conversation or the
+    asked texts did not have, and never writes the person's instructions back
+    as reply text."""
+    if not repaired.strip():
+        return "empty"
+    if not delivered(original) <= delivered(repaired):
+        return "lost_delivered"
+    sources = set().union(
+        *(_words(text) for text in [original, shown, *person, *allowed])
+    )
+    added = _words(repaired) - sources
+    if len(added) > max(NEW_WORDS_FLOOR, NEW_WORDS_SHARE * len(_words(repaired))):
+        return "new_content"
+    asked = [fold(text) for text in person[-1:]]
+    kept = fold(original)
+    exact = [fold(text) for text in allowed if text]
+    for line in re.split(r"[\n.!?;:]+", repaired):
+        folded = fold(line)
+        if (
+            len(folded.split()) >= PARROT_WORDS
+            and folded not in kept
+            and any(folded in message for message in asked)
+            and not any(folded in text or text in folded for text in exact)
+        ):
+            return "parrots_request"
+    return ""
+
+
 # ---- the pass -------------------------------------------------------------------------
 
 
-def _score(results: dict[str, checks.Result]) -> int:
-    return sum(1 for result in results.values() if result.passed is False)
+def _passed(results: dict[str, checks.Result]) -> set[str]:
+    return {key for key, result in results.items() if result.passed is True}
+
+
+def better(before: dict[str, checks.Result], after: dict[str, checks.Result]) -> bool:
+    """A repair is kept only when it passes strictly more constraints and
+    loses none that passed."""
+    return _passed(before) < _passed(after)
 
 
 async def enforce(
@@ -377,13 +704,22 @@ async def enforce(
     complete: COMPLETE | None = None,
     spend: Callable[[Decimal], None] | None = None,
     run_mode: str | None = None,
+    stopped: bool = False,
 ) -> Outcome:
-    """The reply checked against the person's constraints, repaired once."""
+    """The reply checked against the person's constraints, repaired once.
+
+    stopped: the reply is the one code wrote for a turn that stopped (a
+    failure, a limit): the person's constraints are on the answer they asked
+    for, not on that explanation, which is never checked nor rewritten."""
     started = time.monotonic()
     current = run_mode or mode()
+    original = answer
     outcome = Outcome(answer)
     person = [text for role, text in messages if role == "user"]
     if current == "off" or not person or not answer.strip():
+        return outcome
+    if stopped:
+        outcome.skipped = "stopped_turn"
         return outcome
     turn = len(person)
     latest = person[-1]
@@ -404,20 +740,21 @@ async def enforce(
             lambda reply: verify.parse_reading(reply, turn, person, shown),
         )
         found = verify.deduplicated(found, read or [])
-    items = merged(consistent(applicable(found, turn)))
+    items = merged(part_scoped(consistent(applicable(found, turn))))
     outcome.constraints = items
     if not items:
         outcome.seconds = time.monotonic() - started
         outcome.calls, outcome.cost_eur = calls.count, calls.cost
         return outcome
     facts: dict[str, Any] = {"produced": produced, "made": made}
+    allowed = [text for item in items for text in (item.text, *item.items) if text]
 
     async def judged(text: str) -> dict[str, checks.Result]:
         results = check_all(items, text, facts)
         open_items = [
             item
             for item in items
-            if results[item.id].passed is None and item.kind in {"judge"}
+            if results[item.id].passed is None and (item.kind == "judge" or item.part)
         ]
         if current == "full" and open_items and left() > MIN_SECONDS:
             verdicts = await calls.json(
@@ -432,6 +769,7 @@ async def enforce(
     results = await judged(answer)
     failed = [item for item in items if results[item.id].passed is False]
     if failed and not streamed:
+        outcome.attempted.append("code")
         repaired = code_repair(answer, failed)
         if repaired.strip() and repaired != answer:
             again = check_all(items, repaired, facts)
@@ -443,36 +781,49 @@ async def enforce(
                     and value.by == "model"
                 ):
                     again[key] = value
-            if _score(again) < _score(results) and not _broke(results, again):
+            why = refusal(answer, repaired, person, shown, allowed) or (
+                "" if better(results, again) else "no_gain"
+            )
+            if why:
+                outcome.dropped.append("code:" + why)
+            else:
                 answer, results, outcome.repaired = repaired, again, "code"
+        else:
+            outcome.dropped.append("code:unchanged")
         failed = [item for item in items if results[item.id].passed is False]
         rewritable = [item for item in failed if item.kind in REWRITABLE]
         if current == "full" and rewritable and left() > MIN_SECONDS:
+            outcome.attempted.append("model")
             numbers = [str(item.count) for item in items if item.count is not None]
             rewritten = await calls.json(
                 verify.repair_messages(
-                    answer, [(item, results[item.id]) for item in rewritable]
+                    answer,
+                    [(item, results[item.id]) for item in rewritable],
+                    messages,
                 ),
                 verify.REPAIR_TOKENS,
                 min(REPAIR_SECONDS, left()),
                 lambda reply: verify.parse_repair(reply, answer, numbers),
             )
-            if rewritten:
-                again = await judged(rewritten)
-                if _score(again) < _score(results) and not _broke(results, again):
+            if not rewritten:
+                outcome.dropped.append("model:no_valid_rewrite")
+            else:
+                why = refusal(answer, rewritten, person, shown, allowed)
+                again = await judged(rewritten) if not why else results
+                if not why and not better(results, again):
+                    why = "no_gain"
+                if why:
+                    outcome.dropped.append("model:" + why)
+                else:
                     answer, results = rewritten, again
                     outcome.repaired = (outcome.repaired + "+model").lstrip("+")
+    if not answer.strip():
+        # Whatever produced it, an empty reply is never shown.
+        answer, outcome.repaired = original, ""
+        results = await judged(answer)
     outcome.answer = answer
     outcome.results = [results[item.id] for item in items]
-    outcome.note = note(language, outcome.unmet())
+    outcome.note = note(language, outcome.unmet(), results)
     outcome.calls, outcome.cost_eur = calls.count, calls.cost
     outcome.seconds = time.monotonic() - started
     return outcome
-
-
-def _broke(before: dict[str, checks.Result], after: dict[str, checks.Result]) -> bool:
-    """A repair never breaks a constraint that passed."""
-    return any(
-        result.passed is True and after[key].passed is False
-        for key, result in before.items()
-    )

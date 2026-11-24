@@ -70,6 +70,10 @@ class Constraint:
     each: bool = False
     # Applies to later replies too ("always", "from now on").
     lasting: bool = False
+    # A reply's constraint read from words about one PART of it (one of two
+    # lists, each option): "" the whole reply, "one" one of several parts,
+    # "each" every part. Never checked against the whole reply (PARTS).
+    part: str = ""
     source: str = "code"
     id: str = field(default="", compare=False)
 
@@ -91,6 +95,9 @@ class Constraint:
             self.region,
             self.page,
             self.each,
+            self.part,
+            # Two parts asked with the same count are two requirements.
+            fold(self.quote) if self.part else "",
         )
 
 
@@ -334,3 +341,90 @@ def merged(found: Sequence[Constraint]) -> list[Constraint]:
         seen.add(key)
         kept.append(replace(item, id=f"K{len(kept) + 1}"))
     return kept
+
+
+# ---- constraints about one part of the reply ------------------------------------
+
+# A count, in figures or in words of the five languages.
+_COUNT = (
+    r"(?:\d{1,3}|one|two|three|four|five|six|seven|eight|nine|ten|un|une|deux|"
+    r"trois|quatre|cinq|six|sept|huit|neuf|dix|ein|eine|einen|zwei|drei|vier|"
+    r"funf|fuenf|sechs|sieben|acht|neun|zehn|uno|una|dos|tres|cuatro|cinco|"
+    r"seis|siete|ocho|nueve|diez|due|tre|quattro|cinque|sette|otto|nove|dieci)"
+)
+# Words for the parts a reply is made of: lists, outlines, options, sections.
+_CONTAINER = (
+    r"(?:lists?|outlines?|options?|variants?|versions?|proposals?|sections?|"
+    r"parts?|blocks?|tables?|plans?|menus?|groups?|columns?|"
+    r"listes?|sommaires?|variantes?|propositions?|parties|partie|blocs?|"
+    r"tableaux|tableau|groupes?|colonnes?|"
+    r"listen|liste|gliederung\w*|option\w*|variante\w*|vorschlag\w*|vorschlage|"
+    r"teile?|abschnitt\w*|tabellen?|gruppen?|spalten?|"
+    r"listas?|esquemas?|opcion\w*|propuestas?|partes?|seccion\w*|tablas?|"
+    r"grupos?|columnas?|elenchi|elenco|schem\w*|opzion\w*|variant\w*|propost\w*|"
+    r"parti|sezion\w*|tabell\w*|grupp\w*|colonn\w*)"
+)
+_EACH_PART = re.compile(
+    r"\b(?:each|every|chaque|pour chacun\w*|chacun\w*|jede\w*|jeweils|cada|ogni|"
+    r"ciascun\w*)\b"
+    # "every time", "every reply" in any language: a constraint that lasts,
+    # not a part.
+    r"(?!\s(?:time|times|answer|reply|response|fois|reponse|mal|antwort|vez|"
+    r"respuesta|volta|risposta)\b)"
+    rf"|\b{_COUNT}\s(?:\w+\s){{0,2}}(?:par|per|pro|por)\s(?!{_COUNT}\b)\w{{3,}}"
+)
+_ONE_PART = re.compile(
+    # "one with three", "one of five" in the five languages
+    r"\b(?:one|un|une|einer|eine|eines|uno|una)\s(?:en|de|avec|a|with|of|in|"
+    rf"mit|von|zu|con|da|di)\s{_COUNT}\b"
+    # "the other", "the second one" in the five languages
+    r"|\b(?:the other|another|the first|the second|the last|one of|"
+    r"l autre|un autre|une autre|l un|l une|le premier|la premiere|le second|"
+    r"la seconde|le deuxieme|la deuxieme|le dernier|la derniere|"
+    r"der andere|die andere|das andere|der erste|die erste|das erste|"
+    r"der zweite|die zweite|das zweite|der letzte|die letzte|einer davon|"
+    r"el otro|la otra|el primero|la primera|el segundo|la segunda|uno de|una de|"
+    r"l altro|l altra|il primo|la prima|il secondo|la seconda|uno dei|una delle)\b"
+    # "two outlines", "three lists": several parts named in the same words
+    rf"|\b(?:2|3|4|5|two|three|four|five|deux|trois|quatre|cinq|zwei|drei|vier|"
+    rf"funf|fuenf|dos|tres|cuatro|cinco|due|tre|quattro|cinque)\s(?:\w+\s)?"
+    rf"{_CONTAINER}\b"
+)
+# "between three and five" is one range for the whole reply, not two parts.
+_RANGE = re.compile(r"\b(?:between|entre|zwischen|tra|fra)\b")
+_TWO_COUNTS = re.compile(
+    rf"\b{_COUNT}\b[^.;:!?]{{0,40}}\b(?:and|et|und|y|e|or|ou|oder|o)\b"
+    rf"[^.;:!?]{{0,40}}\b{_COUNT}\b"
+)
+
+
+# "a closing sentence for the card", "a sentence for the invitation": a
+# sentence offered as an item inside the reply (which may say more around it), not the
+# reply's own length, unlike "in one sentence" ("en une phrase").
+_OFFERED_SENTENCE = re.compile(
+    rf"\b(\w+)\s{_COUNT}\s(?:\w+\s)?(?:phrases?|sentences?|satz|satze|saetze|"
+    r"frases?|frasi)\s(?:de|d|pour|for|of|fur|fuer|zum|zur|para|per|di|da)\s\w+"
+)
+_REPLY_FORM = frozenset({"en", "in", "dans", "con", "auf", "mit", "as", "comme"})
+
+
+def part_of(quote: str) -> str:
+    """Whether the person's words describe one PART of the reply (one of two
+    menus, the other list), each part ("three points in each section"), or
+    the whole reply (""). Read on the words alone; the pipeline also reads
+    counts that cannot all hold on the whole reply."""
+    folded = fold(quote)
+    if not folded:
+        return ""
+    if _EACH_PART.search(folded):
+        return "each"
+    if _ONE_PART.search(folded):
+        return "one"
+    if _TWO_COUNTS.search(folded) and not _RANGE.search(folded):
+        return "one"
+    if any(
+        match.group(1) not in _REPLY_FORM
+        for match in _OFFERED_SENTENCE.finditer(folded)
+    ):
+        return "one"
+    return ""

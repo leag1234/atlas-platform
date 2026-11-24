@@ -11,6 +11,7 @@ reading would send right answers to repair.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from itertools import permutations
 import re
 from typing import Any, Sequence
 
@@ -349,3 +350,93 @@ def _removed(raw: str, reduced: str) -> str:
         if line.strip() and norm(line) not in kept
     ]
     return " | ".join(gone[:3])
+
+
+# ---- constraints about one part of the reply ---------------------------------------
+
+LIST_ITEMS = frozenset({"bullet", "numbered", "checkbox"})
+MAX_PARTS = 6
+
+
+def list_runs(view: View) -> list[tuple[int, bool]]:
+    """The reply's lists in order: the number of items of each run of list
+    items, and whether a heading or a label line ("Option B:") introduces it.
+    Any other block (a heading, a paragraph, a file link) ends a run."""
+    runs: list[tuple[int, bool]] = []
+    count = 0
+    headed = False
+    previous: Block | None = None
+    for block in view.blocks:
+        if block.kind in LIST_ITEMS:
+            if not count:
+                headed = previous is not None and (
+                    previous.kind == "heading"
+                    or (
+                        previous.kind == "paragraph"
+                        and previous.text.rstrip().endswith(":")
+                        and len(previous.text.split()) <= 14
+                    )
+                )
+            count += 1
+        else:
+            if count:
+                runs.append((count, headed))
+            count = 0
+        previous = block
+    if count:
+        runs.append((count, headed))
+    return runs
+
+
+def part_results(items: Sequence[Constraint], view: View) -> dict[str, Result]:
+    """Constraints about one part of the reply (one of two outlines, each
+    option), checked per part when the parts are clearly delimited, otherwise
+    undecided (left to the verifier, never stated as a gap).
+
+    Only list-item counts are read per part: each run of list items is a part.
+    "each": every part meets the count. "one": the constraints about single
+    parts are matched one to one with the parts, and only when there are as
+    many parts as such constraints; a count no part meets is a failure."""
+    results = {item.id: Result(item.id, None) for item in items}
+    runs = list_runs(view)
+    if len(runs) < 2:
+        return results
+    counted = [
+        item for item in items if item.kind == "items" and item.count is not None
+    ]
+    sizes = ", ".join(str(size) for size, _ in runs)
+    for item in counted:
+        if item.part != "each":
+            continue
+        failing = [
+            index for index, (size, _) in enumerate(runs) if not _relation(size, item)
+        ]
+        if not failing:
+            results[item.id] = Result(
+                item.id, True, f"{len(runs)} lists: {sizes} item(s)"
+            )
+        elif all(headed for _, headed in runs):
+            # Every list is introduced as a part of its own: a part that does
+            # not meet the count is certain.
+            first = failing[0]
+            results[item.id] = Result(
+                item.id, False, f"list {first + 1}: {runs[first][0]} item(s)"
+            )
+    ones = [item for item in counted if item.part == "one"]
+    if ones and len(ones) == len(runs) and len(ones) <= MAX_PARTS:
+        best = max(
+            permutations(range(len(runs))),
+            key=lambda order: sum(
+                _relation(runs[index][0], item) for item, index in zip(ones, order)
+            ),
+        )
+        for item, index in zip(ones, best):
+            size = runs[index][0]
+            results[item.id] = Result(
+                item.id,
+                _relation(size, item),
+                f"list {index + 1}: {size} item(s)"
+                if _relation(size, item)
+                else f"lists of {sizes} item(s)",
+            )
+    return results

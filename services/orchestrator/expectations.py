@@ -584,6 +584,36 @@ def layout_constraint(item: Requirement) -> Any:
     )
 
 
+def layout_part_scoped(items: Sequence[Requirement]) -> set[str]:
+    """Layout counts that describe one part of the file, not the place they
+    name (docs/33): exact counts of the same rule at the same place that
+    cannot all hold there (different numbers, or the same number asked twice
+    in separate words), or a count stated in words about one part ("one
+    list of four and one of six"). They go to the judge."""
+    from services.orchestrator.constraints.model import fold, part_of
+
+    counted = [
+        item
+        for item in items
+        if item.method == "code"
+        and item.check.get("part") == "layout"
+        and item.check.get("rule") in {"items", "paragraphs"}
+    ]
+    scoped = {item.id for item in counted if part_of(item.statement) == "one"}
+    groups: dict[tuple[str, str], list[Requirement]] = {}
+    for item in counted:
+        if str(item.check.get("relation") or "exact") != "exact":
+            continue
+        key = (str(item.check.get("rule")), str(item.check.get("where") or ""))
+        groups.setdefault(key, []).append(item)
+    for group in groups.values():
+        counts = {item.check.get("count") for item in group}
+        statements = {fold(item.statement) for item in group}
+        if len(group) > 1 and (len(counts) > 1 or len(statements) > 1):
+            scoped |= {item.id for item in group}
+    return scoped
+
+
 def layout_result(item: Requirement, view: Any) -> Result:
     """A layout requirement checked on the file's view; None when code
     cannot decide (the judge then reads the file)."""
@@ -1782,8 +1812,13 @@ class TurnLedger:
     ) -> list[Result]:
         results: dict[str, Result] = {}
         to_judge: list[Requirement] = []
+        part_scoped = layout_part_scoped(self.ledger.active())
         for item in self.ledger.active():
-            if item.method == "code" and item.check.get("part") == "layout":
+            if item.id in part_scoped:
+                # A count about one part of the file, never checked on the
+                # whole file or every page: the judge reads it.
+                to_judge.append(item)
+            elif item.method == "code" and item.check.get("part") == "layout":
                 # Read on the built file; undecided, the judge reads it.
                 layout = layout_result(item, view)
                 if layout.passed is None:

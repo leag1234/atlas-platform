@@ -226,15 +226,15 @@ class CodeRepairs(unittest.TestCase):
         self.assertTrue(outcome.answer.startswith("1. Riega"))
         self.assertEqual(outcome.note, "")
 
-    def test_unmet_is_said_in_the_persons_words(self) -> None:
+    def test_unmet_names_what_is_missing(self) -> None:
         messages = [("user", "Beschreibe den Leuchtturm ohne das Wort „romantisch“.")]
         answer = "Der Leuchtturm steht romantisch auf der Klippe."
         outcome = run(
             pipeline.enforce(messages, answer, language="de", run_mode="code")
         )
         self.assertEqual(outcome.answer, answer)
-        self.assertIn("ohne das Wort „romantisch“", outcome.note)
-        self.assertTrue(outcome.note.startswith("Diese Antwort erfüllt noch nicht"))
+        self.assertIn("„romantisch“ kommt noch vor", outcome.note)
+        self.assertTrue(outcome.note.startswith("Diese Antwort erfüllt die Anfrage"))
 
     def test_a_file_made_against_a_deferral_is_said(self) -> None:
         messages = [
