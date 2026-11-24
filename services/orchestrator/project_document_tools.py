@@ -697,7 +697,11 @@ async def publish(
         document = text_document(args["content"], path.suffix)
         content = None
     else:
-        content = kept_title(tools, path, Content.model_validate(args["content"]))
+        content = asked_title_set(
+            tools,
+            path,
+            kept_title(tools, path, Content.model_validate(args["content"])),
+        )
         if append_sources:
             content = include_sources(
                 content, source_texts, deck=path.suffix == ".pptx"
@@ -1050,6 +1054,41 @@ async def publish(
         # the plan and the closing may say of it (deliverable_check.py).
         verification=deliverable_check.verification(checked),
     )
+
+
+def asked_title_set(tools: Any, path: PurePosixPath, content: Content) -> Content:
+    """The content titled exactly as the person's message names it.
+
+    "Title it 'Four Days, Full Output'": the title is that text, as written
+    (punctuation and case), whatever title the writer sent; a heading that
+    repeated the writer's title takes it too. Set by code, never left to a
+    rewrite after a refusal (a rewrite kept dropping the comma). A message
+    that names no title changes nothing.
+    """
+    from services.orchestrator.deliverable_check import asked_title
+
+    request = getattr(tools, "request_text", "")
+    asked = " ".join(asked_title(request).split()) if isinstance(request, str) else ""
+    if not asked or content.title == asked:
+        return content
+    previous = content.title
+    sections = [
+        section.model_copy(update=dict(heading=asked))
+        if section.heading == previous
+        else section
+        for section in content.sections
+    ]
+    titled = Content.model_validate(
+        {
+            **content.model_dump(),
+            "title": asked,
+            "sections": [section.model_dump() for section in sections],
+        }
+    )
+    titles = getattr(tools, "built_titles", None)
+    if isinstance(titles, dict):
+        titles[str(path)] = asked
+    return titled
 
 
 def kept_title(tools: Any, path: PurePosixPath, content: Content) -> Content:
