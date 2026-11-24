@@ -316,6 +316,71 @@ class AppTurnTests(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaises(artifact_store.ArtifactError):
                     artifact_store.read(artifact_id, OWNER, 2)
 
+    async def test_identical_code_keeps_the_answer_to_what_was_asked(self) -> None:
+        """The plain statement comes first; what the model wrote follows when it
+        claims no change (the answer to a complaint or a question), and a
+        complaint answered only by claims of change gets what to do next."""
+        cases = (
+            (
+                "de",
+                "Der Zähler zeigt bei mir 20 statt 21, bitte korrigieren",
+                "Ich habe den Zähler korrigiert. Der Code zählt 17, 21, 25 und "
+                "setzt auf 17 zurück. Nicht im Browser ausgeführt.",
+                "Der Code zählt 17, 21, 25",
+                "Es wurde nichts",
+            ),
+            (
+                "fr",
+                "Le minuteur affiche 20 au lieu de 21, corrige-le",
+                "J'ai corrigé le minuteur. Le code affiche 17, puis 21, puis 25. "
+                "Test navigateur : non exécuté.",
+                "Le code affiche 17, puis 21, puis 25",
+                "Rien n'a été modifié",
+            ),
+            (
+                "en",
+                "The tally shows 20 instead of 21, please fix it",
+                "I fixed the tally. It now adds 4 per press.",
+                "I wrote the same code again",
+                "Nothing was changed",
+            ),
+            (
+                "es",
+                "El contador muestra 20 en lugar de 21, corrígelo",
+                "He corregido el contador. Ahora suma 4. Al recargar vuelve a 17.",
+                "Al recargar vuelve a 17",
+                "No se ha cambiado nada",
+            ),
+        )
+        for language, text, written, expected, statement in cases:
+            with self.subTest(language=language):
+                created = artifact_store.create(
+                    OWNER, "Minuteur", "minuteur.html", APP.encode(), "request-1"
+                )
+                artifact_id = str(created["id"])
+                history = [
+                    {"role": "user", "content": "Crée un compteur"},
+                    {
+                        "role": "assistant",
+                        "content": footer(
+                            artifact_id, 1, "Minuteur", "minuteur.html", language
+                        ),
+                    },
+                ]
+                item, _, _ = await self.turn(
+                    [answer(APP, after=written)],
+                    self.request(text, history, lang=language),
+                    intent="modify",
+                )
+                self.assertEqual(item.artifacts, [])
+                self.assertTrue(item.reponse.startswith(statement), item.reponse)
+                self.assertIn(expected, item.reponse)
+                for claim in ("corrigé", "korrigiert", "I fixed", "corregido"):
+                    self.assertNotIn(claim, item.reponse)
+                self.assertNotIn("now adds", item.reponse)
+                self.assertNotIn("Ahora suma", item.reponse)
+                self.assertNotIn("/versions/2/", item.reponse)
+
     async def test_drawing_is_stored_as_a_page_around_the_svg(self) -> None:
         item, model, events = await self.turn(
             [answer(SVG, "svg", "Un mouton tout rond.")],

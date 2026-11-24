@@ -66,7 +66,7 @@ from services.orchestrator.artifact_tools import (
     PROBLEM_DETAILS,
     CurrentArtifact,
     compose_answer,
-    identical_sentence,
+    identical_answer,
 )
 from services.orchestrator.chat_schema import ChatRequest
 from services.orchestrator.interactions import Interaction
@@ -737,7 +737,17 @@ async def process_app_turn(
             item.artifacts = []
             item.reponse = compose_answer(
                 "",
-                identical_sentence(previous.version, language),
+                identical_answer(
+                    _held_to_facts(
+                        candidate.summary,
+                        app_facts.measure(candidate.document),
+                        language,
+                    )
+                    if kind == "app"
+                    else candidate.summary,
+                    previous.version,
+                    language,
+                ),
                 previous.artifact_id,
                 previous.version,
                 previous.title or candidate.title,
