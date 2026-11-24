@@ -145,6 +145,78 @@ FOOTER = re.compile(r"\\footer\b[:\s]*(.*)")
 RANK = {"paragraphs": 0, "bullets": 1, "tables": 2, "images": 3}
 
 
+# A line that titles the text under it, written without any mark: short, not a
+# sentence (no closing punctuation), alone between blank lines.
+TITLE_WORDS = 8
+TITLE_CHARACTERS = 70
+TITLE_BODY_WORDS = 6
+TITLE_MINIMUM = 2
+_MARK = re.compile(r"#{1,6}\s+\S")
+_LISTED = re.compile(r"(?:[-+*]|\d+[.)])\s+\S")
+
+
+def marked_titles(lines: list[str], title: str) -> list[str]:
+    """The lines of a text whose section titles were written as plain lines,
+    with each title marked as a heading ("## Title").
+
+    Staging -187, -188 and -191: a Word report came with "Introduction",
+    "Calendrier du projet" and "Conclusion" as plain paragraphs (styles Title
+    and Normal only): the writer sent no heading mark, so the structure was
+    neither visible nor navigable. A text with no heading at all is read for
+    them: a block of one short line that is no sentence and no list or table,
+    followed by a paragraph of some length, a list or a table, is a section
+    title when at least two such blocks are found (a poem's short lines are
+    followed by short lines, never by a paragraph). A text that has a heading
+    mark is left as written.
+    """
+    if any(_MARK.match(line.strip()) for line in lines[1:]):
+        return lines
+    blocks: list[list[int]] = []
+    current: list[int] = []
+    for number, line in enumerate(lines):
+        if line.strip():
+            current.append(number)
+        elif current:
+            blocks.append(current)
+            current = []
+    if current:
+        blocks.append(current)
+
+    def body(block: list[int]) -> bool:
+        first = lines[block[0]].strip()
+        if _LISTED.match(first) or "|" in first:
+            return True
+        words = " ".join(lines[number].strip() for number in block).split()
+        return len(words) >= TITLE_BODY_WORDS
+
+    def plain(line: str) -> bool:
+        words = line.split()
+        return (
+            0 < len(words) <= TITLE_WORDS
+            and len(line) <= TITLE_CHARACTERS
+            and not line.startswith(("\\", "!", "#", "|", "*", "_", "`"))
+            and not _LISTED.match(line)
+            and line[-1] not in ".!?:;,…"
+            and line.casefold() != title.strip().casefold()
+        )
+
+    found = [
+        block[0]
+        for index, block in enumerate(blocks[:-1])
+        if len(block) == 1
+        and (index > 0 or blocks[0][0] > 0 or lines[0].strip() != title.strip())
+        and plain(lines[block[0]].strip())
+        and body(blocks[index + 1])
+        and len(blocks[index + 1]) >= 1
+    ]
+    if len(found) < TITLE_MINIMUM:
+        return lines
+    marked = list(lines)
+    for number in found:
+        marked[number] = "## " + lines[number].strip()
+    return marked
+
+
 def markdown(text: str, title: str, *, grouped: bool = True) -> Content:
     """A deliberately small text format: headings, paragraphs, lists and tables.
 
@@ -166,6 +238,8 @@ def markdown(text: str, title: str, *, grouped: bool = True) -> Content:
     )
     paragraph: list[str] = []
     lines = text.splitlines()
+    if grouped:
+        lines = marked_titles(lines, title)
     cover = broken = False
     footer: str | None = None
     depths = [
