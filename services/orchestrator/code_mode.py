@@ -46,6 +46,25 @@ from services.orchestrator.work_clock import work_context
 from services.orchestrator.work_plan import instruction as plan_instruction
 
 
+def requested_suffix(text: str, routed: Any) -> str | None:
+    """The format of the file a request names: an office format (a Word note),
+    else the one text format its file name gives (a vector picture, a CSV);
+    None when it names none, or when the turn is no file request."""
+    from packages.text_deliverables import named_text_suffix
+    from packages.work_intent import named_office_format, work_reason
+
+    named_format = (
+        routed.office_format if routed is not None else named_office_format(text)
+    )
+    if named_format:
+        return "." + named_format
+    if routed is not None:
+        file_turn = routed.kind == "file"
+    else:
+        file_turn = work_reason(text) == "file"
+    return named_text_suffix(text) if file_turn else None
+
+
 def code_profile() -> str:
     routing = yaml.safe_load(Path("services/model-gateway/routing.yaml").read_text())
     return next(
@@ -940,17 +959,11 @@ async def process_work(
     tools.lang = request.lang
     # The person's answer to an approval asked in the conversation (chat_work.py).
     tools.machine_approval = request.__dict__.get("machine_approval")
-    from packages.work_intent import named_office_format
     from services.orchestrator.request_router import decision as routed_decision
 
     # A chat turn routed by the model carries its decision into Work.
     routed = routed_decision(request)
-    named_format = (
-        routed.office_format
-        if routed is not None
-        else named_office_format(request.user_text)
-    )
-    tools.requested_suffix = "." + named_format if named_format else None
+    tools.requested_suffix = requested_suffix(request.user_text, routed)
     tools.request_text = request.user_text
     tools.earlier_requests = [
         message.text for message in request.messages[:-1] if message.role == "user"
