@@ -36,7 +36,7 @@ def built(content: dict[str, object], suffix: str) -> bytes:
 
 class MeasureTests(unittest.TestCase):
     def test_figures_come_from_the_built_file(self) -> None:
-        content = dict(
+        content: dict[str, object] = dict(
             title="Pond club",
             sections=[
                 dict(heading="Tasks", bullets=["[ ] Feed fish", "[ ] Clean filter"]),
