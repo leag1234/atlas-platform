@@ -69,7 +69,7 @@ CARDINALS: dict[str, int] = {
 }  # fmt: skip
 # Cardinal words read right after a picture word without a number word
 # ("picture two"): only these, since "une image un peu", "imagen tres"
-# (French "très" once folded) say no number.
+# (an accented adverb once folded) say no number.
 BARE_CARDINALS = frozenset({"one", "two", "three", "four", "zwei", "drei", "vier"})
 PICTURE_WORDS = frozenset(
     """
@@ -167,7 +167,7 @@ def _number_after(tokens: list[str], at: int) -> int | None:
     if word in CARDINALS and (
         word.isdigit() or index > at + 1 or word in BARE_CARDINALS
     ):
-        # Digits always; a number word after a number word ("numéro deux");
+        # Digits always; a number word after a number word ("number two");
         # a few unambiguous ones right after the picture word.
         return CARDINALS[word]
     ordinal = _ordinal(word)
@@ -200,7 +200,7 @@ def referenced(message: str) -> Reference | None:
             not after or not after[0].isalnum() or after in AFTER
         ):
             # An ordinal standing for a picture: "in the second, ...",
-            # "keep the first but ...", "sur la deuxième :", "la última".
+            # "keep the first but ...", "on the third:", "the last".
             found.add(ordinal)
     if len(found) != 1:
         return None
