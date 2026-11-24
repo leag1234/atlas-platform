@@ -1089,6 +1089,28 @@ def response(
                 item.provider_retries += exc.retries
                 item.state = "error"
                 item.erreurs.append(exc.code)
+                from services.orchestrator.link_requests import (
+                    SEARCH_FAILURES,
+                    failed_search_answer,
+                )
+
+                if payload.atlas_ui and exc.code in SEARCH_FAILURES:
+                    # A required search that failed is said as the answer: as
+                    # an error event, the reply stayed empty (class suite,
+                    # staging 2026-11-24). An API client keeps the status.
+                    item.rejection = {"code": exc.code, "message": exc.detail}
+                    item.reponse = failed_search_answer(
+                        exc.code, exc.detail, payload.answer_language
+                    )
+                    await queue.put(
+                        {
+                            "delta": {"content": item.reponse},
+                            "atlas": {"turn": turn, "phase": "search_failed"},
+                        }
+                    )
+                    await queue.put({"finish": True})
+                    await queue.put(None)
+                    return
                 detail = (
                     temporarily_unavailable(payload.answer_language)
                     if guest_configuration_failure(exc)

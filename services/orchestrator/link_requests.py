@@ -125,8 +125,62 @@ def link_request(question: str, *, prices: bool = False) -> bool:
     )
 
 
+# A link Atlas gave in this conversation's answers: an app or drawing version,
+# a saved project file, a file of the chat's own workspace.
+_DELIVERED_LINK = re.compile(
+    r"/api/atlas/artifacts/[0-9a-f]{32}/versions/\d{1,4}/(?:open|download)"
+    r"|/api/atlas/orgs/[^\s()]{1,200}?/deliverables/[0-9a-f-]{36}/(?:download|preview)"
+    r"|/api/v1/terminals/[^\s()/]{1,80}/files/serve/"
+)
+# What names such a delivery, in the five languages (accents removed): a file,
+# a document, an app, a version, a file format.
+_DELIVERY_NOUN = (
+    r"(?:files?|fichiers?|dateien|datei|archivos?|documents?|dokumente?|documentos?|"
+    r"document[oi]|apps?|applications?|anwendung(?:en)?|aplicacion(?:es)?|"
+    r"applicazion[ei]|versions?|versione|tableurs?|spreadsheets?|tabellen?|"
+    r"presentations?|prasentation(?:en)?|presentacion(?:es)?|presentazion[ei]|"
+    r"rapports?|reports?|berichte?|informes?|relazion[ei]|html|pdf|docx|xlsx|pptx|"
+    r"csv|svg)"
+)
+# A delivery named as the one already there: an article, a demonstrative, a
+# possessive or "same" before it, at most two words between ("the same HTML
+# file", "zur selben HTML-Datei", "el mismo archivo", "lo stesso file").
+_OWN_DELIVERY = re.compile(
+    r"\b(?:the|this|that|your|my|same|le|la|l'|ce|cet|cette|ton|ta|votre|mon|ma|"
+    r"meme|der|die|das|den|dem|zur|zum|diese[rsmn]?|deine[rsmn]?|ihre[rsmn]?|"
+    r"selbe[nrs]?|gleiche[nrs]?|el|este|esta|tu|su|mismo|misma|del|al|il|lo|"
+    r"questo|questa|quel|quella|tuo|tua|stess[oa]|dello|della|allo|alla)"
+    r"(?:\s+|(?<=')\s*)(?:[\w]+[\s-]+){0,2}?" + _DELIVERY_NOUN + r"\b"
+    # "Version 2", "versión 3": a numbered version of the delivery.
+    r"|\bversi(?:on|one)\s*\d"
+)
+
+
+def own_delivery(question: str, history: Sequence[str] = ()) -> bool:
+    """The request is about what this conversation's answers delivered.
+
+    Resend its link, restate its status, rename it, repeat it: the answer comes
+    from the conversation and its stored deliverables, never from a mandatory
+    web search. Class suite, staging 2026-11-24: "send the link to the same
+    HTML file again" in a conversation that had delivered that file read
+    "link" as a request for web pages; five searches ran, every engine was
+    blocked, and the person got an empty reply. Applies only when an answer of
+    the conversation holds a delivered link; web search stays offered.
+    """
+    if not any(_DELIVERED_LINK.search(turn) for turn in history):
+        return False
+    text = "".join(
+        c
+        for c in unicodedata.normalize("NFD", own_words(question).casefold())
+        if not unicodedata.combining(c)
+    ).replace("’", "'")
+    return bool(_OWN_DELIVERY.search(text))
+
+
 def page_request(question: str, history: Sequence[str] = ()) -> bool:
     question = own_words(question)
+    if own_delivery(question, history):
+        return False
     if link_request(question):
         return True
     # A price-only question inherits shopping intent only from the active thread.
@@ -250,6 +304,76 @@ REASONS = {
 def reason(code: str, language: str) -> str:
     texts = REASONS.get(code, {})
     return texts.get(language, texts.get("en", ""))
+
+
+# A search that failed before any page was read ends the turn (the answer is
+# never written from memory in its place, chat_pipeline.ChatTools): the person
+# still reads a reply saying so, never an empty one (class suite, staging
+# 2026-11-24: an error event with no text).
+SEARCH_FAILED = {
+    "fr": "Je n’ai pas pu traiter cette demande, car la recherche web qu’elle demande n’a pas abouti.",
+    "de": "Ich konnte diese Anfrage nicht bearbeiten, weil die dafür nötige Websuche nicht gelungen ist.",
+    "en": "I could not complete this request because the web search it needs did not succeed.",
+    "es": "No pude completar esta solicitud porque la búsqueda web que necesita no tuvo éxito.",
+    "it": "Non ho potuto completare questa richiesta perché la ricerca web necessaria non è riuscita.",
+}
+_PROVIDER_STATUS = re.compile(r"\bHTTP (\d{3})\b")
+# The codes of a search that failed before any page was read (ChatTools.execute
+# raises them): the search outcomes and the provider refusals.
+SEARCH_FAILURES = frozenset(
+    {
+        "upstream_blocked",
+        "upstream_timeout",
+        "empty_results",
+        "partial_results",
+        "search_unavailable",
+        "quota_exceeded",
+        "search_rate_limited",
+        "search_no_results",
+        "daily_search_limit",
+    }
+)
+
+
+def failed_links_reply(
+    code: str, detail: str, question: str, history: Sequence[str], language: str
+) -> str:
+    """The reply of a link request whose search failed before any page was read.
+
+    A limit or a quota is named as such (D5), with the provider's own words
+    when the refusal carries them. The caveat of a search outcome (blocked,
+    timed out, nothing found) is added after the answer by
+    chat_pipeline.process, in the person's language: not repeated here.
+    """
+    from services.orchestrator.searxng import OUTCOMES
+
+    terms = unavailable(fallback_terms(question, history), language)
+    if code in OUTCOMES:
+        return terms
+    cause = detail.strip() or reason(code, language)
+    return terms + ("\n\n" + cause if cause else "")
+
+
+def failed_search_answer(code: str, detail: str, language: str) -> str:
+    """The chat's reply when a required search failed before any page was read.
+
+    Sent as the answer, never as an error event that leaves the reply empty.
+    What failed is said in the person's language: a blocked, timed-out or empty
+    search as such, a quota or a limit as a quota or a limit with the
+    provider's status (D5), never as an outage.
+    """
+    from services.orchestrator.chat_pipeline import search_failure_notice
+    from services.orchestrator.searxng import OUTCOMES
+
+    language = language if language in SEARCH_FAILED else "en"
+    if code in OUTCOMES:
+        cause = search_failure_notice(code, language)
+    else:
+        cause = reason(code, language)
+        status = _PROVIDER_STATUS.search(detail)
+        if cause and status:
+            cause = cause.rstrip(".") + f" (HTTP {status[1]})."
+    return SEARCH_FAILED[language] + ("\n\n" + cause if cause else "")
 
 
 def unavailable(question: str, language: str) -> str:
