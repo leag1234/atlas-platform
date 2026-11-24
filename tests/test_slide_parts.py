@@ -145,3 +145,26 @@ class MissingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DeckTitleTests(unittest.TestCase):
+    def test_a_promoted_first_title_keeps_the_deck_title_as_footer(self) -> None:
+        request = (
+            "Quatre diapositives, les titres dans l'ordre : \u00abPorte du jardin\u00bb, "
+            "\u00abBanc de pierre\u00bb, \u00abFontaine sèche\u00bb."
+        )
+        parts = slide_parts.requested([request])
+        content = deck(
+            [
+                dict(heading="Porte du jardin", paragraphs=["Bois et fer."]),
+                dict(heading="Banc de pierre", paragraphs=["Granit gris."]),
+                dict(heading="Fontaine sèche", paragraphs=["Vasque fendue."]),
+            ],
+            title="Promenade au parc",
+        )
+        repaired = slide_parts.placed(content, parts)
+        self.assertEqual(repaired.title, "Porte du jardin")
+        self.assertEqual(repaired.footer, "Promenade au parc")
+        shown, _ = slides_text(repaired)
+        self.assertIn("Promenade au parc", shown[1])
+        self.assertNotIn("Porte du jardin", shown[1])
