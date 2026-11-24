@@ -9,7 +9,7 @@ from services.orchestrator.pictures.texts import text
 ARTIFACT = "4c" * 16
 IMAGE = "https://atlas.example/images/" + "9e" * 16
 
-ALONE = (
+ALONE: tuple[str, ...] = (
     "Tu peux en faire une version sous la pluie ? Affiche juste l’image ici, "
     "sans titre ni texte.",
     "je veux voir le dessin directement ici, sans titre ni texte.",
