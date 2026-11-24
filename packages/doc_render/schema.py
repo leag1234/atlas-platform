@@ -163,6 +163,10 @@ class Section(ContentModel):
     chart: Chart | None = None
     # The bullets are ordered steps or dates: a deck draws a timeline.
     sequence: bool = Field(default=False, strict=True)
+    # A deck draws the bullets as a bulleted list, never as cards, columns or
+    # a cover: the person asked for bullet points (docs/33). Code sets it
+    # when a layout requirement asks for bullets; the writer may too.
+    bulleted: bool = Field(default=False, strict=True)
     # Pages: the section starts on a new page. Sections otherwise follow each
     # other on the page (layout.py): a page break before every heading left a
     # six-section report on six pages filled to a twentieth (staging -150,
@@ -364,6 +368,11 @@ class PresentationSlide(ContentModel):
         strict=True,
         description="true only when the bullets are ordered steps or dates",
     )
+    bulleted: bool = Field(
+        default=False,
+        strict=True,
+        description="true when the person asked for bullet points: a bulleted list, never cards",
+    )
     # Pictures drawn for the deck (make_pictures references), shown on the slide.
     images: tuple[Text, ...] = Field(
         default=(),
@@ -399,6 +408,7 @@ class PresentationOutline(ContentModel):
                     metrics=slide.metrics,
                     chart=slide.chart,
                     sequence=slide.sequence,
+                    bulleted=slide.bulleted,
                 )
                 for slide in self.slides
             ),

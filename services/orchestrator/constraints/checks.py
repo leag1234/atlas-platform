@@ -21,6 +21,7 @@ TEXT_KINDS = frozenset(
     {
         "heading",
         "paragraph",
+        "card",
         "bullet",
         "numbered",
         "checkbox",
@@ -30,7 +31,9 @@ TEXT_KINDS = frozenset(
         "control",
     }
 )
-PROSE_KINDS = frozenset({"paragraph", "bullet", "numbered", "checkbox", "quote"})
+PROSE_KINDS = frozenset(
+    {"paragraph", "card", "bullet", "numbered", "checkbox", "quote"}
+)
 LIST_KINDS = {"bullets": "bullet", "numbered": "numbered", "checkboxes": "checkbox"}
 EVIDENCE = 120
 
@@ -190,17 +193,19 @@ def check(item: Constraint, view: View, facts: dict[str, Any] | None = None) -> 
     if kind == "titles":
         return _titles(item, view)
 
-    verdicts: list[tuple[bool, str]] = []
+    verdicts: list[tuple[bool | None, str]] = []
     for page in _pages(view, item):
         scoped = replace(item, page=page) if page != item.page else item
         verdicts.append(_one(scoped, view))
-    failed = [evidence for ok, evidence in verdicts if not ok]
+    failed = [evidence for ok, evidence in verdicts if ok is False]
     if failed:
         return Result(item.id, False, _short("; ".join(failed[:3])))
+    if any(ok is None for ok, _ in verdicts):
+        return Result(item.id, None)
     return Result(item.id, True, verdicts[0][1] if verdicts else "")
 
 
-def _one(item: Constraint, view: View) -> tuple[bool, str]:
+def _one(item: Constraint, view: View) -> tuple[bool | None, str]:
     blocks = _texts(_scope(view, item))
     where = f"page {item.page}: " if item.page and view.kind != "answer" else ""
     if item.kind == "starts_with":
@@ -250,12 +255,18 @@ def _one(item: Constraint, view: View) -> tuple[bool, str]:
         if item.style == "plain":
             return not listed, f"{where}{len(listed)} list item(s)"
         wanted = LIST_KINDS[item.style]
+        if wanted == "checkbox" and not view.boxes_known:
+            # The format draws its boxes: code cannot tell them from bullets.
+            return None, ""
         other = [block for block in listed if block.kind != wanted]
         if not listed:
-            shown = [block for block in blocks if block.kind == "paragraph"][:2]
-            return False, where + "no list; text as paragraphs: " + _short(
-                " | ".join(block.text for block in shown)
-            )
+            cards = [block for block in blocks if block.kind == "card"]
+            shown = cards or [block for block in blocks if block.kind == "paragraph"]
+            return False, where + (
+                "no list; points drawn as separate cards: "
+                if cards
+                else "no list; text as paragraphs: "
+            ) + _short(" | ".join(block.text for block in shown[:2]))
         return not other, where + (
             f"{len(listed)} {wanted} item(s)"
             if not other
@@ -274,9 +285,16 @@ def _one(item: Constraint, view: View) -> tuple[bool, str]:
 
 
 def _titles(item: Constraint, view: View) -> Result:
-    if view.kind == "answer":
-        titles = [block.text for block in view.blocks if block.kind == "heading"]
+    if view.kind not in {"deck", "workbook"}:
+        # A reply, a document or a page: its section headings in order; the
+        # document's own title is not one of them.
+        titles = [
+            block.text
+            for block in view.blocks
+            if block.kind == "heading" and block.region != "title"
+        ]
     else:
+        # A slide or a sheet: its title.
         titles = []
         for page in range(1, view.pages + 1):
             first = next(

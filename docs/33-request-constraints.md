@@ -184,9 +184,46 @@ answer is pictures/bare.py), any task (chat, Work, apps), reply scope only.
 The "made in this turn" fact is a file, an app or picture version, a drawn
 image, or a link to a deliverable in the reply.
 
-The file views and checkers are implemented and measured (section 6) but
-not yet wired to the deliverable checks: the expectations ledger keeps
-deciding file requirements in this slice.
+## 5 bis. File layout in the deliverable checks
+
+The expectations ledger (docs/31) has a code check `part: "layout"` for
+documents, decks and workbooks: `rule` (titles, list_style, items, contains,
+excludes, order, starts_with, paragraphs), `texts`, `style`, `count`,
+`relation` and `where` (each, slide:N or page:N, footer, header, notes).
+The extraction is told when to use it; code keeps it only when its exact
+texts are the person's words, otherwise it goes to the judge.
+
+`document_check` builds the structured view of the built file (section 4,
+step 3) once per publication, only when a layout requirement is active, and
+`check_document` decides each layout requirement on it. A verdict code
+cannot give (boxes to tick in a PDF, where they are drawn rather than
+written; a file it cannot read) goes to the judge as before. A failure
+names what was measured ("page 2: no list; points drawn as separate
+cards"), and goes to the existing refusal and repair (at most twice a turn,
+then said by name).
+
+The views read Atlas's own renderer as it writes:
+
+- themed decks by the role in each shape's name (title, deck title, list,
+  point, footer, slide number), as readback.py does: a card or a column is
+  a "card" block, not a list item; speaker notes are their own region, so a
+  text asked on the slide is not met by the notes;
+- DOCX by style (Title, Heading, List Bullet, List Number), box glyphs for
+  points to tick, section headers and footers;
+- PDF by the lines readback.py reads (size, place): the running footer under
+  the bottom margin, headings by size, list items by their indent, wrapped
+  lines joined into one block.
+
+Titles mean the slide or sheet titles for decks and workbooks, the section
+headings in order (the document's own title aside) for documents.
+
+A deck draws two to four developed points as cards, and a short first slide
+as the cover. When the person asked for bullet points, that layout cannot
+pass. `Section.bulleted` (and the same field of a slide in the deck outline)
+draws the slide as a bulleted list; code sets it before rendering whenever
+the turn's ledger, or the one stored with the file, holds a list_style
+bullets requirement (`expectations.bulleted_as_asked`), and the repair line
+tells the writer the same.
 
 only_request: German words written with "ae" in its phrase tables now also
 match their folded form ("Erklärung" folds to "erklarung").
@@ -201,7 +238,8 @@ Offline, hand-labelled fictional cases (`tests/fixtures/request_constraints.json
 | code reading, 53 requests (incl. 16 that must read nothing) | precision 43/44, recall 43/43 |
 | code checks on 42 replies (18 violations) | violations found 18/18, no false violation, 0 undecided |
 | code checks on 26 file cases (PPTX, DOCX, PDF, HTML, SVG, XLSX; 10 violations) | violations found 10/10, no false violation |
-| time | reply check 0.04 to 0.2 ms; file view 3 ms per file |
+| 19 checks on 7 files built by Atlas's renderer (3 decks, 2 DOCX, 2 PDF; 7 violations) | violations found 7/7, no false violation |
+| time | reply check 0.04 to 0.2 ms; file view 2 to 6 ms per file |
 
 The one extra reading: "ohne Einleitung" is also read as "nothing else" by
 only_request, as its phrase tables intend.
@@ -261,10 +299,10 @@ read as a list count.
 
 1. Run `full` on staging, compare the hold rate and the added time with the
    figures above, then decide the default.
-2. Wire the file views into the deliverable checks: the ledger's document
-   and deck requirements of kind titles, list style, region (footer, notes
-   versus slide) and per-slide counts checked by these checkers on the
-   built file, before its model judge.
+2. Measure the layout checks live on staging: how often the extraction
+   gives a layout rule, and how often a refusal for one is repaired. Read
+   back `bulleted` from a delivered deck so that a revision keeps it
+   without the ledger.
 3. Prevent rather than report: a `no_new_file` constraint read before the
    turn routes (deferred_intent covers the main phrases already).
 4. Strict privacy: run the reading and the verifier on the owned model, and

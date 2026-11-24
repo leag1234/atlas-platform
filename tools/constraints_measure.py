@@ -449,6 +449,199 @@ def file_cases(directory: Path) -> list[tuple[str, Path, dict[str, Any], bool]]:
     return built
 
 
+def rendered_cases(directory: Path) -> list[tuple[str, Path, dict[str, Any], bool]]:
+    """Files built by Atlas's own renderer (packages/doc_render), as delivered:
+    themed decks (cards, cover, footer, notes), DOCX and PDF reports."""
+    from packages.doc_render import render
+    from packages.doc_render.schema import Content
+
+    def build(name: str, value: dict[str, Any]) -> Path:
+        path = directory / name
+        render(Content.model_validate(value), path, image_root=directory)
+        return path
+
+    tips = {
+        "Semis": [
+            "Semer en godets dès la fin de l'hiver, à l'abri du vent",
+            "Étiqueter chaque godet avec la variété et la date",
+            "Garder le terreau humide sans jamais le détremper",
+        ],
+        "Repiquage": [
+            "Repiquer quand la plantule a deux vraies feuilles bien formées",
+            "Tenir la plantule par une feuille, jamais par la tige",
+            "Arroser au pied juste après le repiquage, sans mouiller",
+        ],
+        "Récolte": [
+            "Récolter le matin, quand les feuilles sont encore fraîches",
+            "Couper au couteau propre pour éviter les maladies",
+            "Ranger la récolte à l'ombre dans une caisse aérée",
+        ],
+    }
+
+    def deck(bulleted: bool, example_in_notes: bool) -> dict[str, Any]:
+        sections = []
+        for heading, bullets in tips.items():
+            example = f"Exemple : le jardin partagé de la rue {heading.lower()}."
+            sections.append(
+                dict(
+                    heading=heading,
+                    bullets=bullets,
+                    bulleted=bulleted,
+                    notes=[example] if example_in_notes else [],
+                    paragraphs=[] if example_in_notes else [example],
+                )
+            )
+        return dict(title="Atelier potager", sections=sections)
+
+    listed = build("potager-liste.pptx", deck(True, False))
+    # Three developed points alone on a slide: drawn as cards unless bulleted.
+    cards = build("potager-cartes.pptx", deck(False, True))
+    notes = build("potager-notes.pptx", deck(True, True))
+    titles = list(tips)
+    built: list[tuple[str, Path, dict[str, Any], bool]] = [
+        (
+            "rendered deck: slide titles in order",
+            listed,
+            {"kind": "titles", "scope": "file", "items": titles},
+            True,
+        ),
+        (
+            "rendered deck: titles of another order",
+            listed,
+            {
+                "kind": "titles",
+                "scope": "file",
+                "items": [titles[1], titles[0], titles[2]],
+            },
+            False,
+        ),
+        (
+            "rendered deck: bulleted list on each slide",
+            listed,
+            {"kind": "list_style", "scope": "file", "style": "bullets", "each": True},
+            True,
+        ),
+        (
+            "rendered deck: three items on each slide",
+            listed,
+            {"kind": "items", "scope": "file", "count": 3, "each": True},
+            True,
+        ),
+        (
+            "rendered deck: three points drawn as cards",
+            cards,
+            {"kind": "list_style", "scope": "file", "style": "bullets", "each": True},
+            False,
+        ),
+        (
+            "rendered deck: example on each slide",
+            listed,
+            {"kind": "contains", "scope": "file", "text": "Exemple", "each": True},
+            True,
+        ),
+        (
+            "rendered deck: example only in the notes",
+            notes,
+            {"kind": "contains", "scope": "file", "text": "Exemple", "each": True},
+            False,
+        ),
+        (
+            "rendered deck: example in the notes, asked there",
+            notes,
+            {
+                "kind": "contains",
+                "scope": "file",
+                "text": "Exemple",
+                "region": "notes",
+                "each": True,
+            },
+            True,
+        ),
+    ]
+    report = dict(
+        title="Fiches du vestiaire",
+        footer="Vestiaire du gymnase",
+        sections=[
+            dict(
+                heading="Ouverture",
+                paragraphs=["Ouvrir les casiers à 8 h."],
+                bullets=[
+                    "[ ] Allumer la lumière",
+                    "[ ] Vérifier les clés",
+                    "[ ] Aérer",
+                    "[ ] Noter l'heure",
+                ],
+            ),
+            dict(
+                heading="Fermeture",
+                paragraphs=["Fermer à 20 h."],
+                bullets=["[ ] Ramasser les serviettes", "[ ] Éteindre"],
+                page_break=True,
+            ),
+        ],
+    )
+    plain = dict(report, footer=None)
+    for suffix in (".docx", ".pdf"):
+        with_footer = build("vestiaire" + suffix, report)
+        without = build("vestiaire-sans" + suffix, plain)
+        built += [
+            (
+                f"rendered {suffix}: running footer",
+                with_footer,
+                {
+                    "kind": "contains",
+                    "scope": "file",
+                    "text": "Vestiaire du gymnase",
+                    "region": "footer",
+                },
+                True,
+            ),
+            (
+                f"rendered {suffix}: footer missing",
+                without,
+                {
+                    "kind": "contains",
+                    "scope": "file",
+                    "text": "Vestiaire du gymnase",
+                    "region": "footer",
+                },
+                False,
+            ),
+            (
+                f"rendered {suffix}: section titles in order",
+                with_footer,
+                {
+                    "kind": "titles",
+                    "scope": "file",
+                    "items": ["Ouverture", "Fermeture"],
+                },
+                True,
+            ),
+            (
+                f"rendered {suffix}: six list items",
+                with_footer,
+                {"kind": "items", "scope": "file", "count": 6},
+                True,
+            ),
+            (
+                f"rendered {suffix}: four items asked on page 2",
+                with_footer,
+                {"kind": "items", "scope": "file", "count": 4, "page": 2},
+                False,
+            ),
+        ]
+    docx_file = directory / "vestiaire.docx"
+    built.append(
+        (
+            "rendered .docx: boxes to tick",
+            docx_file,
+            {"kind": "list_style", "scope": "file", "style": "checkboxes"},
+            True,
+        )
+    )
+    return built
+
+
 def _tally(rows: list[tuple[str, bool, bool | None]]) -> dict[str, Any]:
     """rows: (name, met, verdict). Positive = a violation."""
     tally: Counter[str] = Counter()
@@ -487,7 +680,7 @@ def measure_checks(data: dict[str, Any]) -> dict[str, Any]:
     answer_ms = (time.perf_counter() - started) * 1000 / max(1, len(rows))
     file_rows: list[tuple[str, bool, bool | None]] = []
     with tempfile.TemporaryDirectory() as directory:
-        built = file_cases(Path(directory))
+        built = file_cases(Path(directory)) + rendered_cases(Path(directory))
         started = time.perf_counter()
         views: dict[Path, Any] = {}
         for name, path, raw, met in built:

@@ -777,6 +777,9 @@ def quoted(section: Section) -> bool:
 
 
 def kind(section: Section, index: int, count: int) -> str:
+    if section.bulleted and section.bullets:
+        # Bullet points were asked for: a list with its bullets.
+        return "content"
     texts = section.paragraphs + section.bullets
     if index and quoted(section) and bare(section):
         return "content"
