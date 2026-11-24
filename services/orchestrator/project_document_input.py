@@ -237,7 +237,7 @@ def markdown(text: str, title: str, *, grouped: bool = True) -> Content:
         heading=title, paragraphs=[], bullets=[], tables=[], images=[]
     )
     paragraph: list[str] = []
-    lines = text.splitlines()
+    lines = without_title_line(text.splitlines(), title)
     if grouped:
         lines = marked_titles(lines, title)
     cover = broken = False
@@ -446,6 +446,46 @@ def opening_heading(text: str | None) -> str:
     return ""
 
 
+def _same_title(line: str, title: str) -> bool:
+    return " ".join(line.split()) == " ".join(title.split())
+
+
+def opening_line(text: str | None) -> str:
+    """The line that titles a text written without a title argument.
+
+    A first block of one short line that is no sentence (titles.title_line),
+    with text after it: "Four Days, Full Output" over the report. It is the
+    title as written, punctuation included. A text that opens otherwise has
+    none here (the file name read as words is the last resort).
+    """
+    from packages.doc_render.titles import title_line
+
+    lines = (text or "").splitlines()
+    starts = [number for number, line in enumerate(lines) if line.strip()]
+    if len(starts) < 2:
+        return ""
+    first = starts[0]
+    line = lines[first].strip()
+    if first + 1 < len(lines) and lines[first + 1].strip():
+        return ""
+    if line.startswith(("#", "|", "!", "\\", "`", "*", "_")) or _LISTED.match(line):
+        return ""
+    return line if title_line(line) else ""
+
+
+def without_title_line(lines: list[str], title: str) -> list[str]:
+    """The lines without an opening line that is the title itself: the title
+    is written once, as the title, never again as a heading or a paragraph."""
+    starts = [number for number, line in enumerate(lines) if line.strip()]
+    if not starts or not title.strip():
+        return lines
+    first = starts[0]
+    alone = first + 1 >= len(lines) or not lines[first + 1].strip()
+    if alone and len(starts) > 1 and _same_title(lines[first], title):
+        return lines[:first] + lines[first + 1 :]
+    return lines
+
+
 def normalize(value: dict[str, Any]) -> dict[str, Any]:
     """Keep strict objects compatible; parse JSON once without coercing bad input."""
     if not isinstance(value, dict):
@@ -493,8 +533,21 @@ def normalize(value: dict[str, Any]) -> dict[str, Any]:
     suffix = PurePosixPath(str(result.get("path", ""))).suffix.lower()
     stem = PurePosixPath(str(result.get("path", ""))).stem
     # Never the file name as a title (titles.py): a deck without a title
-    # takes its cover heading, a text its "# " line, else the stem in words.
-    title = simple.title or opening_heading(simple.content) or stem
+    # takes its cover heading, a text its "# " line or opening title line,
+    # else the stem in words.
+    # The title the writer gives, else the text's opening title line, as
+    # written: the file name may be a slug and is never read back as the
+    # title while the text holds one.
+    from packages.doc_render.titles import slug_like
+
+    given = simple.title if simple.title and not slug_like(simple.title, stem) else ""
+    title = (
+        given
+        or opening_heading(simple.content)
+        or (opening_line(simple.content) if suffix != ".xlsx" else "")
+        or simple.title
+        or stem
+    )
     if suffix == ".pptx" and simple.slides is not None and simple.content is None:
         with explained(Content, "content"):
             normalized = PresentationOutline(
