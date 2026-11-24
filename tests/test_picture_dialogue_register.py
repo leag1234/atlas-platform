@@ -139,7 +139,6 @@ class PictureQuestionRegisterTests(followups.Base):
         result: tuple[bool, Interaction] = await helper(self, gateway, history, text)
         return result
 
-
     async def ask(
         self, language: str, ask: str, question: str, answer: str
     ) -> tuple[DialogueGateway, Interaction]:
