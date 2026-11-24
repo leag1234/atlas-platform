@@ -10,6 +10,7 @@ Fictional pictures and wordings, three languages, both registers."""
 from __future__ import annotations
 
 import json
+from typing import Any
 
 from packages import addressing
 from services.orchestrator.interactions import Interaction
@@ -130,7 +131,14 @@ class PersonRegisterTests(followups.Base):
 class PictureQuestionRegisterTests(followups.Base):
     """A question about the picture shown, through the picture dialogue."""
 
-    follow = followups.FollowUpTests.follow
+    async def follow(
+        self, gateway: DialogueGateway, history: list[tuple[str, str]], text: str
+    ) -> tuple[bool, Interaction]:
+        # Same turn helper as the follow-up tests, on the same fixtures.
+        helper: Any = followups.FollowUpTests.follow
+        result: tuple[bool, Interaction] = await helper(self, gateway, history, text)
+        return result
+
 
     async def ask(
         self, language: str, ask: str, question: str, answer: str
