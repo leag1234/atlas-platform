@@ -112,9 +112,55 @@ RESTRICTION = re.compile(
 )
 
 
+# Verbs of changing something: "change only the colour, nothing else" limits
+# the edit, not the answer (the new version and its link are the answer).
+_EDIT = re.compile(
+    r"\b(?:chang\w*|modifi\w*|corrig\w*|correct\w*|fix\w*|edit\w*|updat\w*|"
+    r"touch\w*|adjust\w*|replac\w*|alter\w*|tweak\w*|keep|leave|"
+    r"remplac\w*|retouch\w*|ajust\w*|rectifi\w*|garde\w*|laisse\w*|"
+    r"andere|andern|aendere|aendern|veraender\w*|verander\w*|bearbeit\w*|"
+    r"korrigier\w*|aktualisier\w*|anpass\w*|passe|ersetz\w*|lass\w*|behalt\w*|"
+    r"cambi\w*|modific\w*|correg\w*|corrij\w*|arregl\w*|actualiz\w*|toca\w*|"
+    r"toques?|reemplaz\w*|deja\w*|manten\w*|"
+    r"correggi\w*|sistem\w*|aggiorn\w*|tocc\w*|ritocc\w*|sostitu\w*|lascia\w*|"
+    r"mantieni|"
+    r"mud\w*|alter\w*|corrij\w*|mantenh\w*)\b"
+)
+_SHOW_WORD = re.compile(rf"\b{_SHOW}\b")
+_CLAUSE = re.compile(r"[.;!?\n]")
+
+
+def _limits_edit(text: str, start: int, end: int) -> bool:
+    """Whether the restriction found at text[start:end] limits a change.
+
+    The nearest verb before it in its sentence decides: a verb of changing
+    ("change only the price", "ne change rien d'autre") limits the edit; a
+    verb of showing ("show me only the result") limits the answer. With no
+    verb before it, a verb of changing right after it ("sonst nichts
+    aendern") limits the edit.
+    """
+    if _SHOW_WORD.match(text, start):
+        return False
+    clause = _CLAUSE.split(text[:start])[-1]
+    edits = [m.end() for m in _EDIT.finditer(clause)]
+    shows = [m.end() for m in _SHOW_WORD.finditer(clause)]
+    if edits or shows:
+        return bool(edits) and (not shows or edits[-1] > shows[-1])
+    after = _CLAUSE.split(text[end:])[0].split()[:3]
+    return any(_EDIT.fullmatch(word) for word in after)
+
+
 def asks_only(request_text: str) -> bool:
-    """True when the request asks for its deliverable with nothing around it."""
-    return bool(RESTRICTION.search(folded(request_text[:4000])))
+    """True when the request asks for its answer with nothing around it.
+
+    A restriction of the change ("modify only the title, nothing else")
+    does not restrict the answer.
+    """
+    text = folded(request_text[:4000])
+    return any(
+        not _limits_edit(text, match.start(), match.end())
+        for match in RESTRICTION.finditer(text)
+    )
 
 
 _FENCE = re.compile(r"^\s*(`{3,}|~{3,})")
@@ -147,9 +193,18 @@ def _blocks(answer: str) -> list[str]:
     return blocks
 
 
-def _only_links(block: str) -> bool:
-    """A paragraph made of links and the few words that introduce them."""
+# A link to what Atlas produced (an app version, a saved file, a picture, a
+# download or preview): the deliverable itself, never furniture around it.
+_OWN = re.compile(r"\]\((?:https?://[^)/\s]+)?/api/atlas/")
+
+
+def _only_links(block: str, own: bool = False) -> bool:
+    """A paragraph made of links and the few words that introduce them. With
+    own False, a paragraph that links to a deliverable Atlas produced is not
+    one."""
     if _PICTURE.search(block) or _FENCE.match(block) or _QUOTE.match(block):
+        return False
+    if not own and _OWN.search(block):
         return False
     if not _LINK.search(block):
         return False
@@ -187,12 +242,22 @@ def _without_plan(blocks: list[str]) -> list[str]:
 def restrict(answer: str) -> str:
     """The answer reduced to its deliverable.
 
-    Links to the saved file and the plan card go. When the deliverable is a
+    The plan card and other links go. A link to a deliverable Atlas produced
+    (an app version, a file, a download) stays, unless the output asked is a
+    code block, quotation or picture shown in the answer. When the deliverable is a
     code block or a quotation, the sentence that introduces it goes, and after
     a quotation the remark on it. Never returns an empty answer.
     """
-    blocks = _blocks(answer)
-    kept = [block for block in _without_plan(blocks) if not _only_links(block)]
+    blocks = _without_plan(_blocks(answer))
+    # The output asked is shown in the answer (console lines, a quotation, a
+    # picture): the files saved on the way are not what was asked. Otherwise
+    # the link to what the turn produced (an app version, a file) is the
+    # deliverable and stays.
+    shown = any(
+        _FENCE.match(block) or _QUOTE.match(block) or _PICTURE.search(block)
+        for block in blocks
+    )
+    kept = [block for block in blocks if not _only_links(block, own=shown)]
     if not kept:
         return answer
     fenced = [i for i, block in enumerate(kept) if _FENCE.match(block)]

@@ -519,3 +519,67 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OwnLinesTests(unittest.TestCase):
+    """A line the person asked to be written, with its placeholder filled, and
+    a quotation of the file Atlas built in the turn are not document quotes."""
+
+    def test_a_requested_line_with_its_number_filled_is_not_marked(self) -> None:
+        cases = (
+            (
+                "fr",
+                "Indiquez « Diapositives dans le fichier : N » à la fin.",
+                "Le fichier contient « Diapositives dans le fichier : 3 » comme demandé.",
+            ),
+            (
+                "en",
+                "End with “Pages in the report: N” please.",
+                "As the contract states, “Pages in the report: 2”.",
+            ),
+            (
+                "de",
+                "Schreibe am Ende „Folien in der Datei: X“.",
+                "Laut Vertrag: „Folien in der Datei: 4“.",
+            ),
+            (
+                "es",
+                "Escribe «Diapositivas en el archivo: N» al final.",
+                "Según el contrato, «Diapositivas en el archivo: 5».",
+            ),
+            (
+                "it",
+                "Scrivi «Diapositive nel file: N» alla fine.",
+                "Secondo il contratto, «Diapositive nel file: 6».",
+            ),
+        )
+        for language, said, answer in cases:
+            with self.subTest(language=language):
+                text, counts = run(
+                    answer, CONTRACT_FR, language=language, said=said, asked=True
+                )
+                self.assertEqual(text, answer)
+                self.assertNotIn("not_found", counts)
+
+    def test_a_changed_requested_line_is_still_checked(self) -> None:
+        said = "Indiquez « Diapositives dans le fichier : N » à la fin."
+        answer = "L'article 6 stipule « Diapositives retirées du dossier : 3 »."
+        _, counts = run(answer, CONTRACT_FR, language="fr", said=said, asked=True)
+        self.assertEqual(counts, {"not_found": 1})
+
+    def test_a_quotation_of_the_built_file_is_not_marked(self) -> None:
+        held = sources(CONTRACT_FR)
+        token = document_quotes.current.set(held)
+        try:
+            document_quotes.add_built(
+                "Plume quadrillée\n(speaker notes, not on the slide) Exposé dans le "
+                "cadre de l'exposition des objets trouvés du printemps"
+            )
+        finally:
+            document_quotes.current.reset(token)
+        rewriter = Rewriter(held, language="fr", asked=True)
+        answer = (
+            "Les notes indiquent « Exposé dans le cadre de l'exposition des objets "
+            "trouvés du printemps »."
+        )
+        self.assertEqual(rewriter.feed(answer) + rewriter.finish(), answer)

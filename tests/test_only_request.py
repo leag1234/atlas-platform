@@ -91,3 +91,53 @@ class RestrictTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+EDIT_LIMITS = (
+    "Change seulement la quantité de farine, ne change rien d'autre.",
+    "Corrige le bouton Valider, rien d'autre.",
+    "Change only the quantity in the second row, nothing else.",
+    "Fix the score counter, nothing more.",
+    "Ändere nur die Farbe des Zählers, sonst nichts ändern.",
+    "Korrigiere den Titel, nichts anderes.",
+    "Cambia solo el precio, nada más.",
+    "Corrige solo eso, nada más.",
+    "Modifica solo il titolo, niente altro.",
+    "Correggi il pulsante, niente altro.",
+)
+APP_ANSWER = (
+    "Le compteur affiche maintenant le score sur 10.\n\n"
+    "[Ouvrir Quiz des volcans v2](/api/atlas/artifacts/a1b2c3/versions/2/download)\n\n"
+    "**Plan** (terminé en 9 s)\n\n- ✓ Modifier le compteur"
+)
+
+
+class EditLimitTests(unittest.TestCase):
+    def test_a_limit_of_the_change_is_not_a_limit_of_the_answer(self) -> None:
+        for request in EDIT_LIMITS:
+            with self.subTest(request=request):
+                self.assertFalse(asks_only(request))
+
+    def test_a_limit_of_the_answer_after_a_change_still_counts(self) -> None:
+        for request in (
+            "Change the price to 4, then show me only the total line.",
+            "Corrige la formule et donne-moi seulement le résultat.",
+            "Cambia el precio y dime solo el resultado.",
+        ):
+            with self.subTest(request=request):
+                self.assertTrue(asks_only(request))
+
+    def test_the_link_to_the_new_version_is_never_removed(self) -> None:
+        restricted = restrict(APP_ANSWER)
+        self.assertIn("/api/atlas/artifacts/a1b2c3/versions/2/download", restricted)
+        self.assertNotIn("Plan", restricted)
+
+    def test_a_saved_file_link_stays_when_the_file_is_the_output(self) -> None:
+        answer = f"Le tableau des cotisations est prêt.\n\n{LINKS}\n\n{PLAN}"
+        self.assertEqual(
+            restrict(answer), f"Le tableau des cotisations est prêt.\n\n{LINKS}"
+        )
+
+    def test_outside_links_still_go(self) -> None:
+        answer = "Il reste 3 lots.\n\n[Source](https://example.org/lots)"
+        self.assertEqual(restrict(answer), "Il reste 3 lots.")

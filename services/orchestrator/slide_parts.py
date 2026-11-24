@@ -180,6 +180,10 @@ def _first_title(
         )
         del first[key][index]
         first["heading"] = part.text
+    if not data.get("footer") and _fold(data["title"]) != folded:
+        # The deck's own title is not lost: it stays the running footer of
+        # the slides, where the first slide's title would otherwise repeat.
+        data["footer"] = data["title"]
     data["title"] = part.text
 
 

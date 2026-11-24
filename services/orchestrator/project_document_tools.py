@@ -993,6 +993,14 @@ async def publish(
     figures = await asyncio.to_thread(
         measured_figures, document.content, path.suffix, length.get("pages")
     )
+    # The answer may quote the file it delivers (document_quotes.py).
+    from services.orchestrator import document_quotes
+
+    document_quotes.add_built(
+        deliverable_check.drawn_text(content)
+        if content is not None
+        else bytes(document.preview).decode("utf-8", "replace")
+    )
     if figures:
         held = getattr(tools, "file_figures", None)
         if not isinstance(held, dict):

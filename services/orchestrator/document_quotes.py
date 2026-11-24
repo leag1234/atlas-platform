@@ -77,6 +77,12 @@ MAX_BLOCK = 6_000
 PAGE_TAIL = 1_500
 PAGE_HEAD = 300
 ACROSS_TRIES = 40
+# A line the person asks to be written with a placeholder ("N", "X", "[n]")
+# that the answer fills in (Sources.fills_template).
+_PLACEHOLDER = re.compile(r"[nxy]|xx+|nn+")
+TEMPLATE_WORDS = 40
+TEMPLATE_CHARACTERS = 20_000
+MAX_FILLED = 2
 # Context before a quotation read for attribution cues.
 CONTEXT = 220
 MAX_QUOTES = 60
@@ -427,6 +433,32 @@ class Sources:
     def holds(self, parts: list[str]) -> bool:
         return any(text.holds(parts) for text in self.texts())
 
+    def fills_template(self, parts: list[str]) -> bool:
+        """Whether the quotation is a line the person asked to be written,
+        with its placeholders filled ("Slides in the file: N" written
+        "Slides in the file: 3"): the answer's own words, not a document's."""
+        words = " ".join(parts).split()
+        if not words or len(words) > TEMPLATE_WORDS:
+            return False
+        for text in self.conversation:
+            said = canonical(text[:TEMPLATE_CHARACTERS]).split()
+            for start in range(len(said) - len(words) + 1):
+                window = said[start : start + len(words)]
+                filled = [
+                    index
+                    for index, (asked, written) in enumerate(
+                        zip(window, words, strict=True)
+                    )
+                    if asked != written
+                ]
+                if (
+                    filled
+                    and len(filled) <= MAX_FILLED
+                    and all(_PLACEHOLDER.fullmatch(window[i]) for i in filled)
+                ):
+                    return True
+        return False
+
     def names_text(self, name: str) -> bool:
         """True when a document or the conversation contains these words."""
         return any(" " + name + " " in text.spaced for text in self.texts())
@@ -491,6 +523,8 @@ def verdict(before: str, content: str, asked: bool, sources: Sources) -> str:
         return "ellipsis" if gap else "exact"
     if located(parts, sources.canonical_evidence()):
         return "elsewhere"
+    if not gap and sources.fills_template(parts):
+        return "own_wording"
     return "not_found"
 
 
@@ -834,6 +868,13 @@ def add_document(text: object, name: object = "", *, retrieved: bool = False) ->
     """
     if (sources := current.get()) is not None:
         sources.add_document(text, name, retrieved=retrieved)
+
+
+def add_built(text: object) -> None:
+    """Record the text of a file Atlas built in this turn: an answer that
+    quotes its own deliverable quotes evidence, not a provided document."""
+    if (sources := current.get()) is not None and isinstance(text, str):
+        sources.add_evidence(text)
 
 
 def observe(output: dict[str, object]) -> dict[str, object]:
