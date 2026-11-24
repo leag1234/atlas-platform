@@ -52,6 +52,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any
 
+from packages.addressing import address_instruction, register, turn_register
 from packages.profiles import picture_profile
 from services.orchestrator.pictures import store
 from services.orchestrator.pictures.texts import answer_language, text
@@ -261,6 +262,47 @@ def follow_messages(
     ]
 
 
+def person_register(request: Any, language: str) -> str:
+    """How the person addresses Atlas over the whole conversation: the latest
+    of their messages that says it ("how many wheels?" says nothing; the
+    request before it, in the familiar form, does), else the turn's recorded
+    words (packages.addressing); "" when none says. Their own messages
+    (ChatRequest.person_texts), never the continuation instruction."""
+    from packages.pasted_text import own_words
+
+    texts = getattr(request, "person_texts", None)
+    if not isinstance(texts, list):
+        texts = [
+            str(getattr(message, "text", "") or "")
+            for message in getattr(request, "messages", []) or []
+            if getattr(message, "role", "") == "user"
+        ]
+    for own in reversed(texts):
+        found = register(own_words(str(own)), language)
+        if found:
+            return found
+    return turn_register(language)
+
+
+def in_register(
+    messages: list[dict[str, Any]], request: Any, language: str
+) -> list[dict[str, Any]]:
+    """The call's messages with the person's register in its instructions.
+
+    The review and the reading call write sentences the person reads (the
+    answer, what is missing, the requirements), and they wrote them in the
+    polite form under a conversation in the familiar one ("alors que vous en
+    vouliez quatre" after "dessine"): every answer path gives the model the
+    person's register (packages.addressing.answer_instruction), these calls
+    now too."""
+    sentence = address_instruction(language, person_register(request, language))
+    if not sentence or not messages or messages[0].get("role") != "system":
+        return messages
+    first = dict(messages[0])
+    first["content"] = str(first["content"]) + "\n" + sentence.strip()
+    return [first, *messages[1:]]
+
+
 async def _call(
     payload: dict[str, Any], seconds: float, spend: Any, call: Any, errors: list[str]
 ) -> str | None:
@@ -301,8 +343,11 @@ async def understand(
     profile = picture_profile("picture_rewrite")
     if profile is None:
         return None
+    language = answer_language(picture_set.language, request.lang)
     payload = {
-        "messages": follow_messages(request, picture_set),
+        "messages": in_register(
+            follow_messages(request, picture_set), request, language
+        ),
         "tools": [],
         "response_format": {"type": "json_object"},
         "profile": profile,
@@ -437,8 +482,12 @@ async def review(
     value: dict[str, Any] | None = None
     if profile is not None:
         payload: dict[str, Any] = {
-            "messages": review_messages(
-                request, picture_set, requirements, language, image_url
+            "messages": in_register(
+                review_messages(
+                    request, picture_set, requirements, language, image_url
+                ),
+                request,
+                language,
             ),
             "tools": [],
             "response_format": {"type": "json_object"},

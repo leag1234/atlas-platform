@@ -84,7 +84,8 @@ class DialogueGateway(CpuGateway):
             (dialogue.FOLLOW_SYSTEM, self.follow, self.follows),
             (dialogue.REVIEW_SYSTEM, self.review, self.reviews),
         ):
-            if system == prompt:
+            # The person's register may follow the instructions (in_register).
+            if system.startswith(prompt):
                 seen.append(payload)
                 if isinstance(answer, Exception):
                     raise answer
