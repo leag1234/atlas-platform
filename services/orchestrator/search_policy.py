@@ -7,6 +7,7 @@ from urllib.parse import urlsplit
 
 from services.orchestrator.loop import Call
 from services.orchestrator.link_requests import (
+    own_delivery,
     own_words,
     page_request,
     product_queries,
@@ -105,6 +106,12 @@ def required_research(
     # sentences:" then a pasted report on the next line sent the report to a web
     # search because it said "current").
     question = own_words(question)
+    # A request about what the conversation delivered (its link, its status,
+    # its name) is answered from the conversation: no mandatory research,
+    # whatever words it uses ("current", "version", "link"); web search stays
+    # offered to the model (link_requests.own_delivery).
+    if own_delivery(question, history):
+        return ()
     normalized = "".join(
         c
         for c in unicodedata.normalize("NFD", question.casefold())

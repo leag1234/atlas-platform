@@ -105,7 +105,9 @@ SYSTEM = (
     "facts about the person's own team, organisation or project that nobody "
     "gave are checked apart, not here: when facts.person_gave_documents is "
     "false, a bracketed placeholder standing for such a fact ([result to add], "
-    "[date to add]) is the expected form, never a gap; "
+    "[date to add]) is the expected form, never a gap; a bracketed "
+    "placeholder standing for a value that follows by calculation from figures "
+    "the request or the earlier messages give is a gap: the value is computed; "
     "content cut off; the wrong language or format; items the person gave "
     "written differently (split into syllables, renamed, translated, reworded) "
     "when nothing asked for that. Acceptable variants are "
@@ -764,6 +766,38 @@ def unit_gaps(tools: Any, content: Any, preview: bytes) -> list[str]:
     ]
 
 
+def computed_placeholder_gaps(tools: Any, content: Any) -> list[str]:
+    """A placeholder where the file could hold a value computed from the
+    figures the person gave (derived_values.py): a gap code is sure of.
+
+    The figures are those of the request, the earlier messages and the
+    document the turn read, as for unit_gaps.
+    """
+    from services.orchestrator import derived_values
+
+    if content is None:
+        return []
+    earlier = getattr(tools, "earlier_requests", None)
+    sources = [
+        text
+        for text in (
+            getattr(tools, "request_text", ""),
+            *(earlier if isinstance(earlier, list) else []),
+        )
+        if isinstance(text, str) and text.strip()
+    ]
+    try:
+        from services.orchestrator import document_quotes
+        from services.orchestrator import source_faithfulness as faith
+
+        provided = faith.provided(document_quotes.current.get())
+        if provided is not None:
+            sources.append(provided.text)
+    except Exception:  # noqa: BLE001 - the messages alone are still a source
+        pass
+    return derived_values.placeholder_gaps(content, sources)
+
+
 def planned_gaps(tools: Any, content: Any) -> list[str]:
     """What code knows the file lacks against the pictures planned for it.
 
@@ -1238,6 +1272,7 @@ async def review(
     certain = (
         planned_gaps(tools, content)
         + unit_gaps(tools, content, preview)
+        + computed_placeholder_gaps(tools, content)
         + title_gaps(content, name)
         + quote_gaps(tools, content, preview)
         + restated_gaps(suffix, content, name)

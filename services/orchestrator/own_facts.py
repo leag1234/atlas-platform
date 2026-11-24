@@ -56,7 +56,10 @@ QUESTION = (
     "pattern (days, hours, meeting arrangements); a duration or a date; a claim "
     "that something did not happen or was not recorded (no complaints, no "
     "delay). Not listed: what the messages give, even reworded; bracketed "
-    "placeholders such as [result to add]; general knowledge that is not about "
+    "placeholders such as [result to add]; a value that follows by calculation "
+    "from figures the messages give (a product, a sum, a total, a difference, a "
+    "ratio, a percentage, a unit conversion), even when the messages do not "
+    "write the result; general knowledge that is not about "
     "the person's case; proposals, recommendations, questions and next steps "
     "written as such; titles and headings.\n"
     'Output only JSON: {"lines":[{"line":3,"words":"<the words of that line '
@@ -65,8 +68,9 @@ QUESTION = (
 GAP = (
     "statements about the person's own case that no message gives: {items} "
     "(write each one as a bracketed placeholder in the file's language at its "
-    "place, such as [result to add], or remove it; keep every placeholder and "
-    "every figure the person gave)"
+    "place, such as [result to add], or remove it; a value that follows by "
+    "calculation from the figures the person gave is computed and written, never "
+    "a placeholder; keep every placeholder and every figure the person gave)"
 )
 _PLACEHOLDER = re.compile(r"\[[^\[\]\n]{1,80}+\]")
 _WORDS = re.compile(r"[^\W_]++")
@@ -118,9 +122,15 @@ def _given_words(asked: list[str]) -> set[str]:
 def given(words: str, asked: list[str]) -> bool:
     """Whether the person's messages already hold a statement: all its figures
     and most of its words ("our team trying a 4 day work week" holds "our team
-    piloted a four-day work week")."""
+    piloted a four-day work week"). A figure that follows by calculation from
+    their figures is held (derived_values.derivable)."""
+    from services.orchestrator import derived_values
+
     held = _given_words(asked)
-    plain = [w for w in _plain(_PLACEHOLDER.sub(" ", words)).split() if len(w) >= 2]
+    # A figure computed from the person's figures (a total, a conversion) is
+    # theirs too: never a placeholder (derived_values.py, class suite 2026-11-24).
+    text = derived_values.without_derivable(_PLACEHOLDER.sub(" ", words), asked)
+    plain = [w for w in _plain(text).split() if len(w) >= 2]
     if not plain:
         return True
     if any(w.isdigit() and w not in held for w in plain):

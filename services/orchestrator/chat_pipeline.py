@@ -2639,7 +2639,9 @@ async def _process(
             asked_text(request),
             request.lang,
             device_timings="tavily" in search_providers(),
-            history=tuple(m.text for m in request.messages[:-1]) if links else (),
+            # The earlier turns also tell a request about the conversation's
+            # own delivery (link_requests.own_delivery).
+            history=tuple(m.text for m in request.messages[:-1]),
         )
         if not request.has_attachments and (not followup or images_in_history)
         else ()
@@ -3554,29 +3556,24 @@ async def _process(
         ):
             await sink({"delta": {"content": item.reponse}})
     except GatewayError as exc:
-        if links and exc.code in {
-            "search_unavailable",
-            "quota_exceeded",
-            "search_rate_limited",
-            "search_no_results",
-            "daily_search_limit",
-        }:
-            from services.orchestrator.link_requests import (
-                fallback_terms,
-                reason,
-                unavailable,
-            )
+        from services.orchestrator.link_requests import (
+            SEARCH_FAILURES,
+            failed_links_reply,
+        )
 
+        if links and exc.code in SEARCH_FAILURES:
+            # Any failed search of a link request, a blocked or timed-out one
+            # included, ends with the terms to search (an empty reply before,
+            # class suite 2026-11-24). Other turns keep the refusal: an API
+            # client reads its status (D5), the chat a sentence (chat_stream).
             item.erreurs.append(exc.code)
-            item.reponse = unavailable(
-                fallback_terms(
-                    request.user_text, tuple(m.text for m in request.messages[:-1])
-                ),
+            item.reponse = failed_links_reply(
+                exc.code,
+                exc.detail,
+                request.user_text,
+                tuple(m.text for m in request.messages[:-1]),
                 request.lang,
             )
-            cause = exc.detail.strip() or reason(exc.code, request.lang)
-            if cause:
-                item.reponse += "\n\n" + cause
             item.state = "done"
             item.cout_eur = float(model.spent)
             return
