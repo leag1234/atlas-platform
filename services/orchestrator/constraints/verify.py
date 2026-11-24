@@ -87,11 +87,17 @@ evidence. If you cannot quote evidence, omit that constraint."""
 REPAIR_SYSTEM = """You correct a reply so that it meets the person's \
 constraints listed under "failed", each with what a checker found.
 
-Keep everything else exactly: facts, figures, names, links (markdown links \
-copied character for character), code blocks, and the language and register \
-of the reply. Change only what each failed constraint needs. Do not add \
-explanations about the correction. If a constraint cannot be met by \
-rewriting the text (a file was or was not made), leave the text as it is.
+"conversation" is the conversation the reply answers, the person's last \
+message last: the corrected reply answers the same request, on the same \
+subject, with the same content. Change only the form each failed constraint \
+needs. Keep everything else exactly: facts, figures, names, links (markdown \
+links copied character for character), code blocks, and the language and \
+register of the reply. Never add content the reply did not have, never \
+replace it with generic content, and never copy the person's instructions \
+into the reply (an instruction to the assistant is followed, never \
+written as a line of the reply). Do not add explanations about the correction. If a \
+constraint cannot be met by rewriting the text (a file was or was not made), \
+leave the text as it is.
 Return JSON {"answer": "<the corrected reply in markdown>"}."""
 
 
@@ -196,9 +202,18 @@ def parse_verdicts(
 
 
 def repair_messages(
-    answer: str, failed: Sequence[tuple[Constraint, Result]]
+    answer: str,
+    failed: Sequence[tuple[Constraint, Result]],
+    conversation: Sequence[tuple[str, str]] = (),
 ) -> list[dict[str, Any]]:
+    """The rewrite call: the same conversation the reply answers (its
+    subject and content), the reply, and what each failed constraint needs."""
     data = {
+        "conversation": [
+            {"role": role, "text": text[:MESSAGE_CHARACTERS]}
+            for role, text in conversation
+            if role in {"user", "assistant"} and text.strip()
+        ][-EARLIER_MESSAGES:],
         "failed": [
             {
                 "constraint": item.label(),
@@ -210,6 +225,8 @@ def repair_messages(
                     if item.count is not None
                     else {}
                 ),
+                **({"part": "one part of the reply"} if item.part == "one" else {}),
+                **({"part": "each part of the reply"} if item.part == "each" else {}),
                 "found": result.evidence,
             }
             for item, result in failed
