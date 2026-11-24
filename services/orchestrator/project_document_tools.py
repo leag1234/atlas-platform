@@ -713,6 +713,10 @@ async def publish(
 
             asked_parts = slide_parts.requested(_asked_requests(tools))
             content = slide_parts.placed(content, asked_parts)
+            # Bullet points asked: lists, never cards (expectations.py).
+            from services.orchestrator import expectations as asked
+
+            content = asked.bulleted_as_asked(tools, str(path), content)
         content, pictures = placed_pictures(tools, content)
         document = await asyncio.to_thread(
             build_project_document,

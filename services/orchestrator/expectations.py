@@ -74,7 +74,33 @@ KEYS = frozenset(
 )
 RENDER_PROPERTIES = ("palette", "visible")
 # Document assertions, on the content the file is built from.
-PARTS = ("title", "section", "slide", "table", "picture", "chart", "text", "size")
+PARTS = (
+    "title",
+    "section",
+    "slide",
+    "table",
+    "picture",
+    "chart",
+    "text",
+    "size",
+    "layout",
+)
+# Layout requirements (part "layout"), checked by code on the built file's
+# structured view (constraints/views.py, constraints/checks.py): titles of the
+# slides or sections in order, list style and item counts, a text in a region
+# (footer, header, on the slide and not in its notes), on one page or slide or
+# on each. docs/33.
+LAYOUT_RULES = (
+    "titles",
+    "list_style",
+    "items",
+    "contains",
+    "excludes",
+    "order",
+    "starts_with",
+    "paragraphs",
+)
+LAYOUT_STYLES = ("bullets", "numbered", "checkboxes", "plain")
 # Size and count requirements (part "size"), measured by code on the built
 # file: slides of the deck, pages of the rendered PDF, words of the text,
 # bullet items, table rows, sections, and the pictures the file shows
@@ -243,6 +269,9 @@ class Ledger:
         if len(self.active()) >= MAX_REQUIREMENTS:
             return None
         method, check = normalized_check(self.kind, raw)
+        if not layout_texts_said(check, said):
+            # An exact title or footer nobody wrote: never checked by code.
+            method, check = "judge", {}
         if not stated_count(check, said):
             # A count nobody wrote: "a short word report" read as "about 1
             # word" (staging -156) made a one-page report of 154 words fail
@@ -442,6 +471,8 @@ def normalized_check(kind: str, raw: dict[str, Any]) -> tuple[str, dict[str, Any
                 "count": size,
                 "relation": relation if relation in RELATIONS else "about",
             }
+        if part == "layout":
+            return layout_check(raw)
         words = _words(raw.get("words"))
         count = raw.get("count")
         check = {"part": part, "words": words}
@@ -451,6 +482,170 @@ def normalized_check(kind: str, raw: dict[str, Any]) -> tuple[str, dict[str, Any
             return "judge", {}
         return "code", check
     return "judge", {}
+
+
+def layout_check(raw: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    """A layout requirement code can check on the built file, or judge."""
+    rule = raw.get("rule")
+    if rule not in LAYOUT_RULES:
+        return "judge", {}
+    texts = _texts(raw.get("texts") if "texts" in raw else raw.get("words"))
+    if not texts and isinstance(raw.get("text"), str):
+        texts = _texts([raw["text"]])
+    check: dict[str, Any] = {"part": "layout", "rule": rule}
+    where = raw.get("where")
+    if isinstance(where, str) and re.fullmatch(
+        r"(?:each|footer|header|notes|title|body|(?:page|slide):?\d{1,3})"
+        r"(?:[ ,]+(?:each|footer|header|notes|title|body))?",
+        where.strip().casefold(),
+    ):
+        check["where"] = where.strip().casefold()
+    if rule in {"titles", "order"}:
+        if len(texts) < 2:
+            return "judge", {}
+        check["texts"] = texts
+    elif rule in {"contains", "excludes", "starts_with"}:
+        if len(texts) != 1:
+            return "judge", {}
+        check["texts"] = texts
+    if rule == "list_style":
+        if raw.get("style") not in LAYOUT_STYLES:
+            return "judge", {}
+        check["style"] = raw["style"]
+    if rule in {"items", "paragraphs"}:
+        count = raw.get("count")
+        if (
+            not isinstance(count, int)
+            or isinstance(count, bool)
+            or not 0 <= count <= MAX_COUNT
+        ):
+            return "judge", {}
+        check["count"] = count
+        relation = raw.get("relation")
+        check["relation"] = relation if relation in ("exact", "min", "max") else "exact"
+    return "code", check
+
+
+def _texts(value: Any) -> list[str]:
+    """Exact texts of a layout check, kept as written (up to 20)."""
+    if not isinstance(value, list):
+        return []
+    found = [
+        " ".join(item.split())[:MAX_STATEMENT]
+        for item in value
+        if isinstance(item, str) and item.strip()
+    ]
+    return list(dict.fromkeys(found))[:20]
+
+
+def layout_texts_said(check: dict[str, Any], said: Sequence[str]) -> bool:
+    """The exact texts of a layout check were written by the person; without
+    the messages (a stored ledger read again) the check stays."""
+    if check.get("part") != "layout" or not said:
+        return True
+    from services.orchestrator.constraints.model import exact_in
+
+    return all(exact_in(text, said) for text in check.get("texts") or [])
+
+
+def layout_constraint(item: Requirement) -> Any:
+    """The requirement as a file constraint of constraints/model.py."""
+    from services.orchestrator.constraints.model import Constraint
+
+    check = item.check
+    where = str(check.get("where") or "")
+    region, page, each = "", 0, False
+    for part in re.split(r"[ ,]+", where):
+        if part in {"footer", "header", "notes", "title", "body"}:
+            region = part
+        elif part == "each":
+            each = True
+        elif re.fullmatch(r"(?:page|slide):?\d{1,3}", part):
+            page = int(re.sub(r"\D", "", part))
+    texts = tuple(check.get("texts") or ())
+    rule = str(check["rule"])
+    return Constraint(
+        kind=rule,
+        scope="file",
+        quote=item.statement,
+        turn=item.turn,
+        statement=item.statement,
+        text=texts[0]
+        if rule in {"contains", "excludes", "starts_with"} and texts
+        else "",
+        items=texts if rule in {"titles", "order"} else (),
+        count=check.get("count"),
+        relation=str(check.get("relation") or "exact"),
+        style=str(check.get("style") or ""),
+        region=region,
+        page=page,
+        each=each,
+        id=item.id,
+    )
+
+
+def layout_result(item: Requirement, view: Any) -> Result:
+    """A layout requirement checked on the file's view; None when code
+    cannot decide (the judge then reads the file)."""
+    from services.orchestrator.constraints import checks
+
+    if view is None:
+        return Result(item.id, None, "the built file could not be read")
+    if not any(block.text for block in view.blocks):
+        # Nothing readable (pictures of pages, drawn text): code cannot
+        # measure, so it claims neither a pass nor a violation.
+        return Result(item.id, None, "no text could be read from the built file")
+    verdict = checks.check(layout_constraint(item), view)
+    if verdict.passed is False:
+        return Result(item.id, False, "measured on the built file: " + verdict.evidence)
+    return Result(item.id, verdict.passed, "")
+
+
+def _asks_bullets(ledger: Ledger) -> bool:
+    return any(
+        item.method == "code"
+        and item.check.get("part") == "layout"
+        and item.check.get("rule") == "list_style"
+        and item.check.get("style") == "bullets"
+        for item in ledger.active()
+    )
+
+
+def bulleted_as_asked(tools: Any, name: str, content: Any) -> Any:
+    """A deck whose requirements ask for bullet points draws its points as
+    bulleted lists (Section.bulleted), never as cards: code applies what the
+    ledger holds, the turn's or the one stored with the file."""
+    if content is None or not enabled():
+        return content
+    turn = getattr(tools, "expectations", None)
+    ledger = turn.ledger if isinstance(turn, TurnLedger) else None
+    if ledger is None:
+        scope = str(getattr(tools, "picture_scope", "") or "")
+        stored = load(document_key(scope, name))
+        ledger = stored[0] if stored else None
+    if ledger is None or not _asks_bullets(ledger):
+        return content
+    sections = tuple(
+        section.model_copy(update={"bulleted": True})
+        if section.bullets and not section.bulleted
+        else section
+        for section in content.sections
+    )
+    return content.model_copy(update={"sections": sections})
+
+
+def file_view_of(raw: bytes, suffix: str) -> Any:
+    """The structured view of the built file (constraints/views.py), or None."""
+    import tempfile
+
+    from services.orchestrator.constraints.views import file_view
+
+    if not raw or suffix not in {".pptx", ".docx", ".pdf", ".xlsx", ".html", ".svg"}:
+        return None
+    with tempfile.TemporaryDirectory(prefix="atlas-layout-") as directory:
+        path = Path(directory) / ("built" + suffix)
+        path.write_bytes(raw)
+        return file_view(path)
 
 
 # ---- storage -----------------------------------------------------------------
@@ -529,6 +724,7 @@ APP_METHODS = """- "code": a test presses or sets an element in the running app.
 
 DOCUMENT_METHODS = """- "code": a part of the file's content. Fields: "part" (title, section, slide, table, picture, chart, text), "words" (1 to 4 words its heading or text contains, in the file's language), and "count" when the person asked for a number of such parts.
 - "code" with "part": "size" for every size or count the person asked for the whole file: "unit" (slides, pages, words, items, rows, sections, pictures), "count" (a number) and "relation" (exact, about, max, min). For example "cinq diapositives" is {"part": "size", "unit": "slides", "count": 5, "relation": "exact"}, "about one page" is {"part": "size", "unit": "pages", "count": 1, "relation": "about"}, "maximal 300 Wörter" is {"part": "size", "unit": "words", "count": 300, "relation": "max"}, "con tres fotos" is {"part": "size", "unit": "pictures", "count": 3, "relation": "exact"}. A number of pictures, images, photos or illustrations in the whole file is a size in pictures. A size is always its own requirement.
+- "code" with "part": "layout" for how the file is laid out, checked on the built file: "rule" (titles, list_style, items, contains, excludes, order, starts_with, paragraphs) with "texts" (exact texts copied from the person's words: titles in order, a text that must or must not appear), "style" (bullets, numbered, checkboxes, plain) for list_style, "count" and "relation" (exact, min, max) for items and paragraphs, and "where": "each" (on each slide or page), "slide:N" or "page:N", "footer", "header", "notes" (in the speaker notes), or nothing (anywhere on the slides or pages, speaker notes not included). For example the slide titles "Seeds", "Soil", "Water" in this order is {"part": "layout", "rule": "titles", "texts": ["Seeds", "Soil", "Water"]}; three bullet points on each slide is {"part": "layout", "rule": "items", "count": 3, "relation": "exact", "where": "each"} and {"part": "layout", "rule": "list_style", "style": "bullets", "where": "each"}; a footer "Club du mardi" is {"part": "layout", "rule": "contains", "texts": ["Club du mardi"], "where": "footer"}; a heading "Example" on each slide itself, not in the notes, is {"part": "layout", "rule": "contains", "texts": ["Example"], "where": "each"}; four boxes to tick is {"part": "layout", "rule": "items", "count": 4} and {"part": "layout", "rule": "list_style", "style": "checkboxes"}. One rule per requirement.
 - "judge": only when no part fits (a tone, a style, a quality). A length of the whole file (pages, slides, words, "short", "one page") is a size, never judge."""
 
 JUDGE_SYSTEM = (
@@ -728,6 +924,8 @@ def describe_check(item: Requirement) -> str:
             "min": f"at least {size}",
         }[relation]
         return f"the whole file has {asked} {check['unit']}, measured on the built file"
+    if item.method == "code" and check.get("part") == "layout":
+        return describe_layout(check)
     if item.method == "code" and "part" in check:
         words = " or ".join(f'"{word}"' for word in check.get("words") or [])
         text = f"a {check['part']}" + (
@@ -742,6 +940,56 @@ def describe_check(item: Requirement) -> str:
         words = " or ".join(f'"{word}"' for word in check.get("words") or [])
         return f"a {ROLE_NAMES[check.get('role', 'any')]} containing {words} is visible on a phone-size screen"
     return "read by a reviewer model against the file"
+
+
+def describe_layout(check: dict[str, Any]) -> str:
+    """A layout check as the writer and the repair read it."""
+    texts = ", ".join(f'"{text}"' for text in check.get("texts") or [])
+    where = str(check.get("where") or "")
+    place = {
+        "each": "on each slide or page",
+        "footer": "in the running footer",
+        "header": "in the header",
+        "notes": "in the speaker notes",
+        "title": "as a title",
+    }
+    scope = (
+        " ".join(
+            place.get(part, part.replace(":", " "))
+            for part in re.split(r"[ ,]+", where)
+            if part
+        )
+        or "on the slides or pages (speaker notes do not count)"
+    )
+    relation = {"exact": "exactly", "min": "at least", "max": "at most"}.get(
+        str(check.get("relation") or "exact"), "exactly"
+    )
+    rule = check.get("rule")
+    if rule == "titles":
+        return f"the slide or section titles are exactly {texts}, in this order"
+    if rule == "order":
+        return f"{texts} appear in this order {scope}"
+    if rule == "contains":
+        return f"{texts} is written {scope}"
+    if rule == "excludes":
+        return f"{texts} is not written {scope}"
+    if rule == "starts_with":
+        return f"the text begins with {texts} {scope}"
+    if rule == "items":
+        return f"{relation} {check.get('count')} list items {scope}"
+    if rule == "paragraphs":
+        return f"{relation} {check.get('count')} paragraphs {scope}"
+    style = str(check.get("style") or "")
+    if style == "bullets":
+        return (
+            f"the points are a bulleted list {scope}, never cards or columns "
+            "(on a deck slide: set bulleted to true)"
+        )
+    if style == "checkboxes":
+        return f"the points are boxes to tick (- [ ] text) {scope}"
+    if style == "numbered":
+        return f"the points are a numbered list {scope}"
+    return f"no list {scope}"
 
 
 def assertions(ledger: Ledger) -> list[dict[str, Any]]:
@@ -1530,11 +1778,19 @@ class TurnLedger:
         seconds: float,
         measures: dict[str, int | None] | None = None,
         name: str = "",
+        view: Any = None,
     ) -> list[Result]:
         results: dict[str, Result] = {}
         to_judge: list[Requirement] = []
         for item in self.ledger.active():
-            if item.method == "code" and "part" in item.check:
+            if item.method == "code" and item.check.get("part") == "layout":
+                # Read on the built file; undecided, the judge reads it.
+                layout = layout_result(item, view)
+                if layout.passed is None:
+                    to_judge.append(item)
+                else:
+                    results[item.id] = layout
+            elif item.method == "code" and "part" in item.check:
                 results[item.id] = document_result(item, content, text, measures)
             elif (named := file_name_result(item, name)) is not None:
                 # The file's name is a fact of the deliverable, never read in
@@ -1896,8 +2152,25 @@ async def document_check(
     # another one.
     tools.file_measures = measures
     left = seconds - (time.monotonic() - started)
+    view = None
+    if any(
+        item.method == "code" and item.check.get("part") == "layout"
+        for item in turn.ledger.active()
+    ):
+        try:
+            view = await asyncio.to_thread(file_view_of, raw, suffix)
+        except Exception as error:  # noqa: BLE001 - unread, the judge decides
+            log.warning(
+                json.dumps(
+                    {
+                        "event": "expectations_layout_unread",
+                        "error": type(error).__name__,
+                    }
+                )
+            )
+        left = seconds - (time.monotonic() - started)
     results = await turn.check_document(
-        content, text, left, measures, PurePosixPath(name).name
+        content, text, left, measures, PurePosixPath(name).name, view
     )
     turn.last_results = results
     _plan_status(str(getattr(tools, "lang", "") or "en"), results)

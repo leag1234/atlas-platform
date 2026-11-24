@@ -1123,7 +1123,19 @@ async def process(request: ChatRequest, item: Interaction) -> None:
         ),
     )
     traveling = travel_claims.current.set(travel)
-    holder = _HeldAnswer(sink, holding=bool(check)) if sink else None
+    from services.orchestrator.constraints import pipeline as answer_constraints
+
+    # A reply with a constraint on its form ("begin with ...", "one sentence",
+    # "write ... under the file") is held until it is checked and repaired
+    # (constraints/pipeline.py, docs/33).
+    holder = (
+        _HeldAnswer(
+            sink,
+            holding=bool(check) or answer_constraints.holds(request.user_text),
+        )
+        if sink
+        else None
+    )
     held = sink_context.set(holder) if holder is not None else None
     if holder is not None:
         travel.hold = holder.hold
@@ -1641,6 +1653,8 @@ async def process(request: ChatRequest, item: Interaction) -> None:
                     "computed": deeds.computed(),
                 }
             )
+    if item.state == "done" and item.task_type != "drawing" and item.reponse.strip():
+        await _answer_constraints(request, item, holder)
     if provenance is not None and item.state == "done" and item.task_type != "work":
         number_provenance.record(
             provenance,
@@ -1663,6 +1677,61 @@ async def process(request: ChatRequest, item: Interaction) -> None:
         item.reponse = notices.get(language, notices["en"])
         if sink := sink_context.get():
             await sink({"delta": {"content": item.reponse}})
+
+
+async def _answer_constraints(
+    request: ChatRequest, item: Interaction, holder: "_HeldAnswer | None"
+) -> None:
+    """The person's constraints on the reply, checked by code, repaired once,
+    the rest said (constraints/pipeline.py, docs/33)."""
+    from services.orchestrator.constraints import pipeline as answer_constraints
+    from services.orchestrator.deadline import remaining as time_left
+
+    if answer_constraints.mode() == "off":
+        return
+    streamed = bool(request.atlas_ui and holder is not None and holder.passed)
+    left = time_left()
+    made = [
+        *item.files,
+        *(str(a.get("title") or a.get("id") or "") for a in item.artifacts),
+    ]
+    spent: list[Decimal] = []
+    outcome = await answer_constraints.enforce(
+        [(m.role, m.text) for m in request.conversation_messages],
+        item.reponse,
+        language=detected_language(item.reponse) or request.answer_language,
+        # Made in this turn: a file, an app or picture version, a drawing,
+        # or a deliverable the reply links to.
+        produced=bool(
+            made
+            or any(image.get("kind") != "web_image" for image in item.images)
+            or re.search(r"/(?:deliverables|versions)/", item.reponse)
+        ),
+        made=", ".join(name for name in made if name)[:200],
+        streamed=streamed,
+        profile=str(request.model),
+        strict=privacy.owned_only(),
+        seconds=min(40.0, max(0.0, (left if left is not None else 60.0) - 5.0)),
+        spend=spent.append,
+    )
+    if not outcome.constraints:
+        return
+    logging.getLogger(__name__).info(outcome.log_line())
+    if spent:
+        item.cout_eur = float(Decimal(str(item.cout_eur)) + sum(spent, Decimal(0)))
+    item.reponse = outcome.answer
+    if outcome.note:
+        item.reponse = unsourced_details.with_note(item.reponse, outcome.note, streamed)
+        if streamed and (current_sink := sink_context.get()) is not None:
+            await current_sink({"delta": {"content": "\n\n" + outcome.note}})
+    item.steps.append(
+        {
+            "phase": "answer_constraints",
+            "constraints": len(outcome.constraints),
+            "unmet": len(outcome.unmet()),
+            "repaired": outcome.repaired,
+        }
+    )
 
 
 # Failures of the model's answer itself, not refusals: budget, quota, privacy
