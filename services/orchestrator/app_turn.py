@@ -1434,7 +1434,12 @@ def _held_to_facts(text: str, facts: app_facts.FileFacts, language: str) -> str:
         logging.getLogger(__name__).warning(
             "app_turn_claims_removed kinds=%s", ",".join(sorted(set(kinds)))
         )
-    return checked
+    # Whether the app was tried out is the code's to state (the render check
+    # and the requirements' results): a sentence that says it was tested, or
+    # gives results as observed, is the writer's guess.
+    from services.orchestrator import file_claims
+
+    return file_claims.without_unproven_status(checked) or checked
 
 
 def _media_line(item: Media) -> str:

@@ -299,11 +299,16 @@ def chrome(slide: Any, theme: Theme, heading: str, deck: str, number: int) -> No
     write(count, [str(number)], 10, theme.muted, align=PP_ALIGN.RIGHT, gap=0)
 
 
-def text_items(section: Section) -> list[tuple[str, bool]]:
-    """(text, bulleted) in order: paragraphs, then bullets."""
-    return [(text, False) for text in section.paragraphs] + [
-        (text, True) for text in section.bullets
-    ]
+def text_items(section: Section, trailing: int = 0) -> list[tuple[str, bool]]:
+    """(text, bulleted) in order: paragraphs, then bullets, then the last
+    `trailing` paragraphs (the text a person put under a list)."""
+    head = section.paragraphs[: len(section.paragraphs) - trailing]
+    tail = section.paragraphs[len(section.paragraphs) - trailing :] if trailing else ()
+    return (
+        [(text, False) for text in head]
+        + [(text, True) for text in section.bullets]
+        + [(text, False) for text in tail]
+    )
 
 
 def body_list(
@@ -740,9 +745,9 @@ def callouts(section: Section) -> tuple[Metric, ...]:
     return tuple(m for m in section.metrics if numeric(m.value))
 
 
-def section_items(section: Section) -> list[tuple[str, bool]]:
+def section_items(section: Section, trailing: int = 0) -> list[tuple[str, bool]]:
     """The slide's text items; a key number without digits is one of them."""
-    return text_items(section) + [
+    return text_items(section, trailing) + [
         (f"{m.label}: {m.value}", True) for m in section.metrics if not numeric(m.value)
     ]
 
@@ -1034,14 +1039,14 @@ def chunked(
     return chunks
 
 
-def parts(section: Section) -> list[dict[str, Any]]:
+def parts(section: Section, trailing: int = 0) -> list[dict[str, Any]]:
     """The slides of a section: one, or more for long text, tables and pictures.
 
     Each part says what it shows: its items, whether the key numbers are on
     it, and its visual (chart, table rows or picture).
     """
     area = Rect(SIDE, BODY_TOP, W - 2 * SIDE, BODY_BOTTOM - BODY_TOP)
-    items = section_items(section)
+    items = section_items(section, trailing)
     numbers = 174.0 if callouts(section) else 0.0
     lead = bool(items) and sum(len(shown(text)) for text, _ in items) <= 90
     has_visual = bool(section.chart or section.tables or section.images)
@@ -1083,6 +1088,41 @@ def parts(section: Section) -> list[dict[str, Any]]:
     return result or [dict(items=[], metrics=True)]
 
 
+def merged(sections: tuple[Section, ...]) -> list[tuple[Section, int]]:
+    """The slides' sections, with a sentence that continues a list under it.
+
+    A paragraph-only section that continues the section before it, when that
+    one is a list, is the text the person put under the list: it is drawn on
+    the list's slide, after the list, as long as the slide still holds it in
+    one piece. (Otherwise it stays a slide of its own, which repeats the
+    heading.) The second number is how many trailing paragraphs there are.
+    """
+    result: list[tuple[Section, int]] = []
+    for section in sections:
+        if (
+            result
+            and section.continued
+            and section.paragraphs
+            and bare(section)
+            and not section.bullets
+            and result[-1][0].bullets
+            and bare(result[-1][0])
+        ):
+            before, trailing = result[-1]
+            joined = before.model_copy(
+                update=dict(
+                    paragraphs=(*before.paragraphs, *section.paragraphs),
+                    notes=(*before.notes, *section.notes),
+                )
+            )
+            count = trailing + len(section.paragraphs)
+            if len(parts(joined, count)) == len(parts(before, trailing)):
+                result[-1] = (joined, count)
+                continue
+        result.append((section, 0))
+    return result
+
+
 def build_deck(content: Content, path: Path, root: Path) -> None:
     font()
     theme = theme_for(content.title)
@@ -1091,12 +1131,13 @@ def build_deck(content: Content, path: Path, root: Path) -> None:
     deck.core_properties.title = shown(content.title)
     blank = deck.slide_layouts[6]
     number = 0
-    count = len(content.sections)
+    slides = merged(content.sections)
+    count = len(slides)
     previous = ""
     # The footer line of every content slide: the running footer asked
     # (Content.footer), else the deck title.
     running = content.footer or content.title
-    for index, section in enumerate(content.sections):
+    for index, (section, trailing) in enumerate(slides):
         layout = kind(section, index, count)
         if layout == previous and layout in ("cards", "pillars"):
             # Two slides in a row never share a point layout.
@@ -1104,7 +1145,9 @@ def build_deck(content: Content, path: Path, root: Path) -> None:
         layout = widened(layout, section, previous)
         previous = layout
         pieces = (
-            [dict(items=[], metrics=True)] if layout != "content" else parts(section)
+            [dict(items=[], metrics=True)]
+            if layout != "content"
+            else parts(section, trailing)
         )
         for piece in pieces:
             number += 1
