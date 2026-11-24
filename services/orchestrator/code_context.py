@@ -14,18 +14,18 @@ from collections.abc import Sequence
 
 MAX_CHARACTERS = 6000
 _FENCED = re.compile(
-    r"(?ms)^[ \t]*(`{3,}|~{3,})[ \t]*([\w+#.-]*)[^\n]*\n(.*?)^[ \t]*\1[ \t]*$"
+    r"(?ms)^[ \t]*+(`{3,}|~{3,})[ \t]*+([\w+#.-]*+)[^\n]*+\n(.*?)^[ \t]*+\1[ \t]*+$"
 )
 # A line of code with no fence around it: an assignment, a call, a keyword
 # statement, an indented body or a closing brace.
 _CODE_LINE = re.compile(
-    r"^\s*(?:"
-    r"[A-Za-z_][\w.\[\]]*\s*(?:[-+*/%|&]?=|:=)\s*\S.*"
-    r"|[A-Za-z_][\w.]*\(.*\)\s*;?"
+    r"^(?:\s*+(?:"
+    r"[A-Za-z_][\w.\[\]]*+\s*+(?:[-+*/%|&]?=|:=)\s*+\S.*+"
+    r"|[A-Za-z_][\w.]*+\(.*\)\s*+;?"
     r"|(?:def|class|import|from|for|while|if|elif|else|try|except|return|print|const|let|var|"
-    r"function|SELECT|INSERT|UPDATE|echo|cd|ls|cat|grep|pip|npm|git)\b.*"
-    r"|[}\])]+;?"
-    r"|\s{2,}\S.*"
+    r"function|SELECT|INSERT|UPDATE|echo|cd|ls|cat|grep|pip|npm|git)\b.*+"
+    r"|[}\])]++;?"
+    r")|\s{2,}+\S.*+"
     r")\s*$"
 )
 
