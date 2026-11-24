@@ -135,9 +135,11 @@ class SameServer(FakeServer):
 class EditServer(FakeServer):
     """A server whose health says it edits a reference picture."""
 
-    def __init__(self, fail_edit: bool = False) -> None:
+    def __init__(self, fail_edit: bool = False, echo: bool = False) -> None:
         super().__init__()
         self.fail_edit = fail_edit
+        # echo: the edit gives back the very picture it was given.
+        self.echo = echo
         self.edits: list[tuple[str, int, str]] = []
 
     async def health(self, seconds: float = 4.0) -> dict[str, Any]:
@@ -151,7 +153,10 @@ class EditServer(FakeServer):
         if self.fail_edit:
             raise cpu_server.CpuServerError("picture_cpu_http_502")
         return cpu_server.Rendered(
-            image=png((200, 30, 30)),
+            # Each edit its own picture (or the reference itself, echo).
+            image=reference
+            if self.echo
+            else png((200, (25 * len(self.edits)) % 250, 30)),
             nsfw=0.0001,
             render_seconds=47.0,
             queue_seconds=0.0,
@@ -274,7 +279,7 @@ class FollowUpTests(Base):
         ]
         for text in cases:
             with self.subTest(text=text):
-                gateway, server = DialogueGateway(), FakeServer()
+                gateway, server = DialogueGateway(), EditServer()
                 first, picture_set = await self.start(gateway, server)
                 history = [
                     ("user", "un jardinier en manteau vert"),
@@ -409,7 +414,7 @@ class FollowUpTests(Base):
 
     async def test_an_identical_picture_makes_no_new_version(self) -> None:
         gateway = DialogueGateway(follow_reply("change", "Add a red hat."))
-        server = SameServer()
+        server = EditServer(echo=True)
         first, picture_set = await self.start(gateway, server)
         history = [("user", "un jardinier"), ("assistant", first.reponse)]
         gateway.reply = rewrite_reply(prompt=FIRST + " He wears a red hat.")
@@ -423,14 +428,22 @@ class FollowUpTests(Base):
         self.assertEqual(after.artifact_version, picture_set.artifact_version)
 
     async def test_real_changes_accumulate_and_keep_the_seed(self) -> None:
+        # A server that cannot edit, its redraw accepted each time: the
+        # changed description is drawn with the picture's own seed.
         gateway = DialogueGateway(follow_reply("change", "Show the whole head."))
         server = FakeServer()
         first, picture_set = await self.start(gateway, server)
         history = [("user", "un jardinier"), ("assistant", first.reponse)]
         gateway.reply = rewrite_reply(prompt=FIRST + " His whole head is visible.")
+        self.accept_redraw(picture_set)
         done, item = await self.follow(gateway, history, "montre sa tête")
         self.assertTrue(done)
         self.assertEqual(server.renders[-1][1], picture_set.seed)
+        self.assertIn("n'a pas été retouchée sur place", item.reponse)
+        stored = store.load(picture_set.set_id)
+        assert stored is not None
+        self.assertFalse(stored.proposed_redraw)  # used once
+        self.accept_redraw(stored)
         gateway.follow = follow_reply("change", "Add a nose, a mouth and eyes.")
         gateway.reply = rewrite_reply(prompt=FIRST + " Head, eyes, nose and mouth.")
         history += [("user", "montre sa tête"), ("assistant", item.reponse)]
@@ -449,6 +462,11 @@ class FollowUpTests(Base):
         self.assertIn("/versions/3/open", again.reponse)
 
     # (b2) Corrections are state: failed statements, proposals, a new method.
+
+    def accept_redraw(self, picture_set: store.PictureSet) -> None:
+        """As after Atlas proposed a redraw the person accepted."""
+        picture_set.proposed_redraw = True
+        store.update(picture_set)
 
     def mark_missed(self, picture_set: store.PictureSet, missed: list[str]) -> None:
         picture_set.candidates[picture_set.artifact_candidate].unmet = missed
@@ -493,7 +511,7 @@ class FollowUpTests(Base):
         gateway = CheckingDialogueGateway(
             follow_reply("change", "The kite has exactly six tails.")
         )
-        server = FakeServer()
+        server = EditServer()
         first, picture_set = await self.start(gateway, server)
         history = [("user", "un cerf-volant"), ("assistant", first.reponse)]
         gateway.reply = rewrite_reply(
@@ -519,7 +537,7 @@ class FollowUpTests(Base):
         gateway = CheckingDialogueGateway(
             follow_reply("change", "Add a red hat with two feathers.")
         )
-        server = FakeServer()
+        server = EditServer()
         first, picture_set = await self.start(gateway, server)
         self.mark_missed(picture_set, [])
         history = [("user", "un jardinier"), ("assistant", first.reponse)]
@@ -609,7 +627,7 @@ class FollowUpTests(Base):
 
     async def test_an_accepted_proposal_is_applied_from_the_stored_plan(self) -> None:
         gateway = DialogueGateway(follow_reply("review"))
-        server = FakeServer()
+        server = EditServer()
         first, picture_set = await self.start(gateway, server)
         history = [("user", "un jardinier"), ("assistant", first.reponse)]
         done, review = await self.follow(gateway, history, "il y a un souci ?")
@@ -667,17 +685,34 @@ class FollowUpTests(Base):
             base64.b64decode(server.edits[-1][2]), store.image_bytes(after.render_key)
         )
 
-    async def test_a_failed_edit_draws_the_changed_prompt(self) -> None:
+    async def test_a_failed_edit_keeps_the_picture_and_proposes_a_redraw(self) -> None:
         gateway = DialogueGateway(follow_reply("change", "Add a red hat."))
         server = EditServer(fail_edit=True)
-        first, _ = await self.start(gateway, server)
+        first, picture_set = await self.start(gateway, server)
         history = [("user", "un jardinier"), ("assistant", first.reponse)]
         gateway.reply = rewrite_reply(prompt=FIRST + " Red hat.", edit="Add a red hat.")
         done, item = await self.follow(gateway, history, "chapeau rouge")
         self.assertTrue(done)
         self.assertIn("picture_cpu_edit_failed", item.erreurs)
+        self.assertIn("picture_cpu_no_edit_failed", item.erreurs)
+        # Nothing drawn from scratch in its place: the two first pictures only.
+        self.assertEqual(len(server.renders), 2)
+        self.assertEqual(item.images, [])
+        self.assertIn("n'a pas réussi à retoucher", item.reponse)
+        self.assertIn("la version 1 reste telle quelle", item.reponse)
+        stored = store.load(picture_set.set_id)
+        assert stored is not None
+        self.assertEqual(stored.artifact_version, 1)
+        self.assertEqual(stored.proposed, ["Add a red hat."])
+        self.assertTrue(stored.proposed_redraw)
+        # Accepted: the changed description is drawn, and said as such.
+        gateway.follow = follow_reply("change", "")
+        history += [("user", "chapeau rouge"), ("assistant", item.reponse)]
+        done, again = await self.follow(gateway, history, "oui vas-y")
+        self.assertTrue(done)
         self.assertIn("Red hat.", server.renders[-1][0])
-        self.assertIn("Voici l'image modifiée", item.reponse)
+        self.assertIn("n'a pas été retouchée sur place", again.reponse)
+        self.assertIn("/versions/2/open", again.reponse)
 
     # (d) A review from evidence, never a promise.
 
@@ -741,7 +776,7 @@ class FollowUpTests(Base):
 
     async def test_an_older_version_in_the_chat_changes_the_latest(self) -> None:
         gateway = DialogueGateway(follow_reply("change", "Add a red hat."))
-        server = FakeServer()
+        server = EditServer()
         first, picture_set = await self.start(gateway, server)
         gateway.reply = rewrite_reply(prompt=FIRST + " Red hat.")
         changed = Interaction()

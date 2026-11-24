@@ -141,6 +141,14 @@ def _write_choice(
     picture_set.render_key = picture_set.candidates[index].render_key
     picture_set.render_hash = picture_set.candidates[index].render_hash
     picture_set.changes = []
+    # The state of the picture it replaces does not carry over: what it
+    # missed, how it was made, what Atlas proposed for it.
+    picture_set.unmet = None
+    picture_set.misses = 0
+    picture_set.edited = False
+    picture_set.by_code = False
+    picture_set.proposed = []
+    picture_set.proposed_redraw = False
     return str(stored["id"]), int(stored["version"]), current.filename
 
 
