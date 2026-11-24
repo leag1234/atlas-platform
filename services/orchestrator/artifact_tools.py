@@ -27,6 +27,11 @@ FOOTER_LABELS: dict[str, dict[str, str]] = {
             "Nothing was changed: the code written for this request is identical "
             "to version {version}, which stays the current one."
         ),
+        "identical_ask": (
+            "I wrote the same code again, so I found nothing to change. If what "
+            "you see differs from what you expect, tell me the steps you took and "
+            "what appears on the screen, and I will look at exactly that."
+        ),
     },
     "fr": {
         "open": "Ouvrir « {title} » (version {version})",
@@ -43,6 +48,12 @@ FOOTER_LABELS: dict[str, dict[str, str]] = {
             "Rien n'a été modifié : le code écrit pour cette demande est identique "
             "à la version {version}, qui reste la version actuelle."
         ),
+        "identical_ask": (
+            "J'ai réécrit le même code, donc je n'ai rien trouvé à modifier. Si ce "
+            "que vous voyez diffère de ce que vous attendez, décrivez-moi les "
+            "étapes suivies et ce qui s'affiche à l'écran, et je regarderai "
+            "précisément cela."
+        ),
     },
     "de": {
         "open": "„{title}“ öffnen (Version {version})",
@@ -58,6 +69,12 @@ FOOTER_LABELS: dict[str, dict[str, str]] = {
             "Es wurde nichts geändert: Der für diese Anfrage geschriebene Code ist "
             "identisch mit Version {version}, die die aktuelle bleibt."
         ),
+        "identical_ask": (
+            "Ich habe denselben Code noch einmal geschrieben und deshalb nichts "
+            "Änderungswürdiges gefunden. Wenn das, was Sie sehen, von Ihrer "
+            "Erwartung abweicht, nennen Sie mir die Schritte und was auf dem "
+            "Bildschirm erscheint, dann schaue ich genau darauf."
+        ),
     },
     "es": {
         "open": "Abrir «{title}» (versión {version})",
@@ -70,6 +87,11 @@ FOOTER_LABELS: dict[str, dict[str, str]] = {
         "identical": (
             "No se ha cambiado nada: el código escrito para esta petición es idéntico "
             "a la versión {version}, que sigue siendo la actual."
+        ),
+        "identical_ask": (
+            "He escrito el mismo código otra vez, así que no encontré nada que "
+            "cambiar. Si lo que ve difiere de lo que espera, dígame los pasos que "
+            "siguió y qué aparece en la pantalla, y lo revisaré exactamente."
         ),
     },
     "it": {
@@ -85,6 +107,12 @@ FOOTER_LABELS: dict[str, dict[str, str]] = {
         "identical": (
             "Non è stato modificato nulla: il codice scritto per questa richiesta è "
             "identico alla versione {version}, che resta quella attuale."
+        ),
+        "identical_ask": (
+            "Ho scritto lo stesso codice di nuovo, quindi non ho trovato nulla da "
+            "modificare. Se ciò che vede è diverso da ciò che si aspetta, mi dica "
+            "i passaggi seguiti e cosa compare sullo schermo, e guarderò proprio "
+            "quello."
         ),
     },
 }
@@ -289,6 +317,24 @@ def identical_sentence(version: int, language: str) -> str:
     """Said when a change request produced the stored version again (C2)."""
     labels = FOOTER_LABELS.get(language, FOOTER_LABELS["en"])
     return labels["identical"].format(version=version)
+
+
+def identical_answer(summary: str, version: int, language: str) -> str:
+    """The answer of a change request whose code is the stored version again.
+
+    The plain statement comes first. What the model wrote follows when it is
+    not a claim of change (the answer to a question, a complaint or a line the
+    person asked for: change_claims); when nothing is left, what the person can
+    do next. The answer is never only the fixed statement.
+    """
+    from packages.addressing import addressed
+    from services.orchestrator.change_claims import without_change_claims
+
+    labels = FOOTER_LABELS.get(language, FOOTER_LABELS["en"])
+    kept = without_change_claims(clean_summary(summary))
+    # In the register of the turn (familiar when the person writes so).
+    ask = addressed(labels["identical_ask"], language)
+    return "\n\n".join((identical_sentence(version, language), kept or ask))
 
 
 def compose_answer(
