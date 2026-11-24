@@ -19,6 +19,7 @@ from services.orchestrator.chat_pipeline import _HeldAnswer
 from services.orchestrator.chat_schema import ChatRequest
 from services.orchestrator.chat_stream import response
 from services.orchestrator.interactions import Interaction
+from services.orchestrator.only_request import asks_only, restrict
 from services.orchestrator.narration import TurnHold, answer_shaped
 from services.orchestrator.stream_client import sink_context
 from test_working_notes import (
@@ -158,6 +159,56 @@ class CheckedAnswerProgressTests(unittest.IsolatedAsyncioTestCase):
             for c in f.get("choices", [])
         )
         self.assertIn("Checked answer.", content)
+
+
+class OnlyRequestStreamTests(unittest.IsolatedAsyncioTestCase):
+    async def shown(self, ask: str) -> str:
+        raw = "Voici les lignes :\n\n```\nA: 1\nB: 2\n```\n\n[Télécharger a.py](/api/atlas/orgs/o/projects/p/deliverables/d/download)"
+
+        async def provider(request: ChatRequest, item: Interaction) -> None:
+            stream = sink_context.get()
+            assert stream is not None
+            await stream({"delta": {"content": raw[:30]}})
+            await stream({"delta": {"content": raw[30:]}})
+            item.state = "done"
+            item.reponse = restrict(raw) if asks_only(request.user_text) else raw
+
+        request = ChatRequest.model_validate(
+            {
+                "stream": True,
+                "atlas_ui": True,
+                "ui_locale": "fr-FR",
+                "messages": [{"role": "user", "content": ask}],
+            }
+        )
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.dict(
+                os.environ, {"ATLAS_INTERACTION_DIR": directory, "ATLAS_STABLE": "1"}
+            ),
+        ):
+            body: AsyncIterable[Any] = response(
+                request, Interaction(), time.monotonic(), provider
+            ).body_iterator
+            frames = [
+                json.loads(str(frame)[6:])
+                async for frame in body
+                if str(frame).startswith("data: {")
+            ]
+        return "".join(
+            str(c["delta"].get("content", ""))
+            for f in frames
+            for c in f.get("choices", [])
+        )
+
+    async def test_only_the_deliverable_reaches_the_person(self) -> None:
+        content = await self.shown("Donne seulement les deux lignes de sortie.")
+        self.assertEqual(content, "```\nA: 1\nB: 2\n```")
+
+    async def test_an_ordinary_request_streams_everything(self) -> None:
+        content = await self.shown("Donne les deux lignes de sortie.")
+        self.assertIn("Télécharger a.py", content)
+        self.assertIn("Voici les lignes", content)
 
 
 if __name__ == "__main__":

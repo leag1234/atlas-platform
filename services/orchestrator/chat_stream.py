@@ -133,6 +133,12 @@ def response(
             return file_request
         return routed.kind == "file"
 
+    from services.orchestrator.only_request import asks_only
+
+    # "Only X, nothing else": the answer is held until the turn ends and sent
+    # once, reduced to its deliverable (only_request.py).
+    only_turn = asks_only(payload.user_text)
+
     def routed_deadline() -> float:
         # Only a routed plain chat turn (never code mode or a Work action) reads
         # its deadline again: the decision can make it a 300 s turn.
@@ -800,6 +806,8 @@ def response(
                 pending += str(delta["content"])
                 suffix = re.search(r"(?<!\w)[`\[]?[a-f0-9]{1,64}$|[`\[]$", pending)
                 end = suffix.start() if suffix else len(pending)
+                if only_turn:
+                    end = 0
                 # A URL may cross provider chunks, including the scheme itself.
                 trailing = _TRAILING_URL.search(pending, _after_last_stop(pending))
                 if trailing:
@@ -978,6 +986,7 @@ def response(
                     plan_text = (
                         chat_plan.markdown()
                         if chat_plan is not None
+                        and not only_turn
                         and chat_plan.finished
                         and chat_plan.shown
                         else ""
@@ -1013,7 +1022,9 @@ def response(
                     else:
                         await content(
                             item.reponse
-                            if routed_file_request() or not received_content
+                            if routed_file_request()
+                            or not received_content
+                            or only_turn
                             else pending
                             + protocol.feed(narration.finish())
                             + protocol.finish()
@@ -1024,6 +1035,7 @@ def response(
                         payload.atlas_ui
                         and not payload.code_mode
                         and item.files
+                        and not (only_turn and item.reponse.strip())
                         and (not routed_file_request() or not item.reponse)
                     ):
                         from services.orchestrator.file_results import file_footer

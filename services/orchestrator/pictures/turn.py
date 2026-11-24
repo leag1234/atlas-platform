@@ -529,8 +529,9 @@ def _answer(
     footer: str,
     note: str = "",
     partial: bool = True,
+    alone: bool = False,
 ) -> str:
-    count = len(picture_set.candidates)
+    count = 1 if alone else len(picture_set.candidates)
     base = _base(urls)
     cpu = picture_set.engine == "cpu"
     parts: list[str] = []
@@ -538,7 +539,9 @@ def _answer(
         parts.append(text(language, "single"))
     else:
         parts.append(text(language, "cpu_intro" if cpu else "intro", n=count))
-    if partial and cpu and count < cpu_pictures():
+    if alone:
+        pass
+    elif partial and cpu and count < cpu_pictures():
         parts.append(text(language, "cpu_partial_one"))
     elif partial and not cpu and count < painter.DRAFTS:
         parts.append(
@@ -827,7 +830,12 @@ async def process_picture_turn(
         return
     await _status("finishing", language)
     urls = [await _store_image(candidate["image"]) for candidate in candidates]
-    if len(candidates) > 1:
+    from services.orchestrator.pictures.bare import image_only
+
+    # One picture asked for, unframed and alone: the suggested candidate is
+    # shown by itself, with no numbered board, frame or choice links.
+    alone = image_only(request_text)
+    if len(candidates) > 1 and not alone:
         try:
             sheet = await run_job(
                 "sheet", {"thumbs": [c["thumb"]["data"] for c in candidates]}
@@ -961,6 +969,7 @@ async def process_picture_turn(
         # Pictures left out because they failed a check are not "could not
         # be made".
         partial=instead is None and (cpu is None or not cpu.selected),
+        alone=alone,
     )
     # Server-made references: the answer filter keeps only these image and
     # link targets (source_truth.drawing_references).

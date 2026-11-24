@@ -18,6 +18,7 @@ import os
 import re
 import tarfile
 import time
+from collections.abc import Iterable
 from pathlib import PurePosixPath
 from typing import Any
 from uuid import uuid4
@@ -348,6 +349,18 @@ def place(
     return default, path
 
 
+def turn_saved_names(tools: Any) -> set[str]:
+    """The files this turn has already saved in the chat project, by saved name."""
+    names: set[str] = set()
+    turn_files = getattr(tools, "turn_files", None)
+    if isinstance(turn_files, dict):
+        names.update(str(name) for name in turn_files.values())
+    for receipt in getattr(tools, "deliverables", ()):
+        if isinstance(receipt, dict) and receipt.get("relative_path"):
+            names.add(str(receipt["relative_path"]))
+    return names
+
+
 def chat_target(
     relative: str,
     content: bytes | None,
@@ -355,14 +368,19 @@ def chat_target(
     existing: dict[str, dict[str, Any]],
     answers: list[str],
     project: str,
+    turn_names: Iterable[str] = (),
 ) -> str | None:
     """In the hidden chat project, the existing file a workspace file stands for.
 
     The name or one of its numbered copies holding the same bytes (linked as it
-    is), else the one this conversation's answers linked last (updated in place,
-    the overwrite being approved automatically there). None when the name is
-    free or taken only by other conversations: the file is then saved under
-    its name or as a numbered copy.
+    is), else the one this conversation's answers linked last, or this turn
+    already saved (updated in place, the overwrite being approved
+    automatically there). None when the name is free or taken only by other
+    conversations: the file is then saved under its name or as a numbered copy.
+
+    A file saved earlier in this turn is this conversation's own although no
+    answer links it yet: written again, it is that file's next version, never
+    a "(2)" copy beside it (a person who asked for a name read its copy back).
     """
     from services.orchestrator.chat_file_names import (
         family,
@@ -378,7 +396,9 @@ def chat_target(
         for name in names:
             if existing[folder_id + "/" + name].get("sha256") == digest:
                 return name
-    return last_delivered(names, answers, project)
+    own = set(turn_names)
+    saved_now = [name for name in names if name in own]
+    return saved_now[-1] if saved_now else last_delivered(names, answers, project)
 
 
 async def save_new_files(
@@ -447,6 +467,7 @@ async def _export_and_save_new_files(
                 existing,
                 getattr(tools, "earlier_answers", []),
                 execution.broker.project,
+                turn_saved_names(tools),
             )
             if target is not None:
                 # The same bytes are already there, or this conversation saved
