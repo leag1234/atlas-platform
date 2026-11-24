@@ -591,6 +591,10 @@ def layout_result(item: Requirement, view: Any) -> Result:
 
     if view is None:
         return Result(item.id, None, "the built file could not be read")
+    if not any(block.text for block in view.blocks):
+        # Nothing readable (pictures of pages, drawn text): code cannot
+        # measure, so it claims neither a pass nor a violation.
+        return Result(item.id, None, "no text could be read from the built file")
     verdict = checks.check(layout_constraint(item), view)
     if verdict.passed is False:
         return Result(item.id, False, "measured on the built file: " + verdict.evidence)

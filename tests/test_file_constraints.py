@@ -160,6 +160,24 @@ class OnTheBuiltFile(unittest.TestCase):
         self.assertIn("no list", failed.how)
         self.assertTrue(expectations.layout_result(bullets, listed).passed)
 
+    def test_a_file_without_readable_text_is_left_to_the_judge(self) -> None:
+        # A file whose pages are pictures gives code nothing to measure:
+        # neither a pass nor a violation is claimed.
+        from services.orchestrator.constraints.views import View
+
+        contains = requirement(
+            "R1",
+            {
+                "method": "code",
+                "part": "layout",
+                "rule": "contains",
+                "texts": ["Draft"],
+                "where": "each",
+            },
+        )
+        result = expectations.layout_result(contains, View("pdf", pages=3))
+        self.assertIsNone(result.passed)
+
     def test_titles_counts_and_notes(self) -> None:
         _, on_slide = built(deck(True, False), ".pptx")
         _, in_notes = built(deck(True, True), ".pptx")
