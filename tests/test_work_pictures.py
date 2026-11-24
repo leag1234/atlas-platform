@@ -106,11 +106,12 @@ class WorkPictureTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(clock.stop)
 
     def checker(self, *verdicts: Any) -> AsyncMock:
-        # Each check reads two statements: the item, and no writing.
+        # Each check reads two statements: the item, and the writing found in
+        # it (met when writing is shown: False here means a clean picture).
         replies = [
             {
                 "text": json.dumps(
-                    {"met": [value, True] if isinstance(value, bool) else value}
+                    {"met": [value, False] if isinstance(value, bool) else value}
                 ),
                 "cost_eur": "0.0004",
             }
@@ -187,7 +188,7 @@ class WorkPictureTests(unittest.IsolatedAsyncioTestCase):
             items(1),
             900,
             server=server,
-            call=self.checker([True, False], [True, False], [True, False]),
+            call=self.checker([True, True], [True, True], [True, True]),
         )
         # Writing found: drawn twice more, with blank surfaces asked.
         self.assertEqual(len(server.prompts), 3)
@@ -211,7 +212,7 @@ class WorkPictureTests(unittest.IsolatedAsyncioTestCase):
             items(2),
             900,
             server=server,
-            call=self.checker(True, [True, False], [True, False], True),
+            call=self.checker(True, [True, True], [True, True], True),
         )
         self.assertEqual(len(server.prompts), 4)
         self.assertEqual(len(result["pictures"]), 2)
@@ -227,15 +228,34 @@ class WorkPictureTests(unittest.IsolatedAsyncioTestCase):
             items(1),
             900,
             server=server,
-            call=self.checker([True, False], [True, False], True),
+            call=self.checker([True, True], [True, True], True),
         )
         self.assertEqual(len(server.prompts), 2)
         self.assertEqual(result["left_out"], ["item 0"])
 
+    async def test_the_writing_check_states_presence_so_a_doubt_keeps_the_picture(
+        self,
+    ) -> None:
+        # The vision check answers false when it cannot tell: asked whether
+        # writing is shown, a doubtful close-up stays; asked whether none is
+        # shown, it was left out (two pictures asked, one kept).
+        tools = tools_for("subject|chat-l", deadline=self.clock[0] + 600)
+        check = self.checker(True, True)
+        result = await work_pictures.execute(
+            tools, items(2), 900, server=FakeServer(self.clock), call=check
+        )
+        self.assertEqual(len(result["pictures"]), 2)
+        self.assertNotIn("left_out", result)
+        statements = check.await_args_list[0].args[0]["messages"][1]["content"][0][
+            "text"
+        ]
+        self.assertIn("clearly contains letters", statements)
+        self.assertNotIn("contains no letters", statements)
+
     async def test_words_asked_inside_a_picture_are_drawn_and_checked(self) -> None:
         tools = tools_for("subject|chat-i", deadline=self.clock[0] + 600)
         server = FakeServer(self.clock)
-        check = self.checker(True)
+        check = self.checker([True, True])
         arguments = json.dumps(
             {"items": [{"label": "sign", "description": "a shop sign", "text": "OPEN"}]}
         )

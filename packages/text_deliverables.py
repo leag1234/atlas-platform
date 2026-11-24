@@ -107,6 +107,25 @@ def names_markup_file(text: str) -> bool:
     )
 
 
+def named_text_suffix(text: str) -> str | None:
+    """The one text format a request names through a file name ("snail.svg"),
+    or None when it names none or several.
+
+    Staging -189: a request for a vector file with its name was delivered as a
+    Markdown file holding the markup (the router's formats are the office ones
+    and Markdown, and the writer followed its reading), then as the vector
+    file too: two files, and an answer that said the wrong one was delivered.
+    The name decides the format (publish_document then takes that suffix
+    first), as the name of an office file does.
+    """
+    found = {
+        match.group(1).lower()
+        for match in _NAMED_FILE.finditer(text)
+        if match.group(1).lower() in TEXT_MIMES
+    }
+    return found.pop() if len(found) == 1 else None
+
+
 # A document type declaration can define entities (expansion bombs, external
 # files): an SVG deliverable never needs one.
 _DECLARATION = re.compile(r"<!\s*(?:DOCTYPE|ENTITY)", re.I)

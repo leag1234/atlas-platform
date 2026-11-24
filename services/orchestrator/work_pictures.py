@@ -114,19 +114,41 @@ ATTEMPTS = 2
 LETTERING_ATTEMPTS = 3
 
 
+# The check of a picture that must hold no writing states the presence of
+# writing, never its absence. The vision check answers true only when a
+# statement is clearly shown and false when it cannot tell: asked "the picture
+# holds no writing", every doubtful close-up (stitches, edges, grain, folds)
+# came back false, was read as writing, and the picture was left out after its
+# redraws: a sheet asked with two pictures kept one, in every version (staging
+# -184 to -189). Asked "the picture shows letters, words or numbers", a doubt
+# is false and the picture stays.
+WRITING_SHOWN = (
+    "The picture clearly contains letters, numbers or words, readable or not "
+    "(lines, edges, stitches, folds, grain and patterns are not writing)"
+)
+
+
 def lettering(item: Item) -> tuple[str, str]:
-    """What the drawing prompt says about writing, and the check statement."""
+    """What the drawing prompt says about writing, and the check statement.
+
+    The statement of a picture with no writing (WRITING_SHOWN) is met when
+    the picture has some: the caller reads it the other way (see spoiled).
+    """
     if item.text:
         return (
             f' The only writing in the picture reads "{item.text}", clearly spelled.',
             f'Any writing in the picture reads exactly "{item.text}" and is spelled '
             "correctly; there is no other writing",
         )
-    return (
-        NO_LETTERING,
-        "The picture contains no letters, words, numbers or writing of any kind "
-        "(plain lines, patterns and textures are not writing)",
-    )
+    return (NO_LETTERING, WRITING_SHOWN)
+
+
+def spoiled(item: Item, statement: str, unmet: list[str]) -> bool:
+    """Whether the check found the picture's writing wrong: unreadable or
+    unasked writing (met WRITING_SHOWN), or wrong words asked inside it."""
+    if item.text:
+        return statement in unmet
+    return statement not in unmet
 
 
 class MakePictures(BaseModel):
@@ -509,9 +531,12 @@ async def execute(
             )
             if unmet is None:
                 break
-            garbled = writing_check in unmet
+            garbled = spoiled(item, writing_check, unmet)
             verdict = "does_not_match" if shows in unmet else "matches"
-            if not unmet or end - time.monotonic() < per_picture:
+            # Drawn again for what the check found wrong; "no writing shown"
+            # (unmet by design for a picture without writing) is no defect.
+            wrong = shows in unmet or garbled
+            if not wrong or end - time.monotonic() < per_picture:
                 break
         if garbled:
             # Unreadable lettering after a redraw: left out, and said.
