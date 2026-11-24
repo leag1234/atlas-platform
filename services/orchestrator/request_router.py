@@ -829,14 +829,30 @@ async def route(request: ChatRequest) -> Decision | None:
 def local_decision(
     text: str, history: Sequence[Mapping[str, object]]
 ) -> Decision | None:
-    """The local classifier's decision, or None when it cannot decide here."""
+    """The local classifier's decision, or None when it cannot decide here.
+
+    The local classifier decides when no model call answered in time (always
+    the case under a slow owned server). A run takes the turn out of the chat
+    into Work: it is kept only when the words of the request say so
+    (packages.work_intent), or the request changes something already
+    delivered. A machine task is kept: its words are too varied to read. Staging -189 (strict privacy): a question about recent
+    findings, with its sources asked, was labelled "run", sent to Work and
+    stopped on the step limit with no statement that nothing recent could be
+    looked up.
+    """
     from services.orchestrator import router_local
 
     try:
-        return Decision.model_validate(router_local.decide(text, history))
+        decided = Decision.model_validate(router_local.decide(text, history))
     except Exception:  # noqa: BLE001 - a missing example file leaves the gates
         log.exception("request_router local classifier unavailable")
         return None
+    if decided.kind == "run" and not decided.follow_up:
+        from packages.work_intent import work_reason
+
+        if work_reason(text) not in {"run", "remote"} and not manages_machine(text):
+            return decided.model_copy(update={"kind": "answer"})
+    return decided
 
 
 def _log(
