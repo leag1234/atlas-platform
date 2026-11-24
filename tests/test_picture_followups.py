@@ -986,6 +986,7 @@ class CodeEditVerifiedTests(Base):
         requirements: list[str],
         *,
         current_passed: bool = False,
+        own_checks: list[str] | None = None,
     ) -> tuple[Interaction, store.PictureSet, Any]:
         from test_picture_turn import FakeGateway
 
@@ -1024,7 +1025,9 @@ class CodeEditVerifiedTests(Base):
             gateway.checks, gateway.edits = [], []
             if current_passed:
                 picture_set.unmet = []
-                store.update(picture_set)
+            if own_checks:
+                picture_set.checks = list(own_checks)
+            store.update(picture_set)
             changed = Interaction()
             done = await process_picture_followup(
                 Request("il en manque un"),
@@ -1086,6 +1089,21 @@ class CodeEditVerifiedTests(Base):
         self.assertIn("Mes 3 nouveaux dessins", changed.reponse)
         self.assertNotIn("/versions/2/", changed.reponse)
 
+    async def test_the_answer_quotes_the_statement_in_the_persons_language(
+        self,
+    ) -> None:
+        for language, _, own, english, lead in QuotedStatementsLanguageTests.CASES:
+            with self.subTest(language=language):
+                changed, _, gateway = await self.corrected(
+                    [([False], ["deux"])],
+                    [english],
+                    current_passed=True,
+                    own_checks=[own],
+                )
+                self.assertEqual(gateway.checks[0], [own])
+                self.assertIn(own, changed.reponse)
+                self.assertNotIn(english, changed.reponse)
+
     async def test_an_unchecked_drawing_is_said_unverified(self) -> None:
         changed, picture_set, gateway = await self.corrected(
             [([True, True], [""])], ["trois chats sur le muret"]
@@ -1093,3 +1111,65 @@ class CodeEditVerifiedTests(Base):
         # The reply had two values for one statement: the check is unread.
         self.assertIn("n'a pas pu être vérifié", changed.reponse)
         self.assertIn("picture_change_unchecked", changed.erreurs)
+
+
+class QuotedStatementsLanguageTests(Base):
+    """What a picture answer quotes is in the person's language (staging -191:
+    a French conversation quoted an English requirement). Fictional texts."""
+
+    CASES = (
+        (
+            "fr",
+            "des chats sur un muret",
+            "Le chat a deux nœuds rouges",
+            "The cat has two red bows",
+            "Mes 3 nouveaux dessins",
+        ),
+        (
+            "de",
+            "Katzen auf einer Mauer",
+            "Die Katze trägt zwei rote Schleifen",
+            "The cat has two red bows",
+            "Meine 3 neuen Zeichnungen",
+        ),
+        (
+            "es",
+            "gatos en un muro",
+            "El gato lleva dos lazos rojos",
+            "The cat has two red bows",
+            "Mis 3 nuevos dibujos",
+        ),
+        (
+            "it",
+            "gatti su un muretto",
+            "Il gatto ha due fiocchi rossi",
+            "The cat has two red bows",
+            "I miei 3 nuovi disegni",
+        ),
+    )
+
+    def test_the_pictures_own_statements_win_over_english_requirements(self) -> None:
+        from services.orchestrator.pictures import followup
+
+        for language, _, own, english, _ in self.CASES:
+            with self.subTest(language=language):
+                picture_set = store.PictureSet(
+                    set_id="x", owner="o", language=language, title="t", candidates=[]
+                )
+                picture_set.checks = [own]
+                found = followup.statements_of(picture_set, [english], "Add bows.")
+                self.assertEqual(found, [own])
+                picture_set.checks = []
+                self.assertEqual(
+                    followup.statements_of(picture_set, [english], "Add bows."),
+                    [english],
+                )
+                self.assertEqual(
+                    followup.statements_of(picture_set, None, "Add bows."),
+                    ["Add bows."],
+                )
+
+    def test_the_reading_call_writes_requirements_in_the_users_language(self) -> None:
+        system = dialogue.FOLLOW_SYSTEM
+        self.assertIn("in the language of the user's own words", system)
+        self.assertNotIn("every later correction, in English", system)
