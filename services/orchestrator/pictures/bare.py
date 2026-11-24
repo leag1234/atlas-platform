@@ -66,10 +66,34 @@ def _folded(text: str) -> str:
     )
 
 
+# One picture, unframed: the numbered board of proposals and the frame around
+# the suggested one are the answer's own furniture.
+_NO_FRAME = re.compile(
+    r"\b(?:pas de|sans|aucun) (?:cadre|bordure|encadrement)\b"
+    r"|\b(?:no|without) (?:a |any )?(?:frame|border)\b"
+    r"|\b(?:kein|keinen|ohne) (?:einen )?rahmen\b"
+    r"|\b(?:sin|ningun) (?:un )?(?:marco|borde)\b"
+    r"|\b(?:senza|nessuna) (?:una )?(?:cornice|bordo)\b"
+    r"|\b(?:sem|nenhuma) (?:uma )?(?:moldura|borda)\b"
+)
+_ONE_PICTURE = re.compile(
+    r"\b(?:une seule|un seul|a single|only one|just one|one single|eine einzige[nrs]?|"
+    r"nur (?:ein|eine)|una sola|un solo|solo una|solo un|un unico|una unica|"
+    r"uma so|apenas uma) (?:\w+ )?(?:image|affiche|dessin|illustration|picture|poster|"
+    r"drawing|bild|plakat|zeichnung|imagen|cartel|dibujo|immagine|manifesto|disegno|"
+    r"imagem|cartaz|desenho|logo|icone|icon|icono)\b"
+)
+
+
 def image_only(request_text: str) -> bool:
     """True when the request asks for the picture with no text around it."""
+    from services.orchestrator.only_request import PLAIN, folded as plain_folded
+
     folded = _folded(request_text[:4000])
     if _ALONE.search(folded):
+        return True
+    plain = plain_folded(request_text[:4000])
+    if PLAIN.search(plain) or _NO_FRAME.search(plain) or _ONE_PICTURE.search(plain):
         return True
     return bool(_NO_TEXT.search(folded) and _HERE.search(folded))
 

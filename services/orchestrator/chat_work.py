@@ -597,6 +597,8 @@ async def _escalate(request: ChatRequest, item: Interaction) -> bool:
         return False
 
     from services.orchestrator.code_mode import process_work, work_failure_reply
+    from services.orchestrator.code_context import code_hint
+    from services.orchestrator.work_execution import run_requested
 
     scoped = request.model_copy(
         update={
@@ -620,6 +622,26 @@ async def _escalate(request: ChatRequest, item: Interaction) -> bool:
                     + (
                         delivered_file_hint(request)
                         if hint and not setup and approval is None
+                        else ""
+                    )
+                    + (
+                        code_hint(
+                            [
+                                (message.role, message.text)
+                                for message in request.conversation_messages[:-1]
+                                if message.role in {"user", "assistant"}
+                            ],
+                            request.user_text,
+                        )
+                        if not setup
+                        and approval is None
+                        and (
+                            follow_up
+                            or run_requested(
+                                routed.kind if routed is not None else None,
+                                request.user_text,
+                            )
+                        )
                         else ""
                     )
                     + (MACHINE_SETUP_HINT if setup else "")

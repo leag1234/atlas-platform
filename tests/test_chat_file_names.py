@@ -307,6 +307,24 @@ class ChatWorkSaveTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(report["modified"], ["tracker.csv"])
         self.assertEqual(report["targets"], {"tracker.csv": "deliverables/tracker.csv"})
 
+    async def test_a_file_saved_earlier_in_this_turn_gets_its_next_version(
+        self,
+    ) -> None:
+        # The name is taken, by this very turn: no answer links it yet, and
+        # the file written again must not become a numbered copy beside it.
+        tools = ChatTools(numbered=True)
+        tools.deliverables.append({"relative_path": "tracker.csv", "id": "d1"})
+        report, _ = await self.save({"tracker.csv": b"day,km\nsunday,12\n"}, tools)
+        self.assertEqual(Publisher.names, [])
+        self.assertEqual(report["modified"], ["tracker.csv"])
+        self.assertEqual(report["targets"], {"tracker.csv": "deliverables/tracker.csv"})
+
+    async def test_another_conversations_file_is_not_this_turns_file(self) -> None:
+        tools = ChatTools(numbered=True)
+        tools.deliverables.append({"relative_path": "other.csv", "id": "d1"})
+        await self.save({"tracker.csv": b"day,km\nsunday,12\n"}, tools)
+        self.assertEqual(Publisher.names, ["tracker (2).csv"])
+
     async def test_a_free_name_is_saved_as_asked(self) -> None:
         report, _ = await self.save({}, ChatTools(numbered=True))
         self.assertEqual(Publisher.names, ["tracker.csv"])

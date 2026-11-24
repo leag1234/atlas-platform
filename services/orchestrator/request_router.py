@@ -185,7 +185,7 @@ kind is one of:
 - "drawing": something visual to LOOK at: drawing, illustration, picture, image, photo, logo, icon, poster, cartoon, diagram, schema, flowchart.
 - "app": something interactive to USE in the browser: game, quiz, flashcards, tool, calculator, converter, timer, simulator, music or drum toy, interactive chart, small web page.
 - "file": a real file to download: Word, Excel, PowerPoint, PDF, CSV or Markdown file, spreadsheet, slide deck, a CV, a text asked as a document or a file.
-- "run": code or tests to execute, data to compute by running a program, or a program to build that is not a single web page (Python script, bot, server, API, scraper). A script or function only to write and show is "answer".
+- "run": code or tests to execute, data to compute by running a program, or a program to build that is not a single web page (Python script, bot, server, API, scraper). A script or function only to write and show is "answer". A request to run code that appears earlier in the conversation (the user's or yours), as it is or with a value changed, is "run" with follow_up true.
 - "remote": an action on a computer the user owns and reaches over SSH or connected to this assistant (their server, VPS, NAS, laptop, a named machine), including connecting, renaming, forgetting, removing or disconnecting one of those machines. Bookings, payments, phone calls, messages to people and smart-home devices are not "remote": they are "other".
 - "other": none of these.
 

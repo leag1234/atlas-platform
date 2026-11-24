@@ -1277,6 +1277,13 @@ async def process(request: ChatRequest, item: Interaction) -> None:
                 # Not answered from the pages either: the person reads the
                 # deadline it ran into (D5).
                 item.erreurs.append("timeout")
+        if item.state == "done" and item.task_type != "drawing":
+            from services.orchestrator.only_request import asks_only, restrict
+
+            # "Only the two lines, nothing else": the deliverable alone
+            # (only_request.py). A picture asked for alone is pictures/bare.py.
+            if asks_only(request.user_text):
+                item.reponse = restrict(item.reponse)
         if quote_gate is not None:
             await quote_gate.flush()
         if date_gate is not None:

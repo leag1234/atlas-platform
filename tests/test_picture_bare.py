@@ -20,6 +20,13 @@ ALONE = (
     "Solo la imagen del farol, sin texto aquí.",
     "Solo l'immagine della teiera, niente altro.",
 )
+ALONE += (
+    "Fais-moi une affiche carrée pour un musée imaginaire. Pas d'autre texte, pas de cadre.",
+    "A single poster for a fictional harbour festival, no frame please.",
+    "Eine einzige Skizze der Windmühle, kein Rahmen.",
+    "Dibuja una sola imagen del faro, sin otro texto.",
+    "Disegna un solo disegno del ponte, senza cornice.",
+)
 CONTENT = (
     "Dessine une affiche sans texte avec un phare et trois mouettes.",
     "Draw a poster of a kite festival with no text on it.",
@@ -50,6 +57,26 @@ class ImageOnlyTests(unittest.TestCase):
         for request in CONTENT:
             with self.subTest(request=request):
                 self.assertFalse(image_only(request))
+
+    def test_a_board_request_for_one_picture_shows_it_alone(self) -> None:
+        from services.orchestrator.pictures.turn import _answer
+        from services.orchestrator.pictures import store
+
+        picture_set = store.PictureSet(
+            set_id="ab" * 16,
+            owner="o",
+            language="fr",
+            title="Affiche",
+            candidates=[
+                store.Candidate(image_key="k" + str(n), svg="<svg/>") for n in range(3)
+            ],
+        )
+        board = _answer("fr", "x", picture_set, [IMAGE], IMAGE + "/sheet", "")
+        self.assertIn("/1)", board)
+        alone = _answer("fr", "x", picture_set, [IMAGE], IMAGE, "", alone=True)
+        self.assertNotIn("/images/picture/", alone)
+        self.assertNotIn("Propositions", alone)
+        self.assertEqual(alone.count("!["), 1)
 
     def test_lead_and_links_go_and_the_version_stays_reachable(self) -> None:
         shown = bare(answer(text("fr", "changed")))
