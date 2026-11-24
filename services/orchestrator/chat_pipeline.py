@@ -2267,6 +2267,15 @@ async def _process(
             artifact_current = await asyncio.to_thread(
                 current_after_click, request, artifact_current, item.request_id
             )
+            from services.orchestrator.pictures.reference import handle_reference
+
+            # "In the second one, ...", "keep image 3 but ...": the change
+            # applies to the picture named, never to another one.
+            artifact_current, answered = await handle_reference(
+                request, item, artifact_current, item.request_id
+            )
+            if answered:
+                return
     from services.orchestrator import request_router
 
     # The model routing decision (ATLAS_MODEL_ROUTER=1) is read first; the

@@ -44,7 +44,7 @@ import hashlib
 import logging
 import secrets
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from decimal import Decimal
 from typing import Any
 
@@ -82,6 +82,8 @@ CORRECTION = "Correct the picture so that it clearly shows: {items}."
 MAX_ATTEMPTS = 6
 # Retries end this long before the turn's deadline.
 RETRY_MARGIN = 15.0
+# Added to an edit retried after a check: what the last edit did not show.
+EDIT_GAP = " Make sure the picture clearly shows: {items}."
 
 
 class CpuUnavailable(Exception):
@@ -458,8 +460,11 @@ async def checked_pictures(
     """(pictures, how many the filter removed, timings, pictures drawn): the
     pictures of `seeds`, then, while none passes its checks and one missed a
     check for certain, CANDIDATES more seeds at a time (a plain draw of the
-    prompt, never an edit) up to MAX_ATTEMPTS pictures, as long as the
-    server's queue estimate fits before `retry_end`. A failed retry keeps the
+    prompt) up to MAX_ATTEMPTS pictures, as long as the server's queue
+    estimate fits before `retry_end`. With `reference` (an edit), every retry
+    is an edit of that same picture with another seed and what the check
+    found missing, one at a time: never a picture drawn from scratch in place
+    of the picture the person asked to change. A failed retry keeps the
     pictures already drawn. `retrying` (async, the attempt count) reports a
     retry before it starts."""
     finished, filtered, timings = await pictures(
@@ -482,24 +487,41 @@ async def checked_pictures(
         and any(failed(c) for c in finished)
         and attempts < MAX_ATTEMPTS
     ):
-        count = min(CANDIDATES, MAX_ATTEMPTS - attempts)
+        count = 1 if reference is not None else min(CANDIDATES, MAX_ATTEMPTS - attempts)
         try:
-            await _health(count, retry)
+            _, status = await _health(count, retry)
         except CpuUnavailable as unavailable:
             errors.append("picture_cpu_retry_" + unavailable.code)
+            break
+        if reference is not None and (
+            cpu_server.expected_wait(status, 1, edit=True) > retry.left()
+        ):
+            errors.append("picture_cpu_retry_picture_cpu_busy")
             break
         if retrying is not None:
             await retrying(attempts)
         more_seeds = [secrets.randbelow(2**31) for _ in range(count)]
+        retried = plan
+        if reference is not None:
+            missed = sorted(
+                {s for c in finished for s in (c.get("unmet") or [])}, key=str
+            )
+            retried = replace(
+                plan,
+                edit=plan.edit.rstrip(" .")
+                + "."
+                + (EDIT_GAP.format(items="; ".join(missed)) if missed else ""),
+            )
         try:
             more, more_filtered, more_timings = await pictures(
-                plan,
+                retried,
                 more_seeds,
                 clock=retry,
                 profile=profile,
                 spend=spend,
                 call=call,
                 errors=errors,
+                reference=reference,
             )
         except CpuUnavailable as unavailable:
             errors.append("picture_cpu_retry_" + unavailable.code)
@@ -606,9 +628,14 @@ async def change(
     conversation, dialogue.py; the user's own words when not given), and
     `requirements` everything the user wants the picture to show. The
     rewrite keeps the earlier changes and the rest of the prompt word for
-    word. A server that edits (its health says so) changes the current
-    picture itself from the edit instruction; otherwise the changed prompt
-    is drawn again with the picture's seed.
+    word. A change edits the current picture itself, from its stored
+    original, by the edit instruction (a server whose health says it
+    edits); a retry after a missed check is an edit of that same picture
+    again. When the server cannot edit it (it does not edit, it is busy, the
+    edit failed, the original is gone), the picture stays as it is, the
+    reason is said, and drawing the changed description again with the
+    picture's seed is proposed; only an acceptance of that proposal draws
+    it, said as a new draw, never as an edit.
 
     Never a change claimed that did not happen: an empty instruction or a
     prompt the rewrite left unchanged (after one stronger attempt) is a new
@@ -655,6 +682,35 @@ async def change(
     render_key, current_hash = store.current_render(picture_set)
     variation = False
     edited = False
+    # Atlas proposed, in its last answer, to draw the picture again from its
+    # changed description because the server could not edit it: this change
+    # may do so. The proposal is used once.
+    allow_redraw = picture_set.proposed_redraw
+    if allow_redraw:
+        picture_set.proposed_redraw = False
+        await asyncio.to_thread(store.update, picture_set)
+    redrawn_instead = False
+
+    def no_edit(reason: str, change_text: str) -> bool:
+        """The picture kept as it is, said with the reason, and the closest
+        option proposed: never a picture drawn from scratch in its place."""
+        item.erreurs.extend([*errors, "picture_cpu_no_edit_" + reason])
+        item.cout_eur = float(spend.total)
+        item.reponse = " ".join(
+            [
+                text(language, "cpu_no_edit_" + reason),
+                text(
+                    language, "cpu_no_edit_offer", version=picture_set.artifact_version
+                ),
+            ]
+        )
+        item.state = "done"
+        picture_set.proposed = [change_text]
+        picture_set.proposed_redraw = True
+        store.update(picture_set)
+        LOGGER.info("picture_cpu_change applied=false reason=no_edit_%s", reason)
+        return True
+
     try:
         if not cpu_enabled() or profile is None:
             raise CpuUnavailable("picture_cpu_off")
@@ -734,20 +790,33 @@ async def change(
             if variation or not picture_set.seed
             else picture_set.seed
         )
+        # A change is an edit of the current picture itself, from its stored
+        # original: what the change does not touch stays as it is. When the
+        # server cannot edit it now, the picture is kept and the closest
+        # option is proposed (no_edit), unless the person accepted it.
         reference = None
-        if not variation and plan.edit and cpu_server.edits(status):
+        cannot_edit = ""
+        if not variation and by_code is None:
+            if not plan.edit:
+                plan.edit = wanted
             raw = store.image_bytes(render_key)
-            if (
-                raw is not None
-                and cpu_server.expected_wait(status, 1, edit=True) <= clock.left()
-            ):
+            if not cpu_server.edits(status):
+                cannot_edit = "server"
+            elif raw is None:
+                cannot_edit = "original"
+            elif cpu_server.expected_wait(status, 1, edit=True) > clock.left():
+                cannot_edit = "busy"
+            else:
                 reference = base64.b64encode(raw).decode("ascii")
+        if cannot_edit and not allow_redraw:
+            return no_edit(cannot_edit, wanted)
+        redrawn_instead = bool(cannot_edit)
         # A picture that misses a checked statement is drawn again with other
         # seeds while time allows (checked_pictures), never shown as done;
         # the time a drawing by code needs is kept when it can follow.
         retry_end = clock.deadline - (
             picture_turn.soft_seconds() + picture_turn.CODE_INSTEAD_MARGIN
-            if code_ready and not code_first
+            if code_ready and not code_first and reference is None
             else 0.0
         )
         if by_code is None:
@@ -767,8 +836,11 @@ async def change(
             except CpuUnavailable:
                 if reference is None:
                     raise
-                # The edit failed: the changed prompt drawn again, if it fits.
                 errors.append("picture_cpu_edit_failed")
+                if not allow_redraw:
+                    return no_edit("failed", wanted)
+                # Accepted before: the changed prompt drawn again, if it fits.
+                redrawn_instead = True
                 finished, filtered, timings, attempts = await checked_pictures(
                     plan,
                     [seed],
@@ -782,9 +854,12 @@ async def change(
             if (
                 code_ready
                 and not code_first
+                and not edited
                 and finished
                 and all(failed(c) for c in finished)
             ):
+                # Never after an edit: a drawing by code is a new picture,
+                # not the one the person asked to change.
                 await _status("code_drawing", language)
                 by_code = await picture_turn._code_instead(
                     code_request, language, checks, spend, clock.deadline, call, errors
@@ -823,8 +898,8 @@ async def change(
         return True
     result = ranked(finished)[0]
     if result is not finished[0]:
-        # A retry's picture: a plain draw of the prompt with its own seed.
-        seed, edited = int(result.get("seed") or seed), False
+        # A retry's picture, with its own seed (an edit again after an edit).
+        seed = int(result.get("seed") or seed)
     unsatisfied = bool(plan.checks) and all(failed(c) for c in finished)
     gaps = dict(result.get("gaps") or {})
     if unsatisfied and store.current_passed(picture_set):
@@ -903,6 +978,7 @@ async def change(
     picture_set.misses = picture_set.misses + 1 if unsatisfied else 0
     # A proposal is applied once (dialogue.follow_up): a new version ends it.
     picture_set.proposed = []
+    picture_set.proposed_redraw = False
     if wanted and not variation:
         picture_set.changes = [*picture_set.changes, wanted][-MAX_CHANGES:]
     await asyncio.to_thread(store.update, picture_set)
@@ -921,7 +997,9 @@ async def change(
     # A change the description already held (an exact count it already
     # stated): new draws of it, checked, never "nothing precise to change"
     # and never a request to say again what the message just said.
-    if not variation:
+    if redrawn_instead and strategy == "cpu":
+        lead = text(language, "cpu_redrawn")
+    elif not variation:
         lead = text(language, "changed")
     elif not wanted:
         lead = text(language, "cpu_variation")

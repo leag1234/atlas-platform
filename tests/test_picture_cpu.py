@@ -631,6 +631,12 @@ class CpuTurnTests(unittest.IsolatedAsyncioTestCase):
             ],
             "owner@example.test",
         )
+        # This server cannot edit: the change is first kept and a redraw is
+        # proposed (test_picture_reference); here the redraw was accepted.
+        stored = store.load(picture_set.set_id)
+        assert stored is not None
+        stored.proposed_redraw = True
+        store.update(stored)
         changed = Interaction()
         done = await process_picture_followup(
             Request("rends le renard plus grand"), changed, current, complete=gateway
@@ -641,7 +647,7 @@ class CpuTurnTests(unittest.IsolatedAsyncioTestCase):
         message = gateway.payloads[-1]["messages"][1]["content"]
         self.assertIn("rends le renard plus grand", message)
         self.assertIn(picture_set.candidates[1].prompt, message)
-        self.assertIn("Voici l'image modifiée", changed.reponse)
+        self.assertIn("n'a pas été retouchée sur place", changed.reponse)
         self.assertIn("/versions/3/open", changed.reponse)
         after = store.load(picture_set.set_id)
         assert after is not None

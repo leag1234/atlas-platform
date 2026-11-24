@@ -98,6 +98,10 @@ class PictureSet:
     # missed a checked statement): later changes edit that drawing with the
     # painter (followup.py), never go back to the image model that missed.
     by_code: bool = False
+    # The image server could not edit the picture for the last change, and
+    # Atlas proposed to draw it again from the changed description instead:
+    # an acceptance of that proposal may draw it again (cpu_turn.change).
+    proposed_redraw: bool = False
 
 
 def current_unmet(picture_set: PictureSet) -> list[str]:
