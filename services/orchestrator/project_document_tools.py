@@ -702,6 +702,13 @@ async def publish(
             content = include_sources(
                 content, source_texts, deck=path.suffix == ".pptx"
             )
+        if path.suffix == ".pptx":
+            # What the person quoted for the slides is on the slides, not in
+            # the speaker notes (slide_parts.py).
+            from services.orchestrator import slide_parts
+
+            asked_parts = slide_parts.requested(_asked_requests(tools))
+            content = slide_parts.placed(content, asked_parts)
         content, pictures = placed_pictures(tools, content)
         document = await asyncio.to_thread(
             build_project_document,
@@ -839,6 +846,12 @@ async def publish(
         if isinstance(count, int) and count > 0:
             tools.deliverable_checks = count - 1
         checked = await review(document)
+    if path.suffix == ".pptx" and content is not None:
+        from services.orchestrator import slide_parts
+
+        absent = slide_parts.missing(document.content, asked_parts)
+        if absent:
+            checked.gaps = absent + checked.gaps
     # A repair that cannot fit in the turn is not asked: the file is
     # published with its gaps named (keep_for_delivery).
     keep_for_delivery(tools, time.monotonic() - began, revision)
@@ -973,6 +986,22 @@ async def publish(
         )
     expectations.document_saved(tools, str(receipt.get("relative_path") or path))
     length = measured_length(tools, path.suffix, document.content)
+    # The figures of the file as built: the only ones the answer may give
+    # (file_claims.py).
+    from packages.doc_render.figures import measure as measured_figures
+
+    figures = await asyncio.to_thread(
+        measured_figures, document.content, path.suffix, length.get("pages")
+    )
+    if figures:
+        held = getattr(tools, "file_figures", None)
+        if not isinstance(held, dict):
+            held = {}
+            tools.file_figures = held
+        held[str(receipt.get("relative_path") or path)] = figures
+    tools.file_unverified = bool(getattr(tools, "file_unverified", False)) or not (
+        deliverable_check.verification(checked).get("status") == "passed"
+    )
     links = project_deliverable_links(
         receipt, execution.broker.org, execution.broker.project
     )
@@ -1365,6 +1394,19 @@ def _pdf_pages(raw: bytes) -> tuple[int, tuple[float, ...]]:
     if total is None:
         raise ValueError("unreadable_pdf")
     return total, tuple(form.measure(raw).filled())
+
+
+def _asked_requests(tools: Any) -> list[str]:
+    """The person's requests of this conversation, earlier ones first."""
+    earlier = getattr(tools, "earlier_requests", None)
+    return [
+        item
+        for item in [
+            *(earlier if isinstance(earlier, (list, tuple)) else ()),
+            getattr(tools, "request_text", ""),
+        ]
+        if isinstance(item, str) and item
+    ]
 
 
 def measured_length(tools: Any, suffix: str, raw: bytes) -> dict[str, int]:

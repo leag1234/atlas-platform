@@ -831,6 +831,20 @@ async def run(
                             result.text = without_fix_narration(
                                 result.text, query.question
                             )
+                            # Figures and status of the file are the code's:
+                            # a statement the built file contradicts goes.
+                            from services.orchestrator import file_claims
+
+                            result.text, _ = file_claims.held_to_file(
+                                result.text,
+                                file_claims.figures_of(tools),
+                                query.lang,
+                            )
+                            if getattr(tools, "file_unverified", False):
+                                result.text = (
+                                    file_claims.without_unproven_status(result.text)
+                                    or result.text
+                                )
                         result.state = "done"
                         setattr(result, "tool_urls", tool_urls)
                         return result
