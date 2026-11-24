@@ -838,6 +838,9 @@ async def change(
             items=cpu_checks.gapped(language, list(result.get("unmet") or []), gaps),
             version=picture_set.artifact_version,
         )
+        if "picture_code_instead_unmet" in errors:
+            # The drawing by code was tried too: said, not hidden.
+            item.reponse += " " + text(language, "code_failed_too")
         item.state = "done"
         return True
     if current_hash and result.get("render_hash") == current_hash:
@@ -883,6 +886,17 @@ async def change(
     picture_set.render_key = render_url.rsplit("/", 1)[-1]
     picture_set.render_hash = str(result.get("render_hash") or "")
     picture_set.edited = edited
+    # A version drawn by code is changed as a drawing from now on: its
+    # painter source, checklist and living map are what an edit starts from
+    # (staging -187: an accepted plan after a drawing by code went back to
+    # the image model, missed again, and nothing changed).
+    picture_set.by_code = by_code is not None and strategy != "cpu"
+    if picture_set.by_code and by_code is not None:
+        picture_set.current_source = str(
+            result.get("source") or result.get("svg") or ""
+        )
+        picture_set.checklist = dict(by_code[1] or {})
+        picture_set.living = dict(result.get("living") or {})
     picture_set.checks = list(plan.checks)
     picture_set.unmet = result.get("unmet")
     # Consecutive turns that ended with a checked statement still missed.

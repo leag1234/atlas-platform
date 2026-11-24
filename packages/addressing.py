@@ -69,6 +69,90 @@ _POLITE = {
     ),
     "it": (re.compile(r"\b(?:Lei|Le consiglio|La invito)\b"), True),
 }
+# A request that opens with an imperative says its register by the verb's
+# form alone: "dessine six ballons" is the familiar form, "dessinez" the polite
+# one (staging -187: a picture request with no pronoun was answered in the
+# polite form). Common request verbs, folded; the polite French forms of -er
+# verbs are derived (dessine -> dessinez). Nouns that read like one of these
+# verbs at the start of a message (liste, garde, aide, resume) are left out.
+_FR_TU_ER = (
+    "dessine redessine ajoute montre donne trouve enleve retire corrige "
+    "explique calcule cherche prepare redige genere colorie imagine invente "
+    "raconte envoie remplace compare decris transforme organise planifie "
+    "recommande verifie regarde ecoute cree modifie supprime"
+).split()
+_LEADING = {
+    "fr": (
+        set(_FR_TU_ER)
+        | set(
+            "fais refais mets remets ecris prends rends dis peins traduis "
+            "choisis convertis lis reecris".split()
+        ),
+        {w[:-1] + "ez" for w in _FR_TU_ER}
+        | set(
+            "faites refaites mettez remettez ecrivez prenez rendez dites peignez "
+            "traduisez choisissez convertissez lisez reecrivez".split()
+        ),
+    ),
+    "es": (
+        set(
+            "dibuja haz pon escribe crea muestra dame dime explica traduce calcula "
+            "busca prepara genera pinta cuenta envia cambia anade quita corrige "
+            "compara recomienda elige revisa lee redacta".split()
+        ),
+        set(
+            "dibuje haga ponga escriba muestre deme digame explique traduzca "
+            "calcule busque prepare genere pinte cuente envie cambie anada quite "
+            "corrija compare recomiende elija revise lea redacte".split()
+        ),
+    ),
+    "it": (
+        set(
+            "disegna fai metti scrivi crea mostra dammi dimmi spiega traduci "
+            "calcola cerca prepara genera dipingi racconta invia cambia aggiungi "
+            "togli correggi confronta scegli controlla leggi".split()
+        ),
+        set(
+            "faccia metta scriva crei mostri spieghi traduca calcoli cerchi "
+            "prepari generi dipinga racconti invii aggiunga tolga corregga "
+            "confronti scelga controlli legga".split()
+        ),
+    ),
+    "de": (
+        set(
+            "zeichne mal male mach mache schreib schreibe erstelle zeig zeige gib "
+            "sag erklar erklare ubersetze berechne such suche erzahl erzahle schick "
+            "schicke andere aendere fug fuge entferne korrigiere vergleiche wahle "
+            "prufe lies bau baue".split()
+        ),
+        set(),
+    ),
+}
+# Words a message may open with before its verb: greetings and "please".
+_OPENING = set(
+    "salut bonjour bonsoir coucou hello hi hey stp svp hola buenas porfa ciao "
+    "salve hallo servus moin bitte".split()
+)
+
+
+def leading_register(text: str, language: str) -> str:
+    """The register the opening imperative of ``text`` says, or ""."""
+    forms = _LEADING.get(language)
+    if forms is None:
+        return ""
+    words = [w for w in _folded(text).split()[:4]]
+    while words and words[0] in _OPENING:
+        words.pop(0)
+    if not words:
+        return ""
+    familiar, polite = forms
+    if words[0] in familiar:
+        return "informal"
+    if words[0] in polite:
+        return "formal"
+    return ""
+
+
 # Words that read as a familiar mark once folded but are not one: the French
 # euphonic t of "y a-t-il", the Spanish word for tea (audit 2026-11-21).
 _NOT_FAMILIAR = {
@@ -97,6 +181,9 @@ def register(text: str, language: str) -> str:
     marks = _NOT_FAMILIAR.get(language)
     informal = bool(familiar.search(_folded(marks.sub(" ", text) if marks else text)))
     formal = bool(pattern.search(text if cased else _folded(text)))
+    leading = leading_register(text, language)
+    informal = informal or leading == "informal"
+    formal = formal or leading == "formal"
     if informal == formal:
         return ""
     return "informal" if informal else "formal"

@@ -333,7 +333,7 @@ def _data_url(raw: bytes) -> str | None:
 
 
 def method(picture_set: store.PictureSet) -> str:
-    if picture_set.engine != "cpu":
+    if picture_set.engine != "cpu" or picture_set.by_code:
         return "code"
     return "edit" if picture_set.edited else "cpu"
 

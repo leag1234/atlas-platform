@@ -87,6 +87,11 @@ class FakeGateway:
         }
 
 
+def painted(gateway: FakeGateway) -> dict[str, Any]:
+    """The last painter call (the check of the drawing follows it)."""
+    return [p for p in gateway.payloads if p.get("produces_files")][-1]
+
+
 class Request:
     """The fields of ChatRequest the picture turn reads."""
 
@@ -596,7 +601,7 @@ class FollowupTests(unittest.IsolatedAsyncioTestCase):
             gateway, first.reponse, "rends le banc plus grand"
         )
         self.assertTrue(done)
-        payload = gateway.payloads[-1]
+        payload = painted(gateway)
         self.assertTrue(payload["single_attempt"])
         self.assertEqual(payload["profile"], "atlas-mistral")
         roles = [m["role"] for m in payload["messages"]]
@@ -613,7 +618,7 @@ class FollowupTests(unittest.IsolatedAsyncioTestCase):
         done, again = await self.change(gateway, changed.reponse, "make it smaller")
         self.assertTrue(done)
         self.assertEqual(
-            gateway.payloads[-1]["messages"][2]["content"], after.current_source
+            painted(gateway)["messages"][2]["content"], after.current_source
         )
         self.assertIn("/versions/3/open", again.reponse)
 
@@ -625,7 +630,7 @@ class FollowupTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(followup, "SOURCE_LIMIT", 10):
             done, changed = await self.change(gateway, first.reponse, "plus de soleil")
         self.assertTrue(done)
-        payload = gateway.payloads[-1]
+        payload = painted(gateway)
         self.assertEqual([m["role"] for m in payload["messages"]], ["system", "user"])
         self.assertTrue(payload["messages"][1]["content"].endswith("plus de soleil"))
         self.assertIn("redessinée", changed.reponse)

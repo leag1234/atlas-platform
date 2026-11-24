@@ -561,6 +561,51 @@ class FollowUpTests(Base):
         assert after is not None
         self.assertEqual(after.artifact_version, 2)
         self.assertEqual(after.misses, 0)
+        # Drawn by code now: its painter source is what a later change edits.
+        self.assertTrue(after.by_code)
+        self.assertTrue(after.current_source)
+
+    async def test_after_a_drawing_by_code_an_accepted_plan_edits_that_drawing(
+        self,
+    ) -> None:
+        """Staging -187: a plan accepted after the method changed to drawing by
+        code went back to the image model, which missed again, and nothing
+        changed. The drawing by code is edited instead (fictional subjects)."""
+        for subject, plan in (
+            ("trois lanternes vertes", ["Space the lanterns evenly"]),
+            ("cuatro cometas azules", ["Move the sun fully into the frame"]),
+        ):
+            with self.subTest(subject=subject):
+                memoise_drafts(self)
+                gateway = CheckingDialogueGateway(follow_reply("change", ""))
+                server = FakeServer()
+                first, picture_set = await self.start(gateway, server)
+                self.mark_missed(picture_set, [subject])
+                picture_set = store.load(picture_set.set_id) or picture_set
+                picture_set.misses = 1
+                store.update(picture_set)
+                history = [("user", subject), ("assistant", first.reponse)]
+                gateway.reply = rewrite_reply(prompt=FIRST, checks=[subject])
+                gateway.met = ['{"met": [true]}'] + ['{"met": [false]}'] * 3
+                with patch.object(picture_turn, "soft_seconds", lambda: 30.0):
+                    done, second = await self.follow(gateway, history, "toujours pas")
+                self.assertTrue(done)
+                coded = store.load(picture_set.set_id)
+                assert coded is not None and coded.by_code
+                coded.proposed = list(plan)
+                store.update(coded)
+                renders = len(server.renders)
+                gateway.follow = follow_reply("change", "")
+                history += [("user", "toujours pas"), ("assistant", second.reponse)]
+                done, accepted = await self.follow(gateway, history, "vas-y")
+                self.assertTrue(done)
+                after = store.load(picture_set.set_id)
+                assert after is not None
+                # No new image-model picture: the drawing was edited.
+                self.assertEqual(len(server.renders), renders)
+                self.assertEqual(after.artifact_version, 3)
+                self.assertEqual(after.proposed, [])
+                self.assertIn("/versions/3/open", accepted.reponse)
 
     async def test_an_accepted_proposal_is_applied_from_the_stored_plan(self) -> None:
         gateway = DialogueGateway(follow_reply("review"))
@@ -928,3 +973,123 @@ class GateEditTests(unittest.TestCase):
         self.assertEqual(cpu_server.expected_wait(status, 1, edit=True), 58.0)
         self.assertFalse(cpu_server.edits(status))
         self.assertTrue(cpu_server.edits(status | {"edit": True}))
+
+
+class CodeEditVerifiedTests(Base):
+    """A correction drawn by code is checked before it is shown (docs/32):
+    retried with the measured gap, the closest shown with its gap, or the
+    verified version kept. Fictional subjects and statements."""
+
+    async def corrected(
+        self,
+        replies: list[tuple[list[bool], list[str]]],
+        requirements: list[str],
+        *,
+        current_passed: bool = False,
+    ) -> tuple[Interaction, store.PictureSet, Any]:
+        from test_picture_turn import FakeGateway
+
+        from services.orchestrator.pictures import turn
+
+        class Checked(FakeGateway):
+            checks: list[list[str]]
+            edits: list[str]
+
+            async def __call__(
+                self, payload: dict[str, Any], seconds: float
+            ) -> dict[str, Any]:
+                system = str(payload["messages"][0]["content"])
+                if "You check a picture against statements" in system:
+                    asked = payload["messages"][1]["content"][0]["text"]
+                    self.checks.append(json.loads(asked.split(": ", 1)[1]))
+                    met, seen = replies[min(len(self.checks), len(replies)) - 1]
+                    return {
+                        "text": json.dumps({"met": met, "seen": seen}),
+                        "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+                        "cost_eur": "0.0001",
+                    }
+                asked = str(payload["messages"][-1]["content"])
+                if "Change the picture as asked" in asked:
+                    self.edits.append(asked)
+                return await super().__call__(payload, seconds)
+
+        with patch.dict(os.environ, {"ATLAS_PICTURES_CPU": ""}):
+            gateway = Checked("cats")
+            gateway.checks, gateway.edits = [], []
+            item = Interaction()
+            await turn.process_picture_turn(
+                Request("des chats sur un muret"), item, complete=gateway
+            )
+            picture_set = self.picture_set(item)
+            gateway.checks, gateway.edits = [], []
+            if current_passed:
+                picture_set.unmet = []
+                store.update(picture_set)
+            changed = Interaction()
+            done = await process_picture_followup(
+                Request("il en manque un"),
+                changed,
+                current(item.reponse),
+                complete=gateway,
+                instruction="Show one more cat on the wall.",
+                requirements=requirements,
+            )
+        self.assertTrue(done)
+        return changed, picture_set, gateway
+
+    async def test_a_drawing_that_passes_is_shown(self) -> None:
+        changed, picture_set, gateway = await self.corrected(
+            [([True], [""])], ["trois chats sur le muret"]
+        )
+        after = store.load(picture_set.set_id)
+        assert after is not None
+        self.assertEqual(after.artifact_version, picture_set.artifact_version + 1)
+        self.assertEqual(gateway.checks, [["trois chats sur le muret"]])
+        self.assertEqual(after.unmet, [])
+        self.assertIn("/versions/2/open", changed.reponse)
+
+    async def test_a_miss_is_drawn_again_with_the_measured_gap(self) -> None:
+        changed, picture_set, gateway = await self.corrected(
+            [([False, True], ["dos gatos", ""]), ([True, True], ["", ""])],
+            ["tres gatos en el muro", "un farol encendido"],
+        )
+        self.assertEqual(len(gateway.edits), 2)
+        self.assertIn("does not show: tres gatos en el muro", gateway.edits[1])
+        self.assertIn("dos gatos", gateway.edits[1])
+        self.assertIn("J'ai fait 2 dessins", changed.reponse)
+        after = store.load(picture_set.set_id)
+        assert after is not None
+        self.assertEqual(after.artifact_version, picture_set.artifact_version + 1)
+
+    async def test_every_miss_shows_the_closest_with_its_gap(self) -> None:
+        changed, picture_set, gateway = await self.corrected(
+            [([False], ["zwei Katzen"])], ["drei Katzen auf der Mauer"]
+        )
+        self.assertEqual(len(gateway.checks), 3)
+        self.assertIn("n'a pas réussi à montrer", changed.reponse)
+        self.assertIn("zwei Katzen", changed.reponse)
+        self.assertIn("picture_change_unsatisfied", changed.erreurs)
+        after = store.load(picture_set.set_id)
+        assert after is not None
+        self.assertEqual(after.unmet, ["drei Katzen auf der Mauer"])
+        self.assertEqual(after.misses, 1)
+
+    async def test_a_verified_version_is_never_replaced_by_a_miss(self) -> None:
+        changed, picture_set, gateway = await self.corrected(
+            [([False], ["deux chats"])],
+            ["trois chats sur le muret"],
+            current_passed=True,
+        )
+        after = store.load(picture_set.set_id)
+        assert after is not None
+        self.assertEqual(after.artifact_version, picture_set.artifact_version)
+        self.assertIn("Mes 3 nouveaux dessins", changed.reponse)
+        self.assertNotIn("/versions/2/", changed.reponse)
+
+    async def test_an_unchecked_drawing_is_said_unverified(self) -> None:
+        changed, picture_set, gateway = await self.corrected(
+            [([True, True], [""])], ["trois chats sur le muret"]
+        )
+        # The reply had two values for one statement: the check is unread.
+        self.assertIn("n'a pas pu être vérifié", changed.reponse)
+        self.assertIn("picture_change_unchecked", changed.erreurs)
