@@ -713,7 +713,12 @@ def asked_title_gaps(request: object, content: Any) -> list[str]:
     if not isinstance(request, str) or not isinstance(title, str):
         return []
     asked = asked_title(request)
-    if len(_squashed(asked)) < 2 or _squashed(asked) == _squashed(title):
+    # The title as the person wrote it, punctuation included: "Four Days,
+    # Full Output" is not "Four Days Full Output". Only spacing, typographic
+    # quotes and case may differ.
+    if len(_squashed(asked)) < 2 or (
+        _verbatim(asked).casefold() == _verbatim(title).casefold()
+    ):
         return []
     return [ASKED_TITLE.format(asked=asked, title=title)]
 
