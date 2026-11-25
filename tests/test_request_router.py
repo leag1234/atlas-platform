@@ -73,6 +73,56 @@ class ParseTests(unittest.TestCase):
             request_router.parse('{"kind": "file", "file_format": "odt"}').file_format
         )
 
+    def test_the_model_decides_whether_a_delivered_file_changes(self) -> None:
+        self.assertTrue(
+            request_router.parse(
+                '{"kind": "app", "follow_up": true, "changes_delivered": true}'
+            ).changes_delivered
+        )
+        self.assertFalse(
+            request_router.parse(
+                '{"kind": "file", "follow_up": true, "changes_delivered": false}'
+            ).changes_delivered
+        )
+
+    def test_a_decision_without_the_field_keeps_the_change(self) -> None:
+        # A model that omits the field must not turn a real edit into a chat reply.
+        self.assertTrue(
+            request_router.parse('{"kind": "app", "follow_up": true}').changes_delivered
+        )
+
+    def test_a_no_change_followup_is_answered_in_chat(self) -> None:
+        cases = (
+            "What does the export button do?",
+            "Merci, peux-tu renvoyer le lien ?",
+            "Kannst du den Link noch einmal schicken?",
+            "¿Puedes repetir cómo se guarda?",
+            "Puoi spiegarmi di nuovo questa parte?",
+        )
+        for text in cases:
+            with self.subTest(text=text):
+                routed = Decision(kind="app", follow_up=True, changes_delivered=False)
+                settled, rule = request_router._settle(text, routed)
+                assert settled is not None
+                self.assertEqual(settled.kind, "answer")
+                self.assertEqual(rule, "no_change")
+
+    def test_a_real_change_followup_still_reaches_the_deliverable(self) -> None:
+        cases = (
+            "Add a link to the help page, please",
+            "Je veux que le titre soit rouge",
+            "Der Titel ist zu klein, mach ihn größer",
+            "Añade un enlace a la guía",
+            "Aggiungi un pulsante per il riepilogo",
+        )
+        for text in cases:
+            with self.subTest(text=text):
+                routed = Decision(kind="app", follow_up=True, changes_delivered=True)
+                settled, rule = request_router._settle(text, routed)
+                assert settled is not None
+                self.assertEqual(settled.kind, "app")
+                self.assertEqual(rule, "")
+
     def test_invalid_outputs_raise(self) -> None:
         for text in ("", "no json here", '{"kind": "poem"}', '{"format": "pdf"}'):
             with self.subTest(text=text):
@@ -168,6 +218,45 @@ class RouteTests(unittest.IsolatedAsyncioTestCase):
         # Never the user's text.
         self.assertNotIn("sheep", logs.output[0])
         self.assertEqual(req.__dict__[request_router.COST_KEY], Decimal("0.0002"))
+
+    async def test_the_router_path_uses_the_model_change_decision(self) -> None:
+        history = [
+            {"role": "user", "content": "make a small quiz"},
+            {"role": "assistant", "content": "Here it is: " + ARTIFACT_LINK},
+        ]
+        cases = (
+            (
+                "Can you send the link again?",
+                '{"kind": "app", "follow_up": true, "changes_delivered": false}',
+                Decision(kind="answer", follow_up=True, changes_delivered=False),
+            ),
+            (
+                "Add a link back to the start, please",
+                '{"kind": "app", "follow_up": true, "changes_delivered": true}',
+                Decision(kind="app", follow_up=True, changes_delivered=True),
+            ),
+        )
+        for text, model_reply, expected in cases:
+            with self.subTest(text=text):
+                gateway = AsyncMock(return_value=reply(model_reply))
+                req = request(text, history)
+                with (
+                    router_on(),
+                    patch("services.orchestrator.request_router._gateway", gateway),
+                    self.assertLogs(
+                        "services.orchestrator.request_router", "WARNING"
+                    ) as logs,
+                ):
+                    self.assertEqual(await request_router.route(req), expected)
+                    self.assertEqual(request_router.decision(req), expected)
+                self.assertIn(
+                    "source=settle" if expected.kind == "answer" else "source=model",
+                    logs.output[0],
+                )
+                self.assertIn(
+                    "rule=no_change" if expected.kind == "answer" else "rule=none",
+                    logs.output[0],
+                )
 
     async def test_forgetting_a_machine_goes_to_the_machine_tools(self) -> None:
         from packages.work_intent import manages_machine, work_reason

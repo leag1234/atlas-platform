@@ -130,7 +130,7 @@ class SettleTests(unittest.TestCase):
                 self.assertEqual(settle(case["text"], routed), routed)
 
     def test_follow_ups_answers_and_failures_are_unchanged(self) -> None:
-        change = Decision(kind="app", follow_up=True)
+        change = Decision(kind="app", follow_up=True, changes_delivered=True)
         self.assertEqual(settle("ajoute un message de victoire", change), change)
         research = Decision(kind="research")
         self.assertEqual(settle(WRITING[0], research), research)

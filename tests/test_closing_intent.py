@@ -75,7 +75,7 @@ class SettleTests(unittest.TestCase):
 
     def test_requests_keep_the_model_kind(self) -> None:
         for text in REQUESTS:
-            routed = Decision(kind="app", follow_up=True)
+            routed = Decision(kind="app", follow_up=True, changes_delivered=True)
             with self.subTest(text=text):
                 self.assertEqual(settle(text, routed), routed)
 
@@ -132,7 +132,7 @@ class RoutingLogTests(unittest.IsolatedAsyncioTestCase):
     async def test_a_closing_settled_by_code(self) -> None:
         gateway = AsyncMock(
             return_value={
-                "text": '{"kind": "app", "follow_up": true}',
+                "text": '{"kind": "app", "follow_up": true, "changes_delivered": true}',
                 "calls": [],
                 "cost_eur": "0.0001",
             }
@@ -151,13 +151,16 @@ class RoutingLogTests(unittest.IsolatedAsyncioTestCase):
     async def test_a_change_keeps_the_model_decision(self) -> None:
         gateway = AsyncMock(
             return_value={
-                "text": '{"kind": "app", "follow_up": true}',
+                "text": '{"kind": "app", "follow_up": true, "changes_delivered": true}',
                 "calls": [],
                 "cost_eur": "0.0001",
             }
         )
         routed, line = await self._route("thanks, now add a timer", gateway)
-        self.assertEqual(routed, Decision(kind="app", follow_up=True))
+        self.assertEqual(
+            routed,
+            Decision(kind="app", follow_up=True, changes_delivered=True),
+        )
         self.assertIn("source=model", line)
         self.assertIn("rule=none", line)
 
