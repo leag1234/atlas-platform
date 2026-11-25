@@ -13,7 +13,7 @@ from pydantic import (
     model_validator,
 )
 
-from .cells import SHEET_COLUMNS, Reading, plain, read_table, shown
+from .cells import SHEET_COLUMNS, Reading, NUMBER_START, plain, read_table, shown
 from .glyphs import adapt
 
 
@@ -147,6 +147,44 @@ def label(line: str) -> str | None:
     if not text or text.endswith((".", "!", "?")) or len(text.split()) > LABEL_WORDS:
         return None
     return text
+
+
+def split_summary(text: str) -> tuple[str, ...]:
+    """A paragraph of several summary values as one line for each.
+
+    A model may write "Subtotal: 10 Tax: 2 Total: 12" as one paragraph. The
+    renderer wraps it between words, possibly inside a value. A paragraph
+    made only of such pairs is split before layout; each label stays with
+    its value and the final total is emphasized.
+    """
+    displayed = plain(text)
+    if displayed.count(":") < 2:
+        return (text,)
+    pieces = displayed.split(":")
+    labels, values = pieces[:-1], pieces[-1].split()
+    if not values:
+        return (text,)
+    lines = []
+    for index, label_text in enumerate(labels):
+        if index + 1 < len(labels):
+            words = labels[index + 1].split()
+            if not words:
+                return (text,)
+            value, following = words[0], words[1:]
+            labels[index + 1] = " ".join(following)
+        else:
+            if not values:
+                return (text,)
+            value, following = values[0], values[1:]
+            values = following
+        if not NUMBER_START.match(value):
+            return (text,)
+        lines.append(f"{label_text.strip()}: {value}")
+    if values:
+        return (text,)
+    return tuple(
+        f"**{line}**" if line.lower().startswith("total") else line for line in lines
+    )
 
 
 class Section(ContentModel):
@@ -288,9 +326,18 @@ class Content(ContentModel):
         chart the table of its numbers: nothing written for a deck is lost
         in a DOCX, a PDF or a workbook.
         """
-        if not any(section.slide_only() for section in self.sections):
-            return self
         value = self.model_dump(mode="json")
+        for section, data in zip(self.sections, value["sections"], strict=True):
+            data["paragraphs"] = [
+                line
+                for paragraph in data["paragraphs"]
+                for line in split_summary(paragraph)
+            ]
+            data["bullets"] = [
+                line for bullet in data["bullets"] for line in split_summary(bullet)
+            ]
+        if not any(section.slide_only() for section in self.sections):
+            return Content.model_validate(value)
         for section, data in zip(self.sections, value["sections"], strict=True):
             data["paragraphs"] = [*data["paragraphs"], *data.pop("notes")]
             data["bullets"] = [
