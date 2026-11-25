@@ -464,6 +464,48 @@ async def _gateway(payload: dict[str, Any], seconds: float) -> dict[str, Any]:
     )
 
 
+CONFIRM_QUESTION = (
+    "Does the last message ask to change the delivered file or app, or to make "
+    "a new one? Answer with one word: yes or no."
+)
+# A confirmation call is short; it never holds the turn longer than this.
+CONFIRM_SECONDS = 6.0
+
+
+async def confirms_no_change(
+    text: str,
+    history: Sequence[Mapping[str, object]],
+    complete: Complete | None = None,
+) -> tuple[bool, Decimal]:
+    """Whether the model, asked once more, says the turn changes nothing.
+
+    Used only when one decision says "a follow-up on a delivered file or app"
+    and also "no change" (staging -200: a request to remove a slide and send
+    the deck again came back that way and was answered in chat). Only a clear
+    "no" counts; an error, a timeout or any other answer keeps the change.
+    """
+    request_payload = payload(text, history, seconds=CONFIRM_SECONDS)
+    request_payload["messages"] = [
+        *request_payload["messages"],
+        {"role": "user", "content": CONFIRM_QUESTION},
+    ]
+    request_payload.pop("response_format", None)
+    request_payload["max_tokens"] = 8
+    cost = Decimal(0)
+    try:
+        async with asyncio.timeout(CONFIRM_SECONDS):
+            result = await (complete or _gateway)(request_payload, CONFIRM_SECONDS)
+        try:
+            cost = Decimal(str(result.get("cost_eur") or 0))
+        except InvalidOperation:
+            cost = Decimal(0)
+        words = str(result.get("text") or "").strip().casefold().split()
+    except Exception:  # noqa: BLE001 - any failure keeps the change
+        return False, cost
+    first = words[0].strip(".!,;:\"'") if words else ""
+    return first == "no", cost
+
+
 def payload(
     text: str,
     history: Sequence[Mapping[str, object]],
@@ -832,6 +874,17 @@ async def route(request: ChatRequest) -> Decision | None:
     if routed is None:
         routed = await asyncio.to_thread(local_decision, request.user_text, history)
         source = "local"
+    if (
+        routed is not None
+        and routed.kind in ("file", "app")
+        and routed.follow_up
+        and not routed.changes_delivered
+    ):
+        no_change, confirm_cost = await confirms_no_change(request.user_text, history)
+        cost += confirm_cost
+        if not no_change:
+            routed = routed.model_copy(update={"changes_delivered": True})
+            reason = (reason + "+" if reason else "") + "change_confirmed"
     settled, rule = _settle(request.user_text, routed)
     if routed is None:
         settled = deliver_fallback(request.user_text)
