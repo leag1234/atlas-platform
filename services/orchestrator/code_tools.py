@@ -607,6 +607,9 @@ class WorkTools(CodeTools):
         # name -> folder) (work_remote_tools.py).
         self.remote_targets: list[dict[str, Any]] | None = None
         self.remote_in_place: dict[str, str] | None = None
+        # Repository instruction files read once per remote turn.
+        self.remote_repo_instructions: str | None = None
+        self.remote_repo_instructions_attempted: dict[str, bool] = {}
         # Turn-specific system text (the machine rules on a remote turn).
         self.instructions = ""
         # Set by the Work turn when the request asks for code to be run.

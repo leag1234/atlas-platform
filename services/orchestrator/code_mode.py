@@ -507,6 +507,11 @@ async def execute_turn(
             else ""
         )
         + (tools.instructions if isinstance(tools, WorkTools) else "")
+        + (
+            tools.remote_repo_instructions
+            if isinstance(tools, WorkTools) and tools.remote_repo_instructions
+            else ""
+        )
         # The plan the person sees in the chat, if any (work_plan.py).
         + (plan_instruction() if isinstance(tools, WorkTools) else ""),
         limits,
@@ -645,13 +650,36 @@ async def process_code(request: ChatRequest, item: Interaction) -> None:
                     "Upload one zip or tar archive to initialize this Code session"
                 )
             listing = await workspace.invoke("list_dir", {"path": "."}, 10)
-            workspace_context = {
-                "root": "/workspace",
-                "archive_state": "already_extracted",
-                "paths": "relative or absolute under /workspace",
-                "listing": listing,
-                **work_context(request),
-            }
+            from services.orchestrator.work_instructions import (
+                instruction_file_name,
+                repo_instructions,
+            )
+
+            repository_instructions = await repo_instructions(workspace)
+            if repository_instructions is not None:
+                workspace_context = {
+                    "root": "/workspace",
+                    "archive_state": "already_extracted",
+                    "paths": "relative or absolute under /workspace",
+                    "listing": listing,
+                    "repository_instructions": repository_instructions,
+                    **work_context(request),
+                }
+                await tools.emit(
+                    "tool",
+                    tool="read_file",
+                    label=f"read {instruction_file_name(repository_instructions)}",
+                    status="completed",
+                    output={"source": "repository instructions"},
+                )
+            else:
+                workspace_context = {
+                    "root": "/workspace",
+                    "archive_state": "already_extracted",
+                    "paths": "relative or absolute under /workspace",
+                    "listing": listing,
+                    **work_context(request),
+                }
             await tools.emit(
                 "workspace",
                 label="Current workspace",
@@ -1410,6 +1438,20 @@ async def process_work(
             # written (page_budget.py); a change of a delivered file gets the
             # room measured on its print instead (current_file.room_note).
             page_budget = await first_brief(tools)
+            from services.orchestrator.work_instructions import (
+                instruction_file_name,
+                repo_instructions,
+            )
+
+            repository_instructions = await repo_instructions(workspace)
+            if repository_instructions is not None:
+                await tools.emit(
+                    "tool",
+                    tool="read_file",
+                    label=f"read {instruction_file_name(repository_instructions)}",
+                    status="completed",
+                    output={"source": "repository instructions"},
+                )
             result = await execute_turn(
                 request,
                 model,
@@ -1420,6 +1462,11 @@ async def process_work(
                     repository=repository,
                     listing=await workspace.invoke(
                         "list_dir", {"path": "."}, workspace_startup_timeout(limits)
+                    ),
+                    **(
+                        {"repository_instructions": repository_instructions}
+                        if repository_instructions is not None
+                        else {}
                     ),
                     files=[
                         dict(

@@ -271,8 +271,21 @@ async def run_opencode_turn(
         # in the person's zone comes first, as on the loop (work_clock.py).
         from packages import addressing
         from services.orchestrator.work_clock import engine_preamble
+        from services.orchestrator.work_instructions import (
+            instruction_file_name,
+            repo_instructions,
+        )
         from services.orchestrator.work_plan import instruction
 
+        repository_instructions = await repo_instructions(workspace)
+        if repository_instructions is not None:
+            await tools.emit(
+                "tool",
+                tool="read_file",
+                label=f"read {instruction_file_name(repository_instructions)}",
+                status="completed",
+                output={"source": "repository instructions"},
+            )
         outcome = await driver.run(
             engine_preamble(request)
             + "\nAnswer in the language of the user's message."
@@ -280,6 +293,7 @@ async def run_opencode_turn(
             + addressing.address_instruction(addressing.answer_language(""))
             # The plan the person sees in the chat, if any (work_plan.py).
             + instruction(engine=True)
+            + ("\n\n" + repository_instructions if repository_instructions else "")
             + "\n\n"
             + request.user_text
         )
