@@ -1519,7 +1519,11 @@ def revision_target(
     is its next version (docs/17, section 12, item 20). A created file, a
     free path or another format is a new file.
     """
-    from services.orchestrator.chat_file_names import delivered_file
+    from services.orchestrator.chat_file_names import (
+        delivered_file,
+        folder_names,
+        named_file,
+    )
 
     # A file this turn already published under this name: the new one is its
     # next version (staging -157: published with a gap, then fixed in the
@@ -1534,6 +1538,20 @@ def revision_target(
             return saved
     answers = getattr(tools, "earlier_answers", None)
     if getattr(tools, "revises_delivered", False) is True and isinstance(answers, list):
+        candidates = [
+            name
+            for name in folder_names(existing, folder_id)
+            if PurePosixPath(name).suffix.lower() == path.suffix.lower()
+            and PurePosixPath(name).name in "\n".join(answers)
+        ]
+        named = named_file(
+            str(getattr(tools, "request_text", "")),
+            candidates,
+            answers,
+            tools.execution.broker.project,
+        )
+        if named is not None:
+            return named
         target = delivered_file(
             existing, folder_id, answers, tools.execution.broker.project, {path.suffix}
         )
