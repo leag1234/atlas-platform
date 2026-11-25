@@ -68,6 +68,10 @@ REDRAW_MIN_SECONDS = 60.0
 CHECKED_DRAWINGS = 3
 # Statements checked at most on one drawing.
 MAX_STATEMENTS = 8
+TEXT_NOTE = (
+    "\nKeep these exact words visible as <text> elements: {texts}. "
+    "Do not remove or reword them."
+)
 GAP_NOTE = (
     "\nA check of your last drawing found that it does not show: {gaps}. "
     "Make each of these plainly visible."
@@ -87,11 +91,8 @@ def statements_of(
     wordings are never mixed: an answer quoted one of them in English in a
     French conversation (staging -191). The change itself (English) is the
     last resort, and is not quoted back as a constraint."""
-    own = [" ".join(str(s).split()) for s in picture_set.checks if str(s).strip()]
-    if own:
-        return own[:MAX_STATEMENTS]
     found: list[str] = []
-    for statement in requirements or []:
+    for statement in picture_set.checks or (requirements or []):
         statement = " ".join(str(statement).split())
         if statement and statement.casefold() not in {f.casefold() for f in found}:
             found.append(statement)
@@ -121,11 +122,14 @@ async def _verified(
 
 
 def messages(
-    picture_set: store.PictureSet, change: str
+    picture_set: store.PictureSet, change: str, texts: list[str] | None = None
 ) -> tuple[list[dict[str, str]], bool]:
     """(messages of the change, whether the picture is drawn again)."""
     first = painter.messages(
-        picture_set.request, picture_set.checklist, animal_kit=animal_kit_enabled()
+        picture_set.request,
+        picture_set.checklist,
+        animal_kit=animal_kit_enabled(),
+        texts=texts,
     )
     source = picture_set.current_source
     if source and len(source.encode("utf-8")) <= SOURCE_LIMIT:
@@ -139,13 +143,18 @@ def messages(
         )
     # Too large (or no stored drawing): the painter draws it again from the
     # first request with the change; never the conversation model.
-    return redraw_messages(picture_set, change), True
+    return redraw_messages(picture_set, change, texts), True
 
 
-def redraw_messages(picture_set: store.PictureSet, change: str) -> list[dict[str, str]]:
+def redraw_messages(
+    picture_set: store.PictureSet, change: str, texts: list[str] | None = None
+) -> list[dict[str, str]]:
     """The painter's first request with the change: the picture drawn again."""
     first = painter.messages(
-        picture_set.request, picture_set.checklist, animal_kit=animal_kit_enabled()
+        picture_set.request,
+        picture_set.checklist,
+        animal_kit=animal_kit_enabled(),
+        texts=texts,
     )
     first[1] = {
         "role": "user",
@@ -164,6 +173,7 @@ async def process_picture_followup(
     complete: Complete | None = None,
     instruction: str | None = None,
     requirements: list[str] | None = None,
+    texts: list[str] | None = None,
 ) -> bool:
     """Change the conversation's picture; False when the artifact is not one.
 
@@ -221,7 +231,8 @@ async def process_picture_followup(
     limit = request.timeout_seconds if wall_clock_limit is None else wall_clock_limit
     seconds = max(30.0, min(240.0, limit - 40.0))
     wanted = (instruction or "").strip() or request.user_text
-    change, redrawn = messages(picture_set, wanted)
+    texts = [value for value in texts or [] if value.strip()]
+    change, redrawn = messages(picture_set, wanted, texts)
     unchanged = app_failure(
         "drawing", language, unchanged_version=picture_set.artifact_version
     )
@@ -283,6 +294,7 @@ async def process_picture_followup(
                         "animal_kit": animal_kit_enabled(),
                         "bounded_contours": bounded_contours_enabled(),
                         "labels_group": painter.labels_group(picture_set.checklist),
+                        "texts": texts,
                     },
                 )
             except PictureJobError as error:
@@ -321,7 +333,7 @@ async def process_picture_followup(
             # The painter gave its own drawing back unchanged to a correction
             # (staging -185): the method changes once, the picture is drawn
             # again from the first request with the correction.
-            change, redrawn = redraw_messages(picture_set, wanted), True
+            change, redrawn = redraw_messages(picture_set, wanted, texts), True
             method_changed = True
             seconds = max(30.0, min(240.0, left))
             await _status("changing", language)
@@ -355,9 +367,9 @@ async def process_picture_followup(
             )
         )
         change, redrawn = (
-            (redraw_messages(picture_set, wanted + measured), True)
+            (redraw_messages(picture_set, wanted + measured, texts), True)
             if redrawn
-            else messages(picture_set, wanted + measured)
+            else messages(picture_set, wanted + measured, texts)
         )
         seconds = max(30.0, min(240.0, left))
         await _status("changing", language)
@@ -398,6 +410,7 @@ async def process_picture_followup(
     picture_set.artifact_version = int(stored["version"])
     picture_set.current_source = str(result.get("source") or svg)
     picture_set.image_key = image.rsplit("/", 1)[-1]
+    picture_set.texts = texts
     picture_set.checks = list(statements)
     picture_set.unmet = None if unmet is None else list(unmet)
     picture_set.misses = picture_set.misses + 1 if unsatisfied else 0

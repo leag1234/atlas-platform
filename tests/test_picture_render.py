@@ -142,6 +142,37 @@ class RenderTests(unittest.TestCase):
             self.assertFalse(render.fonts_available())
 
 
+class RequestedTextTests(unittest.TestCase):
+    def test_a_missing_checklist_has_no_texts(self) -> None:
+        from services.orchestrator.pictures.texts import checklist_texts
+
+        self.assertEqual(checklist_texts({}), [])
+        self.assertEqual(checklist_texts(None), [])
+
+    def test_missing_texts_match_without_case_or_accents(self) -> None:
+        from services.orchestrator.pictures.chain import missing_texts
+
+        svg = f"<svg {NS}><text>ÉCLAT LUNE</text><text>quiet harbour</text></svg>"
+        self.assertEqual(missing_texts(svg, ["éclat lune", "QUIET HARBOUR"]), [])
+        self.assertEqual(
+            missing_texts(svg, ["ÉCLAT LUNE", "NEBULA CAFE"]), ["NEBULA CAFE"]
+        )
+
+    def test_missing_texts_are_added_as_real_elements(self) -> None:
+        from services.orchestrator.pictures.chain import add_texts
+
+        svg = f'<svg {NS}><rect width="10" height="10"/></svg>'
+        with_text = add_texts(svg, ["NEBULA CAFE", "A & B"])
+        root = ET.fromstring(with_text)
+        values = [
+            "".join(element.itertext())
+            for element in root.iter()
+            if element.tag.rsplit("}", 1)[-1] == "text"
+        ]
+        self.assertEqual(values, ["NEBULA CAFE", "A & B"])
+        self.assertIn('class="requested-texts"', with_text)
+
+
 class GeometryTests(unittest.TestCase):
     def test_masks_boxes_and_visibility(self) -> None:
         g = Geometry(SHAPES, frame=100)

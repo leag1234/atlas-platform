@@ -164,6 +164,16 @@ class PainterTests(unittest.TestCase):
         text = painter.messages("un vélo", scene, animal_kit=False)
         self.assertNotIn("Labels, for the program", text[1]["content"])
 
+    def test_exact_texts_are_passed_to_the_painter(self) -> None:
+        messages = painter.messages(
+            "a poster with the caption SOLSTICE HARBOR",
+            {"things": [], "relations": [], "actions": []},
+            animal_kit=False,
+            texts=["SOLSTICE HARBOR"],
+        )
+        self.assertIn("SOLSTICE HARBOR", messages[1]["content"])
+        self.assertIn("real <text> element", messages[1]["content"])
+
 
 class ChoiceTests(unittest.TestCase):
     def test_choices_in_five_languages(self) -> None:

@@ -463,6 +463,22 @@ def answer_language(found: object, fallback: str) -> str:
     return fallback if fallback in LANGUAGES else "en"
 
 
+def checklist_texts(checklist: dict[str, object] | None) -> list[str]:
+    """The exact visible strings declared by the picture checklist."""
+    found: list[str] = []
+    seen: set[str] = set()
+    things = checklist.get("things") if checklist else None
+    for thing in things if isinstance(things, list) else []:
+        if not isinstance(thing, dict) or thing.get("kind") != "text":
+            continue
+        value = " ".join(str(thing.get("text") or "").split())
+        folded = value.casefold()
+        if value and folded not in seen:
+            seen.add(folded)
+            found.append(value)
+    return found
+
+
 # The polite phrases of these tables and their familiar form (longest first
 # is the shared rule); packages.addressing.FAMILIAR adds the common ones.
 FAMILIAR: dict[str, tuple[tuple[str, str], ...]] = {
