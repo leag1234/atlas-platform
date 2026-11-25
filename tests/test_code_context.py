@@ -32,12 +32,62 @@ class CodeContextTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertEqual(code_of(text), "")
 
-    def test_the_latest_block_wins_and_says_whose_it_is(self) -> None:
-        found = last_code([("user", BARE), ("assistant", FENCED), ("user", "ok")])
+    def test_the_latest_block_wins(self) -> None:
+        older = "```js\nconst values = [2, 5];\nconsole.log(values.length);\n```"
+        found = last_code([("user", older), ("user", BARE), ("user", "ok")])
+        assert found is not None
+        self.assertEqual(
+            (found[0], found[1], found[2]), ("user", BARE.split("\n\n", 1)[1], 2)
+        )
+
+    def test_an_assistant_output_block_is_not_the_code_to_run(self) -> None:
+        output = "Here is the result:\n\n```\nMOOS-PUNKTE: 77\nGESAMT: 12\n```"
+        found = last_code([("user", BARE), ("assistant", output), ("user", "ok")])
+        assert found is not None
+        self.assertEqual(
+            (found[0], found[1], found[2]), ("user", BARE.split("\n\n", 1)[1], 3)
+        )
+
+    def test_an_assistant_written_script_is_the_code_to_run(self) -> None:
+        found = last_code([("assistant", FENCED), ("user", "run it")])
         assert found is not None
         self.assertEqual(
             (found[0], found[1], found[2]), ("assistant", "x = 3\nprint(x * 2)", 2)
         )
+
+    def test_assistant_language_tags_distinguish_code_from_output(self) -> None:
+        cases = [
+            ("```python\nfor value in [1, 2]:\n    print(value)\n```", True),
+            ("```js\nconsole.log([1, 2].length);\n```", True),
+            ("```text\nTOTAL: 3\n```", False),
+            ("```console\nTOTAL: 3\n```", False),
+            ("```\nTOTAL: 3\n```", False),
+        ]
+        for text, expected in cases:
+            with self.subTest(text=text):
+                found = last_code([("assistant", text), ("user", "run it")])
+                self.assertEqual(found is not None, expected)
+
+    def test_varied_person_snippets_are_reachable(self) -> None:
+        cases = [
+            (
+                '```go\npackage main\n\nfunc main() {\n\tprintln("TOTAL: 12")\n}\n```',
+                'package main\n\nfunc main() {\n\tprintln("TOTAL: 12")\n}',
+            ),
+            (
+                '```ruby\nprix = [3, 8]\nputs "SOMME: #{prix.sum}"\n```',
+                'prix = [3, 8]\nputs "SOMME: #{prix.sum}"',
+            ),
+            (
+                '```sh\ncount=7\n echo "NOMBRE: $count"\n```',
+                'count=7\n echo "NOMBRE: $count"',
+            ),
+        ]
+        for text, expected in cases:
+            with self.subTest(language=expected.splitlines()[0]):
+                found = last_code([("user", text), ("user", "run it again")])
+                assert found is not None
+                self.assertEqual(found[1], expected)
 
     def test_the_hint_names_the_code_for_a_run_with_a_change(self) -> None:
         hint = code_hint(
