@@ -238,7 +238,11 @@ class RouteTests(unittest.IsolatedAsyncioTestCase):
         )
         for text, model_reply, expected in cases:
             with self.subTest(text=text):
-                gateway = AsyncMock(return_value=reply(model_reply))
+                gateway = AsyncMock(
+                    side_effect=lambda payload, seconds, model_reply=model_reply: reply(
+                        "no" if payload["max_tokens"] == 8 else model_reply
+                    )
+                )
                 req = request(text, history)
                 with (
                     router_on(),
@@ -257,6 +261,67 @@ class RouteTests(unittest.IsolatedAsyncioTestCase):
                     "rule=no_change" if expected.kind == "answer" else "rule=none",
                     logs.output[0],
                 )
+
+    async def test_a_contradiction_keeps_the_change_unless_the_model_says_no(
+        self,
+    ) -> None:
+        history = [
+            {"role": "user", "content": "make a small quiz"},
+            {"role": "assistant", "content": "Here it is: " + ARTIFACT_LINK},
+        ]
+        contradictory = (
+            '{"kind": "file", "follow_up": true, "changes_delivered": false}'
+        )
+        cases = (
+            ("Remove the third card and send the file again", "Yes.", "file"),
+            ("Enlève la dernière page et renvoie le document", "oui", "file"),
+            ("Was steht auf der zweiten Seite?", "No", "answer"),
+            ("Change the colour of the header", RuntimeError("gateway_down"), "file"),
+            ("Quita la tabla del final", "I think so", "file"),
+        )
+        for text, confirmation, kind in cases:
+            with self.subTest(text=text):
+
+                def answer(
+                    payload: dict[str, Any],
+                    seconds: float,
+                    confirmation: object = confirmation,
+                ) -> dict[str, object]:
+                    if payload["max_tokens"] != 8:
+                        return reply(contradictory)
+                    if isinstance(confirmation, Exception):
+                        raise confirmation
+                    return reply(str(confirmation))
+
+                gateway = AsyncMock(side_effect=answer)
+                with (
+                    router_on(),
+                    patch("services.orchestrator.request_router._gateway", gateway),
+                    self.assertLogs("services.orchestrator.request_router", "WARNING"),
+                ):
+                    routed = await request_router.route(request(text, history))
+                assert routed is not None
+                self.assertEqual(routed.kind, kind)
+
+    async def test_a_consistent_decision_asks_nothing_more(self) -> None:
+        history = [
+            {"role": "user", "content": "make a small quiz"},
+            {"role": "assistant", "content": "Here it is: " + ARTIFACT_LINK},
+        ]
+        gateway = AsyncMock(
+            return_value=reply(
+                '{"kind": "app", "follow_up": true, "changes_delivered": true}'
+            )
+        )
+        with (
+            router_on(),
+            patch("services.orchestrator.request_router._gateway", gateway),
+            self.assertLogs("services.orchestrator.request_router", "WARNING"),
+        ):
+            await request_router.route(request("Make the buttons bigger", history))
+        self.assertFalse(
+            any(call.args[0]["max_tokens"] == 8 for call in gateway.await_args_list)
+        )
 
     async def test_forgetting_a_machine_goes_to_the_machine_tools(self) -> None:
         from packages.work_intent import manages_machine, work_reason
