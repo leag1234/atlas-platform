@@ -3252,7 +3252,14 @@ async def _process(
             from services.orchestrator.presentation_delivery import deliver_presentation
 
             delivered = await deliver_presentation(
-                model, request, item, result, tools.terminal, started, formats
+                model,
+                request,
+                item,
+                result,
+                tools.terminal,
+                started,
+                formats,
+                history=attachment_history,
             )
             if delivered is None:
                 # D5: no second file-generation route can replace an honest failure.

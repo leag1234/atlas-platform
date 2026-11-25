@@ -31,6 +31,14 @@ For this PPTX request, return ONLY a JSON object with this exact shape:
 or extra keys. Write all user-visible text in the request language.
 """
 
+COUNT_INSTRUCTION = """
+The conversation asks for a deck. Decide the exact number of slides the person
+expects: an explicit count, or the number of items in an outline they accepted.
+Add a slide only when the person asks for an extra one. Reply with JSON only:
+{"slides":N}; use {"slides":null} when the conversation gives no count and
+accepts no outline.
+"""
+
 
 def requested_topic_words(question: str) -> set[str]:
     ignored = {
@@ -149,6 +157,54 @@ async def repair_outline(
         model.delivery_reserve = Decimal(0)
 
 
+async def requested_slide_count(
+    model: GatewayModel,
+    request: ChatRequest,
+    result: Result,
+    started: float,
+    history: list[Message] | None = None,
+) -> int | None:
+    """The count the model reads from the conversation, never from keywords."""
+    remaining = request.timeout_seconds - (time.monotonic() - started) - 30
+    available = max(Decimal(0), Decimal("0.30") - result.cost)
+    if remaining <= 0 or available <= 0:
+        return None
+    saved_tools, saved_choice, saved_sink = (
+        model.tools,
+        model.required_file_tool,
+        model.sink,
+    )
+    model.tools, model.required_file_tool, model.sink = [], None, None
+    try:
+        model.spent = max(model.spent, result.cost)
+        model.delivery_reserve = Decimal(0)
+        messages: list[Message] = [
+            *(history or []),
+            # The history holds the earlier turns; this turn's request (an
+            # explicit count) is the last user message.
+            {"role": "user", "content": request.messages[-1].text},
+            {"role": "assistant", "content": result.text},
+            {"role": "system", "content": COUNT_INSTRUCTION},
+        ]
+        async with asyncio.timeout(remaining):
+            turn = await model.complete(messages, remaining)
+        data = json.loads(turn.text)
+        count = data["slides"] if isinstance(data, dict) else None
+        if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+            return None
+        result.cost += turn.usage.cost if turn.usage else available
+        return count
+    except Exception:  # noqa: BLE001 - reading the count never fails the turn
+        return None
+    finally:
+        model.tools, model.required_file_tool, model.sink = (
+            saved_tools,
+            saved_choice,
+            saved_sink,
+        )
+        model.delivery_reserve = Decimal(0)
+
+
 async def deliver_presentation(
     model: GatewayModel,
     request: ChatRequest,
@@ -157,6 +213,7 @@ async def deliver_presentation(
     terminal: TerminalClient,
     started: float,
     formats: tuple[str, ...],
+    history: list[Message] | None = None,
 ) -> Result | None:
     """Build, reopen, check and publish a PPTX; return None for D5 inline fallback."""
     try:
@@ -180,6 +237,27 @@ async def deliver_presentation(
     if remaining <= 0:
         item.erreurs.append("presentation_render_timeout")
         return None
+    expected = await requested_slide_count(model, request, result, started, history)
+    if expected is not None and len(outline.slides) != expected:
+        reason = (
+            f"the deck has {len(outline.slides)} slides, exactly {expected} were asked"
+        )
+        repaired = await repair_outline(model, request, result, reason, started)
+        # A deck still off after the repair is delivered as it is: the
+        # answer's claims are checked against the built file elsewhere, and a
+        # deck with one slide too many beats no deck.
+        if repaired is None:
+            item.erreurs.append("presentation_slide_count")
+        else:
+            try:
+                fixed = parse_outline(repaired.text, request.messages[-1].text)
+            except (json.JSONDecodeError, ValidationError, ValueError):
+                result.cost = repaired.cost
+                item.erreurs.append("presentation_slide_count_after_repair")
+            else:
+                outline, result = fixed, repaired
+                if len(outline.slides) != expected:
+                    item.erreurs.append("presentation_slide_count_after_repair")
     try:
         with TemporaryDirectory(prefix="atlas-pptx-") as directory:
             content = outline.content()
