@@ -72,3 +72,42 @@ class DocumentTotalLinesTests(unittest.TestCase):
         result = render(content, path, image_root=self.root)
         self.assertIn("Total: 12", "".join(result.text))
         verify(path, expected=content)
+
+    def test_currency_and_unit_values_keep_their_unit(self) -> None:
+        content = self.content(
+            (
+                "Subtotal EUR: 126,90 € Tax 20 % (EUR part only): 25,38 € "
+                "Total EUR: 152,28 €",
+                "Subtotal: CHF 43.20 Tax: CHF 8.64 Total: CHF 51.84",
+                "Subtotal: $ 8.74 Tax: $ 1.75 Total: $ 10.49",
+            )
+        )
+        for suffix in ("pdf", "docx"):
+            path = self.root / f"currency.{suffix}"
+            result = render(content, path, image_root=self.root)
+            text = " ".join(result.text).replace("\xa0", " ")
+            self.assertIn("Subtotal EUR: 126,90 €", text)
+            self.assertIn("Tax 20 % (EUR part only): 25,38 €", text)
+            self.assertIn("Total EUR: 152,28 €", text)
+            self.assertIn("Subtotal: CHF 43.20", text)
+            self.assertIn("Tax: CHF 8.64", text)
+            self.assertIn("Total: CHF 51.84", text)
+            self.assertIn("Subtotal: $ 8.74", text)
+            self.assertIn("Tax: $ 1.75", text)
+            self.assertIn("Total: $ 10.49", text)
+            self.assertNotIn("25,38 € Total", text)
+            self.assertNotIn("CHF 8.64 Total", text)
+            verify(path, expected=content)
+
+    def test_time_values_keep_their_colon(self) -> None:
+        content = self.content(("Start: 09:30 End: 17:45 Total: 8 h 15",))
+        for suffix in ("pdf", "docx"):
+            path = self.root / f"time.{suffix}"
+            result = render(content, path, image_root=self.root)
+            text = " ".join(result.text).replace("\xa0", " ")
+            self.assertIn("Start: 09:30", text)
+            self.assertIn("End: 17:45", text)
+            self.assertIn("Total: 8 h 15", text)
+            self.assertNotIn("09:30 End", text)
+            self.assertNotIn("17:45 Total", text)
+            verify(path, expected=content)
