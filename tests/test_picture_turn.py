@@ -677,10 +677,16 @@ class FollowupTests(unittest.IsolatedAsyncioTestCase):
     async def test_failure_keeps_the_version_and_quota_is_refused(self) -> None:
         gateway = FakeGateway("cats")
         first, _ = await self.picture(gateway)
-        gateway.failures = {4: GatewayError("provider_error", 502)}
-        done, changed = await self.change(gateway, first.reponse, "plus grand")
+        from services.orchestrator.pictures import followup
+
+        # A lasting provider failure: the first call and its three retries.
+        gateway.failures = {
+            n: GatewayError("provider_error", 502) for n in (4, 5, 6, 7)
+        }
+        with patch.object(followup, "TRANSIENT_WAITS", (0.0, 0.0, 0.0)):
+            done, changed = await self.change(gateway, first.reponse, "plus grand")
         self.assertTrue(done)
         self.assertIn("inchangée", changed.reponse)
-        gateway.failures = {5: GatewayError("provider_quota", 402, "credit")}
+        gateway.failures = {8: GatewayError("provider_quota", 402, "credit")}
         with self.assertRaises(GatewayError):
             await self.change(gateway, first.reponse, "plus grand")

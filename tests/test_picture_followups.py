@@ -968,6 +968,97 @@ class CodeEngineIdenticalTests(Base):
                 self.assertIn("changé de méthode", changed.reponse)
                 self.assertIn("/versions/2/open", changed.reponse)
 
+    async def test_a_passing_provider_failure_is_tried_again(self) -> None:
+        from test_picture_turn import FakeGateway
+
+        from services.orchestrator import app_turn
+        from services.orchestrator.pictures import followup, turn
+
+        for code in ("provider_error", "incomplete_stream"):
+            with self.subTest(code=code):
+
+                class CutOnce(FakeGateway):
+                    cuts = 0
+
+                    async def __call__(
+                        self, payload: dict[str, Any], seconds: float
+                    ) -> dict[str, Any]:
+                        asked = str(payload["messages"][-1]["content"])
+                        if "Change the picture as asked" in asked and not self.cuts:
+                            self.cuts += 1
+                            raise GatewayError(code, 502)
+                        return await super().__call__(payload, seconds)
+
+                with (
+                    patch.dict(os.environ, {"ATLAS_PICTURES_CPU": ""}),
+                    patch.object(followup, "TRANSIENT_WAITS", (0.0, 0.0, 0.0)),
+                ):
+                    self.assertEqual(len(app_turn.TRANSIENT_WAITS), 3)
+                    gateway = CutOnce("cats")
+                    item = Interaction()
+                    await turn.process_picture_turn(
+                        Request("deux chats sur un banc"), item, complete=gateway
+                    )
+                    picture_set = self.picture_set(item)
+                    changed = Interaction()
+                    await process_picture_followup(
+                        Request("c'est pas ça"),
+                        changed,
+                        current(item.reponse),
+                        complete=gateway,
+                        instruction="Give the bench a green colour.",
+                    )
+                self.assertEqual(gateway.cuts, 1)
+                self.assertNotIn("picture_change_" + code, changed.erreurs)
+                self.assertNotIn("Renvoie ton message", changed.reponse)
+                after = store.load(picture_set.set_id)
+                assert after is not None
+                self.assertEqual(
+                    after.artifact_version, picture_set.artifact_version + 1
+                )
+
+    async def test_a_lasting_provider_failure_keeps_the_version(self) -> None:
+        from test_picture_turn import FakeGateway
+
+        from services.orchestrator.pictures import followup, turn
+
+        class AlwaysCut(FakeGateway):
+            cuts = 0
+
+            async def __call__(
+                self, payload: dict[str, Any], seconds: float
+            ) -> dict[str, Any]:
+                asked = str(payload["messages"][-1]["content"])
+                if "Change the picture as asked" in asked:
+                    self.cuts += 1
+                    raise GatewayError("provider_error", 502)
+                return await super().__call__(payload, seconds)
+
+        with (
+            patch.dict(os.environ, {"ATLAS_PICTURES_CPU": ""}),
+            patch.object(followup, "TRANSIENT_WAITS", (0.0, 0.0, 0.0)),
+        ):
+            gateway = AlwaysCut("cats")
+            item = Interaction()
+            await turn.process_picture_turn(
+                Request("un phare sous la pluie"), item, complete=gateway
+            )
+            picture_set = self.picture_set(item)
+            changed = Interaction()
+            await process_picture_followup(
+                Request("c'est pas ça"),
+                changed,
+                current(item.reponse),
+                complete=gateway,
+                instruction="Make the lighthouse red.",
+            )
+        # The first call and three retries, then the version stays.
+        self.assertEqual(gateway.cuts, 4)
+        self.assertIn("picture_change_provider_error", changed.erreurs)
+        after = store.load(picture_set.set_id)
+        assert after is not None
+        self.assertEqual(after.artifact_version, picture_set.artifact_version)
+
     async def test_identical_twice_keeps_the_version_and_asks_nothing_again(
         self,
     ) -> None:

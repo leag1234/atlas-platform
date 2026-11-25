@@ -45,6 +45,7 @@ from services.orchestrator.pictures.turn import (
     turn_ceiling,
 )
 from services.orchestrator.pictures.worker import PictureJobError, run_job
+from services.orchestrator.app_turn import TRANSIENT_FAILURES, TRANSIENT_WAITS
 
 LOGGER = logging.getLogger(__name__)
 # Largest painter SVG given back to the painter for a change (bytes). A draft
@@ -254,6 +255,7 @@ async def process_picture_followup(
     check_profile = picture_profile("picture_rewrite")
     check_errors: list[str] = []
     tried: list[dict[str, Any]] = []
+    transient_used = 0
     while True:
         payload = {
             "messages": change,
@@ -275,6 +277,23 @@ async def process_picture_followup(
                 # The whole allowance was offered to this one call: a cost or
                 # quota refusal is the user's (D5), said with its measurements.
                 raise
+            if transient_used < len(TRANSIENT_WAITS):
+                # A provider failure that passes (a stream cut, an empty
+                # answer) is tried again while the turn still has room, as
+                # for apps (staging -201: a correction was refused after a
+                # stream cut of 0.13 s).
+                wait = TRANSIENT_WAITS[transient_used]
+                left = limit - (time.monotonic() - started) - 40.0
+                if code in TRANSIENT_FAILURES and left - wait >= 30.0:
+                    transient_used += 1
+                    LOGGER.warning(
+                        "picture_change_retry code=%s retry=%d wait=%.0f",
+                        code,
+                        transient_used,
+                        wait,
+                    )
+                    await asyncio.sleep(wait)
+                    continue
             failure = "picture_change_" + code
         if not failure:
             spend.settle(reply)
