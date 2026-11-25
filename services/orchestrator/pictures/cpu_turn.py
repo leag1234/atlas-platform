@@ -835,22 +835,41 @@ async def change(
                 edited = reference is not None
             except CpuUnavailable:
                 if reference is None:
-                    raise
-                errors.append("picture_cpu_edit_failed")
-                if not allow_redraw:
-                    return no_edit("failed", wanted)
-                # Accepted before: the changed prompt drawn again, if it fits.
-                redrawn_instead = True
-                finished, filtered, timings, attempts = await checked_pictures(
-                    plan,
-                    [seed],
-                    clock=clock,
-                    retry_end=retry_end,
-                    profile=profile,
-                    spend=spend,
-                    call=call,
-                    errors=errors,
-                )
+                    if not (code_ready and allow_redraw):
+                        raise
+                    errors.append("picture_cpu_fallback")
+                    # The server refused the redraw before starting it: the
+                    # accepted change can still be painted by code while the
+                    # turn has time and allowance left.
+                    await _status("code_drawing", language)
+                    by_code = await picture_turn._code_instead(
+                        code_request,
+                        language,
+                        checks,
+                        spend,
+                        clock.deadline,
+                        call,
+                        errors,
+                    )
+                    if by_code is None:
+                        raise
+                    finished, filtered, timings, attempts = [], 0, {}, 0
+                else:
+                    errors.append("picture_cpu_edit_failed")
+                    if not allow_redraw:
+                        return no_edit("failed", wanted)
+                    # Accepted before: the changed prompt drawn again, if it fits.
+                    redrawn_instead = True
+                    finished, filtered, timings, attempts = await checked_pictures(
+                        plan,
+                        [seed],
+                        clock=clock,
+                        retry_end=retry_end,
+                        profile=profile,
+                        spend=spend,
+                        call=call,
+                        errors=errors,
+                    )
             if (
                 code_ready
                 and not code_first

@@ -427,7 +427,7 @@ class FollowUpTests(Base):
         self.assertEqual(after.changes, [])
 
     async def test_an_unchanged_prompt_gets_one_stronger_rewrite(self) -> None:
-        gateway = DialogueGateway(follow_reply("change", "Add a red hat."))
+        gateway = CheckingDialogueGateway(follow_reply("change", "Add a red hat."))
         server = FakeServer()
         first, picture_set = await self.start(gateway, server)
         history = [("user", "un jardinier"), ("assistant", first.reponse)]
@@ -447,7 +447,7 @@ class FollowUpTests(Base):
         self.assertEqual(item.images, [])
 
     async def test_an_identical_picture_makes_no_new_version(self) -> None:
-        gateway = DialogueGateway(follow_reply("change", "Add a red hat."))
+        gateway = CheckingDialogueGateway(follow_reply("change", "Add a red hat."))
         server = EditServer(echo=True)
         first, picture_set = await self.start(gateway, server)
         history = [("user", "un jardinier"), ("assistant", first.reponse)]
@@ -720,7 +720,7 @@ class FollowUpTests(Base):
         )
 
     async def test_a_failed_edit_keeps_the_picture_and_proposes_a_redraw(self) -> None:
-        gateway = DialogueGateway(follow_reply("change", "Add a red hat."))
+        gateway = CheckingDialogueGateway(follow_reply("change", "Add a red hat."))
         server = EditServer(fail_edit=True)
         first, picture_set = await self.start(gateway, server)
         history = [("user", "un jardinier"), ("assistant", first.reponse)]
@@ -747,6 +747,28 @@ class FollowUpTests(Base):
         self.assertIn("Red hat.", server.renders[-1][0])
         self.assertIn("n'a pas été retouchée sur place", again.reponse)
         self.assertIn("/versions/2/open", again.reponse)
+
+    async def test_a_busy_accepted_redraw_is_painted_by_code(self) -> None:
+        gateway = CheckingDialogueGateway(follow_reply("change", "Add a red hat."))
+        server = FakeServer()
+        first, picture_set = await self.start(gateway, server)
+        history = [("user", "un jardinier"), ("assistant", first.reponse)]
+        gateway.reply = rewrite_reply(
+            prompt=FIRST + " He wears a red hat.", checks=["le chapeau est rouge"]
+        )
+        gateway.met = ['{"met": [true, true, true], "seen": ["", "", ""]}']
+        self.accept_redraw(picture_set)
+        server.job_error = "picture_cpu_busy"
+        done, item = await self.follow(gateway, history, "chapeau rouge")
+        self.assertTrue(done)
+        self.assertIn("picture_cpu_busy", item.erreurs)
+        self.assertIn("picture_cpu_fallback", item.erreurs)
+        self.assertIn("/versions/2/open", item.reponse)
+        stored = store.load(picture_set.set_id)
+        assert stored is not None
+        self.assertEqual(stored.artifact_version, 2)
+        self.assertTrue(stored.by_code)
+        self.assertEqual(stored.changes, ["Add a red hat."])
 
     # (d) A review from evidence, never a promise.
 
