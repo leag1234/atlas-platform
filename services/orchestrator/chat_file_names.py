@@ -25,6 +25,78 @@ MAX_ATTEMPTS = 8
 # Numbered copies looked at for one name.
 MAX_COPIES = 500
 
+# A person may name a delivered file by its place in the conversation, in
+# the languages the chat serves. Only the low numbers are unambiguous enough
+# to select one file among several. An ordinal is accepted only when it
+# qualifies a file: the same words can be adverbs, time units or ordinary
+# sequence words elsewhere in a request.
+ORDINALS = {
+    "first": 1,
+    "second": 2,
+    "third": 3,
+    "premier": 1,
+    "première": 1,
+    "deuxième": 2,
+    "troisième": 3,
+    "erste": 1,
+    "zweite": 2,
+    "dritte": 3,
+    "primer": 1,
+    "primera": 1,
+    "segundo": 2,
+    "segunda": 2,
+    "tercer": 3,
+    "tercera": 3,
+    "primo": 1,
+    "prima": 1,
+    "secondo": 2,
+    "seconda": 2,
+    "terzo": 3,
+    "terza": 3,
+}
+
+FILE_NOUNS = {
+    "file",
+    "document",
+    "version",
+    "fichier",
+    "document",
+    "version",
+    "datei",
+    "dokument",
+    "version",
+    "archivo",
+    "documento",
+    "versión",
+    "file",
+}
+
+FORMAT_NOUNS = {
+    "docx",
+    "xlsx",
+    "pptx",
+    "pdf",
+    "csv",
+    "txt",
+    "html",
+    "markdown",
+    "spreadsheet",
+    "presentation",
+    "drawing",
+    "tableur",
+    "présentation",
+    "dessin",
+    "tabelle",
+    "präsentation",
+    "zeichnung",
+    "hoja",
+    "presentación",
+    "dibujo",
+    "foglio",
+    "presentazione",
+    "disegno",
+}
+
 
 def copy_name(relative: str, number: int) -> str:
     """The numbered copy of a name: copy_name("a/tracker.xlsx", 2) is "a/tracker (2).xlsx"."""
@@ -105,6 +177,58 @@ def delivered_file(
         and PurePosixPath(name).name in text
     ]
     return last_delivered(names, answers, project)
+
+
+def named_file(
+    request: str,
+    names: Iterable[str],
+    answers: Iterable[str],
+    project: str,
+) -> str | None:
+    """The delivered file the person names in this request, if exactly one.
+
+    A file may be named by its path, its file name, its stem or its place in
+    the conversation ("the second file"). A title is not stored with the
+    file, so the stem is the only name the file itself carries. The place is
+    the order in which this conversation delivered the candidates. When no
+    candidate is named, or when the words name several, the caller keeps its
+    previous choice.
+    """
+    candidates = list(names)
+    if not candidates:
+        return None
+    text = " ".join(request.split()).casefold()
+    text = re.sub(r"[«»“”„‘’]", " ", text)
+    if not text:
+        return None
+    words = re.findall(r"[\w]+", text)
+    joined = " " + " ".join(words) + " "
+    found: set[str] = set()
+    for name in candidates:
+        path = PurePosixPath(name)
+        for label in dict.fromkeys((name, path.name, path.stem)):
+            label_words = re.findall(r"[\w]+", label.casefold())
+            if label_words and " " + " ".join(label_words) + " " in joined:
+                found.add(name)
+    if not found:
+        delivered = [
+            name
+            for name in candidates
+            if last_delivered([name], answers, project) == name
+        ]
+        for index, word in enumerate(words):
+            number = ORDINALS.get(word)
+            if number is None:
+                continue
+            neighbours = words[max(0, index - 2) : index + 3]
+            if not any(
+                neighbour in FILE_NOUNS or neighbour in FORMAT_NOUNS
+                for neighbour in neighbours
+            ):
+                continue
+            if number <= len(delivered):
+                found.add(delivered[number - 1])
+    return next(iter(found)) if len(found) == 1 else None
 
 
 def folder_names(existing: Mapping[str, Any], folder_id: str) -> set[str]:

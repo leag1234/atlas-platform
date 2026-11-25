@@ -16,6 +16,7 @@ from services.orchestrator.chat_file_names import (
     family,
     free_name,
     last_delivered,
+    named_file,
     publish_copy,
 )
 from services.retrieval.project_identity import ProjectError
@@ -164,6 +165,67 @@ class StaleListingTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertIn("path_conflict", caught.exception.args)
         self.assertEqual(len(self.asked), 8)
+
+
+class NamedFileTests(unittest.TestCase):
+    NAMES = ["atlas-map.docx", "harbor-notes.docx", "garden-plan.docx"]
+    ANSWERS = [
+        "First: " + link("atlas-map.docx"),
+        "Then: " + link("harbor-notes.docx"),
+        "Last: " + link("garden-plan.docx"),
+    ]
+
+    def test_the_file_name_and_the_stem_are_recognised(self) -> None:
+        cases = {
+            "Change Harbor Notes.docx, not the others": "harbor-notes.docx",
+            "Dans « harbor-notes », corrige la deuxième page": "harbor-notes.docx",
+            "Aktualisiere „Garden Plan“ bitte": "garden-plan.docx",
+        }
+        for request, expected in cases.items():
+            with self.subTest(request=request):
+                self.assertEqual(
+                    named_file(request, self.NAMES, self.ANSWERS, PROJECT), expected
+                )
+
+    def test_the_place_in_the_conversation_is_recognised_in_five_languages(
+        self,
+    ) -> None:
+        cases = {
+            "please revise the second file": "harbor-notes.docx",
+            "corrige le deuxième fichier": "harbor-notes.docx",
+            "ändere die zweite Datei": "harbor-notes.docx",
+            "revisa el segundo archivo": "harbor-notes.docx",
+            "modifica il secondo file": "harbor-notes.docx",
+            "change the first file": "atlas-map.docx",
+            "corrige le troisième fichier": "garden-plan.docx",
+        }
+        for request, expected in cases.items():
+            with self.subTest(request=request):
+                self.assertEqual(
+                    named_file(request, self.NAMES, self.ANSWERS, PROJECT), expected
+                )
+
+    def test_an_ambiguous_or_absent_name_leaves_the_choice_to_the_caller(self) -> None:
+        self.assertIsNone(
+            named_file("change the file", self.NAMES, self.ANSWERS, PROJECT)
+        )
+        self.assertIsNone(
+            named_file("change notes and plan", self.NAMES, self.ANSWERS, PROJECT)
+        )
+        self.assertIsNone(named_file("", self.NAMES, self.ANSWERS, PROJECT))
+
+    def test_an_ordinal_not_qualifying_a_file_is_not_a_file_reference(self) -> None:
+        cases = (
+            "prima correggi il titolo",
+            "attend the second, then send the plan",
+            "primero revise el texto y después el plan",
+            "corrige le titre avant la première réunion",
+        )
+        for request in cases:
+            with self.subTest(request=request):
+                self.assertIsNone(
+                    named_file(request, self.NAMES, self.ANSWERS, PROJECT)
+                )
 
 
 class LinkedNameTests(unittest.TestCase):
