@@ -58,7 +58,12 @@ class DeferredCreationTests(unittest.TestCase):
                 self.assertIsNone(settled.file_format)
 
     def test_the_choice_that_follows_still_makes_the_file(self) -> None:
-        routed = Decision(kind="file", file_format="pptx", follow_up=True)
+        routed = Decision(
+            kind="file",
+            file_format="pptx",
+            follow_up=True,
+            changes_delivered=True,
+        )
         self.assertEqual(request_router.settle(NOT_DEFERRED[0], routed), routed)
 
     def test_no_profile_decided(self) -> None:
