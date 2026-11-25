@@ -187,6 +187,10 @@ LABELS = (
     "left and right margins with leader lines to the parts: keep the subject "
     "in the middle three fifths of the picture."
 )
+TEXTS = (
+    "\nExact words to show: write each of these as a real <text> element, "
+    "exactly as given: {texts}. Keep them in every later version."
+)
 # The short plan (2026-11-14, 10 corpus requests, 50 drafts against 40 without
 # it): median reasoning 960 tokens instead of 1310, 90th percentile 1920
 # instead of 4250, cut drafts 1 in 50 instead of 3 in 40, the same share of
@@ -233,7 +237,12 @@ def ids_text(ck: dict[str, Any]) -> str:
 
 
 def messages(
-    request: str, ck: dict[str, Any], *, animal_kit: bool, brief: bool = False
+    request: str,
+    ck: dict[str, Any],
+    *,
+    animal_kit: bool,
+    brief: bool = False,
+    texts: list[str] | None = None,
 ) -> list[dict[str, str]]:
     """System and user messages of one draft."""
     user = FREE_USER.format(subject=request) + NAMED.format(ids=ids_text(ck))
@@ -242,6 +251,8 @@ def messages(
         user += ANIMAL2
     if has_labels(ck):
         user += LABELS
+    if texts:
+        user += TEXTS.format(texts="; ".join(texts))
     if brief:
         user += BRIEF
     return [

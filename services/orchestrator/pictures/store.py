@@ -81,6 +81,8 @@ class PictureSet:
     # The changes applied so far, in order (English instructions): every
     # later change keeps them.
     changes: list[str] = field(default_factory=list)
+    # Every exact text the person asked to have written on the picture.
+    texts: list[str] = field(default_factory=list)
     # The last change edited the picture itself (a server that edits).
     edited: bool = False
     # The statements checked on the current picture and those it misses,

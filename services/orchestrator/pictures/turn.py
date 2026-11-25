@@ -49,7 +49,7 @@ from services.orchestrator.pictures import (
 )
 from services.orchestrator.pictures.routes import choice_url
 from services.orchestrator.pictures.svg_text import extract_svg, salvage
-from services.orchestrator.pictures.texts import answer_language, text
+from services.orchestrator.pictures.texts import answer_language, checklist_texts, text
 from services.orchestrator.pictures.worker import PictureJobError, run_job
 
 LOGGER = logging.getLogger(__name__)
@@ -367,6 +367,7 @@ async def draw(
         ck,
         animal_kit=animal_kit_enabled(),
         brief=brief_plan_enabled(),
+        texts=checklist_texts(ck),
     )
     drafts = [Draft(index) for index in range(painter.DRAFTS + spares)]
     living: dict[str, bool] | None = None
@@ -429,6 +430,7 @@ async def draw(
                 "animal_kit": animal_kit_enabled(),
                 "bounded_contours": bounded_contours_enabled(),
                 "labels_group": painter.labels_group(ck),
+                "texts": checklist_texts(ck),
             },
         )
         if not isinstance(result, dict):
@@ -920,6 +922,7 @@ async def process_picture_turn(
                 picture_set.checklist = ck or {}
                 picture_set.living = dict(candidates[0].get("living") or {})
                 picture_set.current_source = picture_set.candidates[0].source
+                picture_set.texts = checklist_texts(ck)
                 await asyncio.to_thread(store.update, picture_set)
                 await asyncio.to_thread(store.link_artifact, picture_set)
                 item.artifacts = [

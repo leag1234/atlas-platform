@@ -67,6 +67,8 @@ MAX_TURN_CHARS = 700
 MAX_CHANGE_CHARS = 700
 MAX_REQUIREMENTS = 12
 MAX_REQUIREMENT_CHARS = 160
+MAX_TEXTS = 6
+MAX_TEXT_CHARS = 160
 MAX_ITEMS = 6
 MAX_ITEM_CHARS = 200
 FOLLOW_SECONDS = 20.0
@@ -116,8 +118,14 @@ FOLLOW_SYSTEM = (
     "in the language of the user's own words (never English unless they "
     "write English: the statements are shown to the user as they are), the "
     "latest wording when one replaces another.\n"
+    "'texts' (only for kind change): the exact strings the LAST message asks "
+    "to have visible in the picture, each as it must be written. Include "
+    "only strings that must be written in the picture, never a quoted name "
+    "or description of an object; empty when the message asks for no "
+    "visible text. A replacement lists only its new text, never the text it "
+    "replaces.\n"
     'Reply with JSON only: {"kind": "...", "change": "...", '
-    '"requirements": ["..."]}'
+    '"requirements": ["..."], "texts": ["..."]}'
 )
 REVIEW_SYSTEM = (
     "You look at a picture that Atlas drew and compare it with what the user "
@@ -163,6 +171,7 @@ class Understood:
     kind: str
     change: str = ""
     requirements: list[str] = field(default_factory=list)
+    texts: list[str] = field(default_factory=list)
 
 
 def picture_of(request: Any, current: Any) -> store.PictureSet | None:
@@ -245,6 +254,7 @@ def parse_understood(reply: str) -> Understood | None:
         requirements=_strings(
             value.get("requirements"), MAX_REQUIREMENTS, MAX_REQUIREMENT_CHARS
         ),
+        texts=_strings(value.get("texts"), MAX_TEXTS, MAX_TEXT_CHARS),
     )
 
 
@@ -601,6 +611,7 @@ async def follow_up(
             kind="change",
             change=str(request.user_text),
             requirements=understood.requirements,
+            texts=understood.texts,
         )
     if understood.kind != "change":
         # The ordinary routing answers; the reading call is part of its cost.
@@ -626,6 +637,7 @@ async def follow_up(
         complete=complete,
         instruction=change,
         requirements=understood.requirements,
+        texts=understood.texts,
     )
     item.cout_eur = float(Decimal(str(item.cout_eur or 0)) + spend.total)
     if not done:

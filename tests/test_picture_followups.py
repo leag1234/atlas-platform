@@ -46,13 +46,17 @@ REQUIREMENTS = ["a single gardener", "a green coat", "the whole head is visible"
 
 
 def follow_reply(
-    kind: str, change: str = "", requirements: list[str] | None = None
+    kind: str,
+    change: str = "",
+    requirements: list[str] | None = None,
+    texts: list[str] | None = None,
 ) -> str:
     return json.dumps(
         {
             "kind": kind,
             "change": change,
             "requirements": REQUIREMENTS if requirements is None else requirements,
+            "texts": texts or [],
         }
     )
 
@@ -264,6 +268,35 @@ class FollowUpTests(Base):
         return done, item
 
     # (a) Contextual follow-ups take the picture path with their context.
+
+    def test_understood_reads_the_model_declared_texts(self) -> None:
+        understood = dialogue.parse_understood(
+            follow_reply(
+                "change",
+                "Replace the caption with NEBULA CAFE.",
+                texts=["NEBULA CAFE"],
+            )
+        )
+        assert understood is not None
+        self.assertEqual(understood.texts, ["NEBULA CAFE"])
+
+    async def test_only_the_current_texts_are_sent_to_the_painter(self) -> None:
+        from services.orchestrator.pictures import followup
+
+        gateway = DialogueGateway(
+            follow_reply("change", "Replace the caption.", texts=["NEBULA CAFE"])
+        )
+        server = EditServer()
+        first, picture_set = await self.start(gateway, server)
+        picture_set.texts = ["OLD HARBOR"]
+        picture_set.checklist = {"things": []}
+        picture_set.current_source = '<svg xmlns="http://www.w3.org/2000/svg"></svg>'
+        painter_messages, redrawn = followup.messages(
+            picture_set, "Replace the caption.", ["NEBULA CAFE"]
+        )
+        self.assertFalse(redrawn)
+        self.assertIn("NEBULA CAFE", json.dumps(painter_messages, ensure_ascii=False))
+        self.assertNotIn("OLD HARBOR", json.dumps(painter_messages, ensure_ascii=False))
 
     async def test_contentless_follow_ups_carry_the_conversation(self) -> None:
         # Two languages, typos, no visual word in the last message: the

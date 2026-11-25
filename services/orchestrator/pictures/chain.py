@@ -87,7 +87,8 @@ def process_draft(payload: dict[str, Any]) -> dict[str, Any]:
     """One painter draft through the code steps.
 
     Input: svg (recovered text), checklist, living (id -> bool), animal_kit,
-    bounded_contours (finish.bound_contours), labels_group. Output: the final SVG, its 1024 px render, a 512 px render
+    bounded_contours (finish.bound_contours), labels_group, texts (exact
+    words to keep). Output: the final SVG, its 1024 px render, a 512 px render
     for the contact sheet, the ordering measure and a short report.
     """
     from services.orchestrator.pictures import (
@@ -128,6 +129,11 @@ def process_draft(payload: dict[str, Any]) -> dict[str, Any]:
         return (finish.bound_contours(out, ms) if bounded else out), done
 
     svg = _step(report, "finish", svg, finished)
+    texts = [str(value) for value in payload.get("texts") or [] if str(value).strip()]
+    missing = missing_texts(svg, texts)
+    if missing:
+        report["missing_texts"] = missing
+        svg = add_texts(svg, missing)
     final = sanitise(svg)
     picture = render.image(final, PICTURE_PX, background="#ffffff", mode="RGB")
     mime, data = _encode(picture)
@@ -148,6 +154,55 @@ def process_draft(payload: dict[str, Any]) -> dict[str, Any]:
         "source": source,
         "living": living,
     }
+
+
+def _text_values(svg: str) -> list[str]:
+    from xml.etree import ElementTree as ET
+
+    try:
+        root = ET.fromstring(svg)
+    except ET.ParseError:
+        return []
+    return [
+        "".join(element.itertext())
+        for element in root.iter()
+        if element.tag.rsplit("}", 1)[-1] == "text"
+    ]
+
+
+def _folded(value: str) -> str:
+    import unicodedata
+
+    return " ".join(
+        "".join(
+            character
+            for character in unicodedata.normalize("NFKD", value)
+            if not unicodedata.combining(character)
+        )
+        .casefold()
+        .split()
+    )
+
+
+def missing_texts(svg: str, texts: list[str]) -> list[str]:
+    """The requested exact texts absent from the SVG's text elements."""
+    found = {_folded(value) for value in _text_values(svg)}
+    return [text for text in texts if text.strip() and _folded(text) not in found]
+
+
+def add_texts(svg: str, texts: list[str]) -> str:
+    """Add missing exact texts as real SVG text elements."""
+    from xml.sax.saxutils import escape
+
+    if not texts or "</svg>" not in svg:
+        return svg
+    elements = "".join(
+        f'<text x="512" y="{940 - index * 48}" text-anchor="middle" '
+        'font-family="Liberation Sans" font-weight="bold" font-size="36" '
+        f'fill="#111111">{escape(text)}</text>'
+        for index, text in enumerate(texts)
+    )
+    return svg.replace("</svg>", f'<g class="requested-texts">{elements}</g></svg>')
 
 
 def _font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
