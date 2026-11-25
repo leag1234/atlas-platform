@@ -79,7 +79,8 @@ class PresentationRecoveryTests(unittest.IsolatedAsyncioTestCase):
                 item,
             )
         upload.assert_awaited_once()
-        self.assertEqual(len(messages_seen), 1)
+        # The outline call, then the slide-count reading.
+        self.assertEqual(len(messages_seen), 2)
         self.assertFalse(
             any(
                 isinstance(tool, dict)
