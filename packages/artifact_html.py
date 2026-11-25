@@ -8,7 +8,7 @@ import re
 import shutil
 import subprocess
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from packages import linear_scan
@@ -126,6 +126,8 @@ class Problem:
 
     code: str
     line: int
+    # What the check found, for the repair request (the parser's message).
+    detail: str = field(default="", compare=False)
 
 
 CLASSIC_SCRIPT_TYPES = frozenset(
@@ -134,7 +136,14 @@ CLASSIC_SCRIPT_TYPES = frozenset(
 
 
 def script_syntax_error(text: str) -> str | None:
-    """The syntax error of a classic script, or None when it parses.
+    """The syntax error of a classic script, or None when it parses."""
+    found = script_syntax_location(text)
+    return found[0] if found is not None else None
+
+
+def script_syntax_location(text: str) -> tuple[str, int] | None:
+    """The syntax error of a classic script and its line in the script (0 when
+    unknown), or None when it parses.
 
     A script that does not parse leaves the app without its behaviour (staging
     2026-11-10: a missing brace, the page showed its title and no controls). The
@@ -160,7 +169,12 @@ def script_syntax_error(text: str) -> str | None:
     if result.returncode == 0:
         return None
     match = re.search(r"SyntaxError: (.*)", result.stderr)
-    return (match.group(1) if match else "syntax error")[:80]
+    # Node.js names the file and the line first ("/tmp/x/script.js:12").
+    where = re.search(r"script\.js:(\d+)", result.stderr)
+    return (
+        (match.group(1) if match else "syntax error")[:80],
+        int(where.group(1)) if where else 0,
+    )
 
 
 class _Validator(html.parser.HTMLParser):
@@ -288,8 +302,16 @@ class _Validator(html.parser.HTMLParser):
                 self._add_script_problem(match.start(), "external_reference")
         for match in LOCATION_ASSIGNMENT_PATTERN.finditer(text):
             self._add_script_problem(match.start(), "navigation_api")
-        if self._script_classic and script_syntax_error(text) is not None:
-            self.problems.append(Problem("script_syntax", self._script_start))
+        found = script_syntax_location(text) if self._script_classic else None
+        if found is not None:
+            # The repair request names the parser's message and the line where
+            # it stopped: "this script does not parse" alone left the writer to
+            # guess, and its second file failed the same way (staging -198).
+            message, offset = found
+            where = f" at line {self._script_start + offset - 1}" if offset else ""
+            self.problems.append(
+                Problem("script_syntax", self._script_start, f"{message}{where}")
+            )
         self._script_text = []
 
     def _find_script_problem(self, text: str, pattern: str, code: str) -> None:
