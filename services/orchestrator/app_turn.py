@@ -70,7 +70,7 @@ from services.orchestrator.artifact_tools import (
 )
 from services.orchestrator.chat_schema import ChatRequest
 from services.orchestrator.interactions import Interaction
-from services.orchestrator.loop import GatewayError, Message
+from services.orchestrator.loop import GatewayError, Message, Turn
 from services.orchestrator.model import GatewayModel
 from services.orchestrator.stream_client import Sink, sink_context
 from services.orchestrator.work_plan import ChatPlan
@@ -88,6 +88,23 @@ MAX_CALLS = 2
 DEADLINE_MARGIN = 8.0
 # A call that cannot write a file in less is not started.
 MINIMUM_CALL_SECONDS = 25.0
+# A provider failure that a new call may not meet (a broken stream, a refusal for
+# capacity, a 5xx) is tried again after these waits while the turn's time allows,
+# without using one of the MAX_CALLS writes. Staging 2026-11-24: three 429 answers
+# in 4 s used every write of an app turn, which then asked the person to resend
+# with about 120 s of its time left.
+TRANSIENT_FAILURES = frozenset(
+    {
+        "provider_error",
+        "gateway_stream_error",
+        "gateway_unavailable",
+        "incomplete_stream",
+        "invalid_stream",
+        "empty_completion",
+        "incomplete_provider_answer",
+    }
+)
+TRANSIENT_WAITS = (2.0, 5.0, 10.0)
 PROGRESS_SECONDS = 1.0
 HISTORY_MESSAGES = 12
 HISTORY_CHARS = 6000
@@ -656,6 +673,9 @@ def _problem_lines(problems: list[Problem], source: str) -> str:
                     "this atlas-media reference does not exist, use only the "
                     "references Atlas listed: " + detail
                 )
+        if problem.detail:
+            # The checker's own finding (the parser's message and line).
+            detail = f"{detail} ({problem.detail})" if detail else problem.detail
         rendered.append(f"- line {problem.line}: {problem.code}: {detail or ''}")
     return "\n".join(rendered)
 
@@ -977,6 +997,7 @@ async def process_app_turn(
         # Unmet requirements may take one more repair (expectations.MAX_REPAIRS
         # in all), within the turn's time.
         calls = MAX_CALLS + (1 if expect is not None and expect.checks else 0)
+        retries = Retries()
         for attempt in range(calls):
             remaining = deadline - time.monotonic() - DEADLINE_MARGIN
             if remaining < MINIMUM_CALL_SECONDS:
@@ -994,12 +1015,11 @@ async def process_app_turn(
                     "artifact_unmet",
                 }
                 await progress.status(3 if repair else 0)
-            # The gateway accepts at most 300 s for a file turn.
-            remaining = min(remaining, 290.0)
             call_started = time.monotonic()
             try:
-                async with asyncio.timeout(remaining):
-                    turn = await model.complete(messages, remaining)
+                turn = await _complete(
+                    model, messages, deadline, progress, item, retries
+                )
                 last_call_seconds = time.monotonic() - call_started
             except TimeoutError:
                 failure, timed_out = "timeout", True
@@ -1008,7 +1028,6 @@ async def process_app_turn(
                 if exc.code in BUDGET_CODES:
                     raise
                 failure = exc.code
-                item.provider_retries += exc.retries
                 logging.getLogger(__name__).warning(
                     "app_turn_call_failed code=%s attempt=%d", exc.code, attempt + 1
                 )
@@ -1339,6 +1358,7 @@ async def process_app_turn(
                 language,
                 timeout=timed_out,
                 unchanged_version=previous.version if previous is not None else None,
+                cause=failure_cause(failure),
             )
         )
         item.state = "done"
@@ -1485,8 +1505,66 @@ def _fail(
         language,
         timeout=timed_out,
         unchanged_version=previous.version if previous is not None else None,
+        cause=failure_cause(code),
     )
     item.state = "done"
+
+
+@dataclass
+class Retries:
+    """The transient retries a turn has used (at most len(TRANSIENT_WAITS))."""
+
+    used: int = 0
+
+
+def failure_cause(code: str) -> Literal["checks", "provider"] | None:
+    """The cause the failure sentence names: files that never passed the checks,
+    or a model service that kept failing (user_errors.app_failure)."""
+    if code == "artifact_invalid":
+        return "checks"
+    if code in TRANSIENT_FAILURES:
+        return "provider"
+    return None
+
+
+async def _complete(
+    model: GatewayModel,
+    messages: list[Message],
+    deadline: float,
+    progress: Progress,
+    item: Interaction,
+    retries: Retries,
+) -> Turn:
+    """One write of the file. A transient provider failure is tried again
+    (TRANSIENT_WAITS, counted for the whole turn) while a call still fits the
+    turn; any other failure, or the last one, is raised to the caller."""
+    while True:
+        # The gateway accepts at most 300 s for a file turn.
+        remaining = min(deadline - time.monotonic() - DEADLINE_MARGIN, 290.0)
+        try:
+            async with asyncio.timeout(remaining):
+                return await model.complete(messages, remaining)
+        except (GatewayError, RuntimeError, ValueError) as exc:
+            code = exc.code if isinstance(exc, GatewayError) else str(exc)
+            if isinstance(exc, GatewayError):
+                item.provider_retries += exc.retries
+            if code not in TRANSIENT_FAILURES or retries.used >= len(TRANSIENT_WAITS):
+                raise
+            wait = TRANSIENT_WAITS[retries.used]
+            if deadline - time.monotonic() - DEADLINE_MARGIN - wait < (
+                MINIMUM_CALL_SECONDS
+            ):
+                raise
+            retries.used += 1
+            item.provider_retries += 1
+            logging.getLogger(__name__).warning(
+                "app_turn_call_retry code=%s retry=%d wait=%.0f",
+                code,
+                retries.used,
+                wait,
+            )
+            await asyncio.sleep(wait)
+            progress.restart()
 
 
 # Next to the plan's "change the app" step when the code came back identical.

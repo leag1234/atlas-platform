@@ -20,6 +20,7 @@ from unittest.mock import AsyncMock, patch
 from packages.limits import LimitError
 from packages.user_errors import app_failure, app_quota
 from services.orchestrator import artifact_store
+from services.orchestrator import app_turn as app_turn_module
 from services.orchestrator.app_turn import output_tokens, process_app_turn
 from services.orchestrator.artifact_tools import current_artifact_message, footer
 from services.orchestrator.chat_schema import ChatRequest
@@ -56,6 +57,18 @@ STOP_TEXT = (
 
 def answer(code: str, fence: str = "html", after: str = "Cliquez sur Démarrer.") -> str:
     return f"```{fence}\n{code}\n```\n{after}"
+
+
+# No real waits between the transient retries of a write.
+_NO_WAITS = patch.object(app_turn_module, "TRANSIENT_WAITS", (0.0, 0.0, 0.0))
+
+
+def setUpModule() -> None:
+    _NO_WAITS.start()
+
+
+def tearDownModule() -> None:
+    _NO_WAITS.stop()
 
 
 class FakeModel:
@@ -498,18 +511,19 @@ class AppTurnTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_every_failure_ends_with_one_readable_sentence(self) -> None:
         failed = app_failure("app", "fr")
+        checks = app_failure("app", "fr", cause="checks")
+        # A broken provider answer is tried again (TRANSIENT_WAITS) before a
+        # write counts as failed: three retries, then the second write.
+        retried = len(app_turn_module.TRANSIENT_WAITS) + 2
         cases: dict[str, tuple[list[object], str, str]] = {
             "invalid content twice": (
                 [answer(DIALOG), answer(DIALOG)],
-                failed,
+                checks,
                 "artifact_invalid",
             ),
             "provider error twice": (
-                [
-                    GatewayError("provider_error", 502, STOP_TEXT),
-                    GatewayError("provider_error", 502, STOP_TEXT),
-                ],
-                failed,
+                [GatewayError("provider_error", 502, STOP_TEXT)] * retried,
+                app_failure("app", "fr", cause="provider"),
                 "provider_error",
             ),
             "invalid tool arguments": (
@@ -527,7 +541,7 @@ class AppTurnTests(unittest.IsolatedAsyncioTestCase):
             ),
             "cut answer": (
                 ["```html\n<!DOCTYPE html><html><body>", answer(DIALOG)],
-                failed,
+                checks,
                 "artifact_invalid",
             ),
             "output limit": (
@@ -566,7 +580,7 @@ class AppTurnTests(unittest.IsolatedAsyncioTestCase):
                 current=None,
             )
         self.assertEqual(item.state, "done")
-        self.assertEqual(item.reponse, app_failure("app", "en"))
+        self.assertEqual(item.reponse, app_failure("app", "en", cause="provider"))
         self.assertIn("provider_error", item.erreurs)
 
     async def test_failed_change_keeps_the_version(self) -> None:
@@ -587,7 +601,10 @@ class AppTurnTests(unittest.IsolatedAsyncioTestCase):
             intent="modify",
         )
         self.assert_readable(item)
-        self.assertEqual(item.reponse, app_failure("app", "fr", unchanged_version=1))
+        self.assertEqual(
+            item.reponse,
+            app_failure("app", "fr", unchanged_version=1, cause="checks"),
+        )
         self.assertIn("version 1 reste inchangée", item.reponse)
 
     async def test_no_time_left_is_a_deadline_sentence(self) -> None:
@@ -668,6 +685,7 @@ class AppTurnStreamTests(unittest.IsolatedAsyncioTestCase):
             [
                 GatewayError("provider_error", 502, STOP_TEXT),
                 RuntimeError("invalid_tool_arguments"),
+                RuntimeError("gateway_stream_failure"),
             ],
             [answer(DIALOG), answer(DIALOG)],
             [TimeoutError()],
@@ -680,6 +698,7 @@ class AppTurnStreamTests(unittest.IsolatedAsyncioTestCase):
                     text.strip(),
                     {
                         app_failure("app", "fr"),
+                        app_failure("app", "fr", cause="checks"),
                         app_failure("app", "fr", timeout=True),
                     },
                 )

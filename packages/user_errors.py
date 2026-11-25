@@ -305,6 +305,39 @@ _UNCHANGED = {
 }
 
 
+# Why the file was not made, said in the failure sentence (owner rule: a change
+# that was not applied says its real cause). "checks": every file written failed
+# Atlas's checks; "provider": the model service kept failing (app_turn
+# retries a transient failure first, TRANSIENT_WAITS).
+_APP_CAUSES = {
+    "checks": {
+        "fr": "le code écrit ne passait pas les vérifications d'Atlas",
+        "en": "the code written did not pass Atlas's checks",
+        "de": "der geschriebene Code hat die Prüfungen von Atlas nicht bestanden",
+        "es": "el código escrito no superó las comprobaciones de Atlas",
+        "it": "il codice scritto non ha superato le verifiche di Atlas",
+    },
+    "provider": {
+        "fr": "le service du modèle n'a pas répondu",
+        "en": "the model service did not answer",
+        "de": "der Modelldienst hat nicht geantwortet",
+        "es": "el servicio del modelo no respondió",
+        "it": "il servizio del modello non ha risposto",
+    },
+}
+
+
+def _with_cause(sentence: str, cause: str) -> str:
+    """The cause in brackets at the end of the sentence's first clause."""
+    end = min(
+        (index for index in (sentence.find("."), sentence.find(";")) if index > 0),
+        default=len(sentence),
+    )
+    head = sentence[:end]
+    space = head[len(head.rstrip()) :]
+    return f"{head.rstrip()} ({cause}){space}{sentence[end:]}"
+
+
 @_in_register
 def app_failure(
     kind: Literal["app", "drawing"],
@@ -312,14 +345,21 @@ def app_failure(
     *,
     timeout: bool = False,
     unchanged_version: int | None = None,
+    cause: Literal["checks", "provider"] | None = None,
 ) -> str:
-    """One readable sentence ending a failed app or drawing turn, with a retry."""
+    """One readable sentence ending a failed app or drawing turn, with its cause
+    when known and a retry."""
     if unchanged_version is not None:
-        return _UNCHANGED.get(language, _UNCHANGED["en"]).format(
+        sentence = _UNCHANGED.get(language, _UNCHANGED["en"]).format(
             version=unchanged_version
         )
-    labels = (_APP_TOO_LONG if timeout else _APP_FAILED)[kind]
-    return labels.get(language, labels["en"])
+    else:
+        labels = (_APP_TOO_LONG if timeout else _APP_FAILED)[kind]
+        sentence = labels.get(language, labels["en"])
+    if cause is None or (timeout and unchanged_version is None):
+        return sentence
+    reasons = _APP_CAUSES[cause]
+    return _with_cause(sentence, reasons.get(language, reasons["en"]))
 
 
 # The render check (services/orchestrator/app_render.py) opened the app twice
