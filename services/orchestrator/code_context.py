@@ -1,10 +1,10 @@
 """The code the conversation already holds, for "run it" and "run it with X changed".
 
 A request to run "the snippet above", or to run it with one value changed,
-names no file: the code is in an earlier message, the person's or the
-assistant's. The Work step starts in an empty workspace, so the request is
-completed with the latest code block of the conversation and the message it
-came from. Two blocks: the latest wins and the step is told which one it is.
+names no file: the code is in an earlier message. The Work step starts in an
+empty workspace, so the request is completed with the latest code block. A
+person's block stays eligible; an assistant block is code only when tagged with
+a programming language, because an untagged or text/console block is output.
 """
 
 from __future__ import annotations
@@ -59,10 +59,18 @@ def code_of(text: str) -> str:
     return _bare_block(text)
 
 
+def _assistant_code_of(text: str) -> str:
+    """The last assistant block that is code, not rendered output."""
+    for _, language, code in reversed(_FENCED.findall(text)):
+        if language and language.lower() not in {"text", "txt", "console", "output"}:
+            return str(code).strip()
+    return ""
+
+
 def last_code(messages: Sequence[tuple[str, str]]) -> tuple[str, str, int] | None:
-    """(role, code, messages back) of the latest code of a conversation."""
+    """(role, code, messages back) of the latest code block."""
     for back, (role, text) in enumerate(reversed(messages), start=1):
-        code = code_of(text)
+        code = code_of(text) if role == "user" else _assistant_code_of(text)
         if code:
             return role, code[:MAX_CHARACTERS], back
     return None
