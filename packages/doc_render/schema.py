@@ -13,8 +13,24 @@ from pydantic import (
     model_validator,
 )
 
-from .cells import SHEET_COLUMNS, Reading, plain, read_table, shown
+from .cells import (
+    MONEY,
+    SHEET_COLUMNS,
+    Reading,
+    NUMBER_START,
+    plain,
+    read_table,
+    shown,
+)
 from .glyphs import adapt
+from .spacing import UNITS
+
+_VALUE = re.compile(
+    rf"[+\-−]?\s*(?:(?:{MONEY})\s*)?[+\-−]?\d(?:[\d.,]*\d)?"
+    r"(?::\d(?:[\d.,]*\d)?)?"
+)
+_CURRENCY = re.compile(rf"(?:{MONEY})")
+_SUMMARY_UNIT = re.compile(rf"(?:{MONEY}|%|‰|(?:{UNITS}))")
 
 
 def font_spaces(value: str) -> str:
@@ -147,6 +163,52 @@ def label(line: str) -> str | None:
     if not text or text.endswith((".", "!", "?")) or len(text.split()) > LABEL_WORDS:
         return None
     return text
+
+
+def split_summary(text: str) -> tuple[str, ...]:
+    """A paragraph of several summary values as one line for each.
+
+    A model may write "Subtotal: 10 Tax: 2 Total: 12" as one paragraph. The
+    renderer wraps it between words, possibly inside a value. A paragraph
+    made only of such pairs is split before layout; each label stays with
+    its value and the final total is emphasized.
+    """
+    displayed = plain(text)
+    if displayed.count(":") < 2:
+        return (text,)
+    # A time ("09:30") keeps its colon; only a label colon separates pairs.
+    pieces = re.split(r"(?<!\d):(?!\d)", displayed)
+    if len(pieces) < 3:
+        return (text,)
+    lines = []
+    label = pieces[0].strip()
+    for piece in pieces[1:]:
+        following = piece.split()
+        start = 0
+        if (
+            len(following) > 1
+            and _CURRENCY.fullmatch(following[0])
+            and NUMBER_START.match(following[1])
+        ):
+            start = 1
+        if not following[start:] or not NUMBER_START.match(following[start]):
+            return (text,)
+        end = start + 1
+        while end < len(following) and (
+            _VALUE.fullmatch(following[end]) or _SUMMARY_UNIT.fullmatch(following[end])
+        ):
+            end += 1
+        value, label_words = following[:end], following[end:]
+        if not label or not label_words and piece is not pieces[-1]:
+            return (text,)
+        lines.append(f"{label}: {' '.join(value)}")
+        label = " ".join(label_words)
+    if label:
+        return (text,)
+    return tuple(
+        f"**{line}**" if index == len(lines) - 1 else line
+        for index, line in enumerate(lines)
+    )
 
 
 class Section(ContentModel):
@@ -288,9 +350,18 @@ class Content(ContentModel):
         chart the table of its numbers: nothing written for a deck is lost
         in a DOCX, a PDF or a workbook.
         """
-        if not any(section.slide_only() for section in self.sections):
-            return self
         value = self.model_dump(mode="json")
+        for section, data in zip(self.sections, value["sections"], strict=True):
+            data["paragraphs"] = [
+                line
+                for paragraph in data["paragraphs"]
+                for line in split_summary(paragraph)
+            ]
+            data["bullets"] = [
+                line for bullet in data["bullets"] for line in split_summary(bullet)
+            ]
+        if not any(section.slide_only() for section in self.sections):
+            return Content.model_validate(value)
         for section, data in zip(self.sections, value["sections"], strict=True):
             data["paragraphs"] = [*data["paragraphs"], *data.pop("notes")]
             data["bullets"] = [
