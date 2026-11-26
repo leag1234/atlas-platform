@@ -115,6 +115,11 @@ _FILESYSTEM_TAG = linear_scan.Scan(
 )
 
 
+# The deadline of a turn that makes a file, an app or a picture, or that Work
+# answers behind the chat, whether it was routed there or handed over later.
+ROUTED_SECONDS = 300.0
+
+
 class ChatRequest(VisionInput):
     model_config = ConfigDict(extra="ignore", strict=True)
     location: Location | None = Field(default=None, exclude=True, repr=False)
@@ -355,7 +360,7 @@ class ChatRequest(VisionInput):
         # the lexical file and Work tests (ATLAS_MODEL_ROUTER=1).
         routed = decision(self)
         return (
-            300.0
+            ROUTED_SECONDS
             if self.has_attachments
             or (
                 routed.kind == "file"

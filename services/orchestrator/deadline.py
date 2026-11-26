@@ -74,20 +74,21 @@ def extend(seconds: float) -> None:
         deadline.reschedule(when + seconds)
 
 
-def extend_for_path(request: "ChatRequest") -> None:
+def extend_for_path(request: "ChatRequest", total: float | None = None) -> None:
     """Give a late handoff the deadline its direct route would have had.
 
     A turn can be read as a plain chat answer, then handed to Work, an app or a
     file path after the deadline was set. The handoff must never shorten the
     deadline; it moves it to the full allowance of the path, minus the time
-    already spent.
+    already spent. `total` gives that allowance when the request alone does
+    not show the new path (a plain answer handed to Work after routing).
     """
     deadline = _current.get()
     before = deadline.when() if deadline is not None else None
     started = _started.get()
     if deadline is None or before is None or started is None:
         return
-    wanted = started + request.timeout_seconds
+    wanted = started + (request.timeout_seconds if total is None else total)
     if wanted > before:
         deadline.reschedule(wanted)
 

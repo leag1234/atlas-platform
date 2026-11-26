@@ -650,9 +650,13 @@ async def _escalate(request: ChatRequest, item: Interaction) -> bool:
             ],
         }
     )
+    from services.orchestrator.chat_schema import ROUTED_SECONDS
     from services.orchestrator.deadline import extend_for_path
 
-    extend_for_path(request)
+    # The request may still read as a plain answer (about 120 s): a turn Work
+    # answers behind the chat gets the routed Work allowance (staging -205, a
+    # deck change cut at 132 s with an empty answer).
+    extend_for_path(request, total=ROUTED_SECONDS)
     scoped._project_subject = subject
     scoped.__dict__["approvals_unattended"] = True
     # The project is shared by all of this person's chats: a name another

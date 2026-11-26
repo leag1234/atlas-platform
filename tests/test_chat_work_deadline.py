@@ -235,6 +235,40 @@ class OwnDeadlineCutTests(unittest.IsolatedAsyncioTestCase):
                 assert left is not None
                 self.assertTrue(left >= 299.9)
 
+    async def test_a_plain_answer_handed_to_work_gets_the_routed_allowance(
+        self,
+    ) -> None:
+        from services.orchestrator.chat_schema import ROUTED_SECONDS
+        from services.orchestrator.deadline import extend_for_path
+
+        req = request(
+            "Gardez les trois autres diapositives telles quelles.",
+            lang="fr",
+            continuation=True,
+        )
+        with patch.dict(
+            os.environ, {"ATLAS_MODEL_ROUTER": "0", "ATLAS_CHAT_WORK": "0"}
+        ):
+            self.assertLess(req.timeout_seconds, ROUTED_SECONDS)
+            async with request_deadline(req.timeout_seconds):
+                await asyncio.sleep(0.01)
+                extend_for_path(req)
+                before = remaining()
+                assert before is not None
+                self.assertLess(before, ROUTED_SECONDS - 1)
+                extend_for_path(req, total=ROUTED_SECONDS)
+                left = remaining()
+                assert left is not None
+                self.assertTrue(left >= ROUTED_SECONDS - 0.5)
+
+    async def test_the_work_handoff_asks_for_the_routed_allowance(self) -> None:
+        import inspect
+
+        from services.orchestrator import chat_work
+
+        source = inspect.getsource(chat_work._escalate)
+        self.assertIn("extend_for_path(request, total=ROUTED_SECONDS)", source)
+
     async def test_late_handoff_never_shortens_deadline(self) -> None:
         from services.orchestrator.deadline import extend_for_path
 
