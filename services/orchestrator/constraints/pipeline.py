@@ -76,6 +76,102 @@ def mode() -> str:
     return value if value in {"off", "code", "full"} else "code"
 
 
+def before_enabled() -> bool:
+    value = os.environ.get("ATLAS_CONSTRAINTS_BEFORE", "off").strip().casefold()
+    return value == "on"
+
+
+def block(items: Sequence[Constraint]) -> str:
+    """The numbered constraints the answer model sees, in the person's words."""
+    if not items:
+        return ""
+    lines = ["Constraints of this request, all must hold:"]
+    lines.extend(f"{index}. {item.quote}" for index, item in enumerate(items, 1))
+    return "\n".join(lines)
+
+
+async def read_before(
+    messages: Sequence[tuple[str, str]],
+    *,
+    profile: str,
+    strict: bool,
+    seconds: float,
+    complete: COMPLETE | None = None,
+    spend: Callable[[Decimal], None] | None = None,
+    model: Any = None,
+) -> tuple[list[Constraint], float]:
+    """Read constraints before the answer call; a failure never blocks it."""
+    started = time.monotonic()
+    person = [text for role, text in messages if role == "user"]
+    if not person:
+        return [], 0.0
+    turn = len(person)
+    latest = person[-1]
+    shown = next(
+        (text for role, text in reversed(messages[:-1]) if role == "assistant"), ""
+    )
+    found = phrases.read(latest, turn)
+    if mode() == "full" and phrases.worth_reading(latest) and seconds > MIN_SECONDS:
+        room = getattr(model, "reasoning_room", 0)
+        calls = _Calls(
+            profile,
+            strict,
+            complete,
+            spend,
+            room if isinstance(room, int) and not isinstance(room, bool) else 0,
+            model=model,
+        )
+        try:
+            read = await calls.json(
+                verify.reading_messages(person, shown, found),
+                verify.READ_TOKENS,
+                min(READ_SECONDS, seconds),
+                lambda reply: verify.parse_reading(reply, turn, person, shown),
+            )
+        except Exception:
+            log.exception("constraints_before reading failed")
+            read = []
+        found = verify.deduplicated(found, read or [])
+    items = merged(part_scoped(consistent(applicable(found, turn))))
+    return items, (time.monotonic() - started) * 1000
+
+
+async def before_messages(
+    messages: Sequence[tuple[str, str]],
+    *,
+    profile: str,
+    strict: bool,
+    seconds: float,
+    complete: COMPLETE | None = None,
+    spend: Callable[[Decimal], None] | None = None,
+    model: Any = None,
+) -> tuple[list[dict[str, Any]], float]:
+    """The constraint block as the last contextual block before writing."""
+    if not before_enabled():
+        return [], 0.0
+    items, latency_ms = await read_before(
+        messages,
+        profile=profile,
+        strict=strict,
+        seconds=seconds,
+        complete=complete,
+        spend=spend,
+        model=model,
+    )
+    log.info(
+        json.dumps(
+            {
+                "event": "constraints_before",
+                "count": len(items),
+                "latency_ms": round(latency_ms, 2),
+            }
+        )
+    )
+    if not items:
+        return [], latency_ms
+    return [{"role": "system", "content": block(items)}], latency_ms
+
+
 def holds(text: str) -> bool:
     """Whether the reply to this message is held until it is checked: code
     found a constraint on the reply, or (full mode) the model reading may."""
@@ -157,10 +253,12 @@ class _Calls:
         complete: COMPLETE | None,
         spend: Callable[[Decimal], None] | None,
         reasoning_room: int = 0,
+        model: Any = None,
     ) -> None:
         self.profile = profile
         self.strict = strict
         self.complete = complete
+        self.model = model
         self.spend = spend
         self.reasoning_room = reasoning_room
         self.count = 0
@@ -218,7 +316,15 @@ class _Calls:
         }
         if self.strict:
             payload["privacy"] = "strict"
-        call = self.complete or _complete
+        if self.complete is not None:
+            call = self.complete
+        elif self.model is not None:
+
+            async def call(payload: dict[str, Any], seconds: float) -> dict[str, Any]:
+                turn = await self.model.complete(payload["messages"], seconds)
+                return {"text": turn.text, "cost_eur": str(turn.reservation.cost)}
+        else:
+            call = _complete
         self.count += 1
         try:
             async with asyncio.timeout(seconds + 3):

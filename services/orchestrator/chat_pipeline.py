@@ -2727,6 +2727,19 @@ async def _process(
         await process_vision(request, item)
         return
     started = time.monotonic()
+    from services.orchestrator.constraints import pipeline as answer_constraints
+
+    constraint_messages: list[Message] = []
+    constraint_ms = 0.0
+    if not request.user_text.lstrip().startswith("### Task:"):
+        constraint_messages, constraint_ms = await answer_constraints.before_messages(
+            [(message.role, message.text) for message in request.messages],
+            profile=request.model,
+            strict=privacy.owned_only(),
+            seconds=request.timeout_seconds,
+        )
+        if constraint_ms:
+            item.latence_ms["constraints_before"] = constraint_ms
     model = await GatewayModel.connect(
         os.environ.get("ATLAS_GATEWAY_URL", atlas_ports().url("gateway")),
         local_enabled=os.environ.get("GPU_LOCAL", "0") == "1",
@@ -3185,9 +3198,10 @@ async def _process(
             include_intermediate=request.atlas_ui,
             final_only=answer_only,
             history=attachment_history,
-            skill_messages=tools.skills.instructions
-            if tools.skills is not None
-            else None,
+            skill_messages=(
+                tools.skills.instructions if tools.skills is not None else []
+            ),
+            final_messages=constraint_messages,
             retry_web=True,
             initial_calls=discovery,
             terminal_tools=(
@@ -3365,9 +3379,12 @@ async def _process(
                         ),
                         include_intermediate=request.atlas_ui,
                         history=recovery_history,
-                        skill_messages=tools.skills.instructions
-                        if tools.skills is not None
-                        else None,
+                        skill_messages=(
+                            tools.skills.instructions
+                            if tools.skills is not None
+                            else []
+                        ),
+                        final_messages=constraint_messages,
                     )
                     result.cost += first_result.cost
                     result.tool_calls += first_result.tool_calls

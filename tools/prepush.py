@@ -76,6 +76,7 @@ GENERIC_NAMES = {
     "requirements.txt",
 }
 TEST_ENV = {  # same defaults as scripts/test.sh
+    "ATLAS_CONSTRAINTS_BEFORE": "off",
     "ATLAS_IMAGE_GPU_IP": "127.0.0.9",
     "ATLAS_IMAGE_GPU_EUR_H": "0.7875",
     "PYTHONPATH": "services/model-gateway:services/edge-bff",

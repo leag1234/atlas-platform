@@ -698,6 +698,19 @@ async def process_scoped_project(request: ChatRequest, item: Interaction) -> Non
                 if context_tools.skills is not None
                 else []
             ) + ([{"role": "system", "content": guidance}] if guidance else [])
+            from services.orchestrator.constraints import pipeline as answer_constraints
+
+            (
+                constraint_messages,
+                constraint_ms,
+            ) = await answer_constraints.before_messages(
+                [(message.role, message.text) for message in request.messages],
+                profile=request.model,
+                strict=model.privacy == "strict",
+                seconds=request.timeout_seconds,
+            )
+            if constraint_ms:
+                item.latence_ms["constraints_before"] = constraint_ms
             result = await run(
                 Query(question=request.user_text, lang=scoped.lang),
                 model,
@@ -715,7 +728,8 @@ async def process_scoped_project(request: ChatRequest, item: Interaction) -> Non
                 ),
                 history=[dict(role=m.role, content=m.text) for m in history[:-1]],
                 references=references,
-                skill_messages=skill_messages or None,
+                skill_messages=skill_messages,
+                final_messages=constraint_messages,
             )
             tool_calls = result.tool_calls
             item.state, item.cout_eur = result.state, float(result.cost)

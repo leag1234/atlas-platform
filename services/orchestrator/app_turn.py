@@ -867,6 +867,17 @@ async def process_app_turn(
         model.reasoning_ceiling = "none"
         model.cost_ceiling = cost_limit
         model.sink = progress
+        from services.orchestrator.constraints import pipeline as answer_constraints
+
+        constraint_messages, constraint_ms = await answer_constraints.before_messages(
+            [(message.role, message.text) for message in request.messages],
+            profile=request.model,
+            strict=privacy.owned_only(),
+            seconds=deadline - time.monotonic(),
+            model=model,
+        )
+        if constraint_ms:
+            item.latence_ms["constraints_before"] = constraint_ms
         messages: list[Message] = [
             {
                 "role": "system",
@@ -996,6 +1007,7 @@ async def process_app_turn(
             # The expected result, stated before the file is written.
             messages.append({"role": "system", "content": expect.brief()})
         messages.append({"role": "user", "content": request.messages[-1].text})
+        messages.extend(constraint_messages)
         # Unmet requirements may take one more repair (expectations.MAX_REPAIRS
         # in all), within the turn's time.
         calls = MAX_CALLS + (1 if expect is not None and expect.checks else 0)
@@ -1087,6 +1099,7 @@ async def process_app_turn(
                     {"role": "assistant", "content": text or "(empty)"},
                     {"role": "user", "content": NO_BLOCK_REPAIR.format(fence=fence)},
                 ]
+                messages.extend(constraint_messages)
                 continue
             await progress.status(2)
             if plan is not None:
@@ -1152,6 +1165,7 @@ async def process_app_turn(
                         + told_current(),
                     },
                 ]
+                messages.extend(constraint_messages)
                 continue
             document = artifact_media.embed(prepared.document, media)
             if kind == "app":
@@ -1205,6 +1219,7 @@ async def process_app_turn(
                                 + told_current(),
                             },
                         ]
+                        messages.extend(constraint_messages)
                         continue
                     soft = report.codes
                 # A follow-up keeps every feature of the version it changes
@@ -1328,6 +1343,7 @@ async def process_app_turn(
                             + told_current(),
                         },
                     ]
+                    messages.extend(constraint_messages)
                     continue
             else:
                 pending = Candidate(document, title, summary, block.content)
