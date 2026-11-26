@@ -58,6 +58,13 @@ from typing import Any
 
 from packages import addressing
 
+
+def _reasoning_room(model: object) -> int:
+    """The model's reasoning allowance for check calls; 0 when unknown."""
+    room = getattr(model, "reasoning_room", 0)
+    return room if isinstance(room, int) and not isinstance(room, bool) else 0
+
+
 log = logging.getLogger(__name__)
 
 KINDS = ("app", "document", "deck", "spreadsheet")
@@ -2185,7 +2192,7 @@ async def document_check(
             profile,
             str(getattr(tools, "lang", "") or "en"),
             strict=bool(getattr(model, "strict", False)),
-            reasoning_room=int(getattr(model, "reasoning_room", 0) or 0),
+            reasoning_room=_reasoning_room(model),
             spend=spend,
             complete=getattr(tools, "expectations_complete", None),
         )

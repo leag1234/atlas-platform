@@ -109,6 +109,12 @@ from services.orchestrator.appearance import (
 )
 
 
+def _reasoning_room(model: object) -> int:
+    """The model's reasoning allowance for check calls; 0 when unknown."""
+    room = getattr(model, "reasoning_room", 0)
+    return room if isinstance(room, int) and not isinstance(room, bool) else 0
+
+
 def search_failure_notice(outcome: str, language: str) -> str:
     """Keep application-generated search caveats in the conversation language."""
     notices = {
@@ -1726,7 +1732,7 @@ async def _answer_constraints(
         strict=privacy.owned_only(),
         seconds=min(40.0, max(0.0, (left if left is not None else 60.0) - 5.0)),
         spend=spent.append,
-        reasoning_room=int(getattr(model, "reasoning_room", 0) or 0),
+        reasoning_room=_reasoning_room(model),
         # The turn's plan stopped: the reply is code's explanation of what
         # failed (staging -197: a provider refusal rewritten into an invented
         # answer).
