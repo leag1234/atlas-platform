@@ -336,6 +336,34 @@ WITHOUT_SCREEN = patch.object(faith, "screen_profile", new=lambda turn: None)
 
 @WITHOUT_SCREEN
 class ReviewTests(unittest.TestCase):
+    def test_a_general_definition_in_the_assistant_own_voice_is_not_flagged(
+        self,
+    ) -> None:
+        answer = (
+            "A design brief states the goals and constraints for a project. "
+            "The Varnholt footbridge opened on 14 October 2020. "
+            "I can help you compare the design options next."
+        )
+        calls = Calls(CLEAN)
+        text, addition, report = review(answer, calls)
+        self.assertEqual((text, addition, report.outcome), (answer, "", "clean"))
+
+    def test_an_invented_claim_attributed_to_the_document_is_flagged(self) -> None:
+        answer = (
+            "A design brief states the goals and constraints for a project. "
+            "The document says the bridge was designed in 2018. "
+            "I can help you compare the design options next."
+        )
+        attributed = "The document says the bridge was designed in 2018."
+        calls = Calls(
+            judged(
+                [{"text": attributed, "reason": "the document gives no design year"}]
+            )
+        )
+        _, addition, report = review(answer, calls)
+        self.assertIn(attributed, addition)
+        self.assertEqual(report.outcome, "noted")
+
     def test_a_faithful_answer_is_unchanged_after_one_call(self) -> None:
         calls = Calls(CLEAN)
         text, addition, report = review(FAITHFUL, calls)
