@@ -659,6 +659,7 @@ async def change(
         _gateway,
         _status,
         _store_image,
+        file_line,
         turn_ceiling,
     )
 
@@ -1075,6 +1076,17 @@ async def change(
         [
             " ".join(filter(None, [lead, checks_said])),
             f"![{picture_set.title}]({image})",
+            *(
+                [
+                    file_line(
+                        picture_set.artifact_id,
+                        picture_set.artifact_version,
+                        previous.filename,
+                    )
+                ]
+                if picture_set.file_requested
+                else []
+            ),
             footer(
                 picture_set.artifact_id,
                 picture_set.artifact_version,

@@ -96,6 +96,9 @@ class PictureSet:
     # order: an acceptance applies them (dialogue.follow_up), a new version
     # ends them.
     proposed: list[str] = field(default_factory=list)
+    # The person asked for the picture as a file: every later version keeps
+    # naming the same artifact file.
+    file_requested: bool = False
     # The current version of a CPU set was drawn by code (the image model had
     # missed a checked statement): later changes edit that drawing with the
     # painter (followup.py), never go back to the image model that missed.

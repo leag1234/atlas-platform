@@ -32,6 +32,7 @@ from decimal import ROUND_FLOOR, Decimal
 from typing import Any
 
 from packages.artifact_source import Block, filename_for, prepare, title_of
+from packages.file_intent import requests_file_delivery
 from packages.limits import LimitError
 from packages.profiles import picture_profile
 from packages.user_errors import app_failure, app_quota
@@ -573,6 +574,20 @@ def _answer(
     return "\n\n".join(lines)
 
 
+def _file_requested(request: Any) -> bool:
+    from services.orchestrator import request_router
+
+    decision = request_router.decision(request)
+    if decision is not None:
+        return decision.kind == "file" or bool(decision.file_format)
+    return requests_file_delivery(request.user_text)
+
+
+def file_line(artifact_id: str, version: int, filename: str) -> str:
+    prefix = f"/api/atlas/artifacts/{artifact_id}/versions/{version}"
+    return f"**{filename}** · [Download {filename}]({prefix}/download)"
+
+
 def cpu_pictures() -> int:
     from services.orchestrator.pictures.cpu_turn import CANDIDATES
 
@@ -856,6 +871,7 @@ async def process_picture_turn(
         or title_of(candidates[0]["svg"])
         or DEFAULT_TITLES["drawing"].get(language, DEFAULT_TITLES["drawing"]["en"])
     )
+    file_requested = _file_requested(request)
     owner = str(getattr(request, "artifact_owner", "") or "")
     # A CPU picture keeps the server's own picture: a later edit starts from it.
     renders = [
@@ -921,6 +937,7 @@ async def process_picture_turn(
                 artifact_id, version = str(stored["id"]), int(stored["version"])
                 picture_set.artifact_id = artifact_id
                 picture_set.artifact_version = version
+                picture_set.file_requested = file_requested
                 picture_set.request = request_text
                 picture_set.checklist = ck or {}
                 picture_set.living = dict(candidates[0].get("living") or {})
@@ -938,6 +955,8 @@ async def process_picture_turn(
                 footer = artifact_footer(
                     artifact_id, version, title, filename, language, temporary=False
                 )
+                if file_requested:
+                    footer = file_line(artifact_id, version, filename) + "\n\n" + footer
     note = ""
     if cpu is not None and cpu.rewrite is not None:
         from services.orchestrator.pictures import cpu_checks
