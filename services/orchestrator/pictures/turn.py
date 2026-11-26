@@ -668,33 +668,24 @@ def export_picture(
         str(request.user_text), picture_set.title or current.filename, extension
     )
     try:
-        stored = artifact_store.update(
-            picture_set.artifact_id,
+        stored = artifact_store.create(
             owner,
             picture_set.title,
             filename,
             content,
             str(getattr(item, "request_id", "") or "picture-export"),
-            base_version=picture_set.artifact_version,
         )
     except ArtifactError as error:
         item.erreurs.append("picture_export_" + error.code)
         return None
+    export_id = str(stored["id"])
     version = int(stored["version"])
-    picture_set.artifact_version = version
     picture_set.file_requested = True
     store.update(picture_set)
     language = answer_language(picture_set.language, request.lang)
-    line = file_line(picture_set.artifact_id, version, filename, language)
+    line = file_line(export_id, version, filename, language)
     if extension == "png" and requested_svg:
-        raster = {
-            "en": "The picture shown is a raster image, so the file is PNG.",
-            "fr": "L'image affichée est une image matricielle, le fichier est donc un PNG.",
-            "de": "Das gezeigte Bild ist eine Rastergrafik, die Datei ist daher PNG.",
-            "es": "La imagen mostrada es una imagen de mapa de bits, por lo que el archivo es PNG.",
-            "it": "L'immagine mostrata è un'immagine raster, quindi il file è PNG.",
-        }[language]
-        return f"{raster}\n\n{line}"
+        return f"{text(language, 'raster_export')}\n\n{line}"
     return line
 
 

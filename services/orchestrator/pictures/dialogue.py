@@ -53,14 +53,13 @@ from decimal import Decimal
 from typing import Any
 
 from packages.addressing import address_instruction, register, turn_register
-from packages.file_intent import requests_file_delivery
 from packages.profiles import picture_profile
 from services.orchestrator.pictures import store
 from services.orchestrator.pictures.texts import answer_language, text
 
 LOGGER = logging.getLogger(__name__)
 # Router kinds that are never about the picture.
-OUTSIDE = frozenset({"file", "run", "remote", "research"})
+OUTSIDE = frozenset({"run", "remote", "research"})
 # The picture must be in one of this many last assistant messages.
 RECENT_ANSWERS = 6
 MAX_TURNS = 10
@@ -579,23 +578,6 @@ async def follow_up(
     from services.orchestrator.pictures.turn import Spend, _gateway, turn_ceiling
 
     routed_kind = getattr(routed, "kind", "") if routed is not None else ""
-    if (
-        routed_kind == "file"
-        and picture_set.artifact_id
-        and requests_file_delivery(request.user_text)
-    ):
-        from services.orchestrator.pictures.turn import export_picture
-
-        answer = export_picture(
-            request,
-            item,
-            picture_set,
-            requested_svg=bool(re.search(r"(?i)\bsvg\b", str(request.user_text))),
-        )
-        if answer is not None:
-            item.task_type = "drawing"
-            item.reponse = answer
-            return True
     if routed_kind in OUTSIDE:
         return False
     from packages.closing_intent import polite_closing

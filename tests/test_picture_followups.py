@@ -399,8 +399,19 @@ class FollowUpTests(Base):
                 self.assertIn(f"**{filename}**", item.reponse)
                 self.assertIn("/download", item.reponse)
                 after = self.picture_set(first)
+                self.assertEqual(after.artifact_version, picture_set.artifact_version)
+                panel = artifact_store.read(
+                    picture_set.artifact_id,
+                    "owner@example.test",
+                    picture_set.artifact_version,
+                )
+                self.assertEqual(panel.content, current.content)
+                self.assertEqual(panel.filename, current.filename)
+                export_id = re.search(r"/artifacts/([^/]+)/versions/", item.reponse)
+                assert export_id is not None
+                self.assertNotEqual(export_id.group(1), picture_set.artifact_id)
                 exported = artifact_store.read(
-                    after.artifact_id, "owner@example.test", after.artifact_version
+                    export_id.group(1), "owner@example.test", 1
                 )
                 self.assertEqual(exported.filename, filename)
                 self.assertEqual(exported.content.decode("utf-8"), expected)
@@ -408,6 +419,40 @@ class FollowUpTests(Base):
                     'xmlns="http://www.w3.org/2000/svg"',
                     exported.content.decode("utf-8"),
                 )
+
+    async def test_an_export_does_not_break_a_later_visual_change(self) -> None:
+        gateway = DialogueGateway(follow_reply("file"))
+        server = EditServer()
+        first, _ = await self.start(gateway, server)
+        picture_set = self.picture_set(first)
+        history = [("user", FIRST), ("assistant", first.reponse)]
+        _, exported = await self.follow(gateway, history, "give it as moulin.png")
+        self.assertEqual(exported.task_type, "drawing")
+        self.assertIn("**moulin.png**", exported.reponse)
+        before = self.picture_set(first)
+        self.assertEqual(before.artifact_version, picture_set.artifact_version)
+
+        gateway.follow = follow_reply("change", "Add a red windmill sail.")
+        gateway.reply = rewrite_reply(prompt=FIRST + " Add a red windmill sail.")
+        done, changed = await self.follow(
+            gateway,
+            history
+            + [
+                ("user", "give it as moulin.svg"),
+                ("assistant", exported.reponse),
+            ],
+            "add a red windmill sail",
+        )
+        self.assertTrue(done)
+        self.assertEqual(len(server.edits), 1)
+        after = self.picture_set(first)
+        self.assertEqual(after.artifact_version, picture_set.artifact_version + 1)
+        from services.orchestrator import artifact_store
+
+        panel = artifact_store.read(
+            after.artifact_id, "owner@example.test", after.artifact_version
+        )
+        self.assertIn(b"<svg", panel.content)
 
     async def test_a_mixed_file_request_is_a_visual_change(self) -> None:
         gateway, server = (
@@ -455,16 +500,36 @@ class FollowUpTests(Base):
         self.assertIn("**windmill.png**", item.reponse)
         self.assertIn("/download", item.reponse)
         after = self.picture_set(first)
+        self.assertEqual(after.artifact_version, picture_set.artifact_version)
         from services.orchestrator import artifact_store
 
-        exported = artifact_store.read(
-            after.artifact_id, "owner@example.test", after.artifact_version
-        )
+        export_id = re.search(r"/artifacts/([^/]+)/versions/", item.reponse)
+        assert export_id is not None
+        self.assertNotEqual(export_id.group(1), picture_set.artifact_id)
+
+        exported = artifact_store.read(export_id.group(1), "owner@example.test", 1)
         self.assertEqual(exported.filename, "windmill.png")
         self.assertEqual(
             exported.content,
             store.image_bytes(store.current_image_key(picture_set)),
         )
+
+    async def test_a_router_file_request_is_not_exported_before_reading(self) -> None:
+        from services.orchestrator.request_router import Decision
+
+        gateway = DialogueGateway(follow_reply("other"))
+        server = FakeServer()
+        first, _ = await self.start(gateway, server)
+        history = [("user", FIRST), ("assistant", first.reponse)]
+        done, item = await self.follow(
+            gateway,
+            history,
+            "make a PDF report describing this poster",
+            routed=Decision(kind="file", file_format="pdf"),
+        )
+        self.assertFalse(done)
+        self.assertEqual(len(gateway.follows), 1)
+        self.assertNotIn("/download", item.reponse)
 
     async def test_outside_kinds_skip_the_reading_call(self) -> None:
         from services.orchestrator.request_router import Decision

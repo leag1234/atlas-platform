@@ -41,6 +41,7 @@ TEXTS: dict[str, dict[str, str]] = {
         "cpu_no_edit_failed": "The image server failed to edit the picture this time.",
         "cpu_no_edit_original": "The original of this picture is no longer stored, so it cannot be edited.",
         "cpu_no_edit_offer": 'So nothing was redrawn: version {version} stays as it is. The closest option is to draw it again from its description with this change and the same starting point: the composition stays close, but other details may change. Answer "yes" to do that; an edit of the picture itself can be tried again later.',
+        "raster_export": "The picture shown is a raster image, so the file is PNG.",
         "cpu_redrawn": "This picture was not edited in place: as proposed, it was drawn again from its description with the change, so other details may differ from the previous version.",
         "expired": "These proposals are no longer stored (30-day retention).",
         "reading": "Reading the request…",
@@ -128,6 +129,7 @@ TEXTS: dict[str, dict[str, str]] = {
         "cpu_no_edit_failed": "Le serveur d'images n'a pas réussi à retoucher l'image cette fois.",
         "cpu_no_edit_original": "L'original de cette image n'est plus conservé : elle ne peut pas être retouchée.",
         "cpu_no_edit_offer": "Rien n'a donc été redessiné : la version {version} reste telle quelle. L'option la plus proche est de la redessiner à partir de sa description avec cette modification et le même point de départ : la composition reste proche, mais d'autres détails peuvent changer. Dites-moi « oui » pour le faire ; une retouche de l'image elle-même pourra être tentée de nouveau plus tard.",
+        "raster_export": "L'image affichée est une image matricielle, le fichier est donc un PNG.",
         "cpu_redrawn": "Cette image n'a pas été retouchée sur place : comme proposé, elle a été redessinée à partir de sa description avec la modification, donc d'autres détails peuvent différer de la version précédente.",
         "expired": (
             "Ces propositions ne sont plus conservées (conservation de 30 jours)."
@@ -214,6 +216,7 @@ TEXTS: dict[str, dict[str, str]] = {
         "cpu_no_edit_failed": "Der Bildserver konnte das Bild diesmal nicht bearbeiten.",
         "cpu_no_edit_original": "Das Original dieses Bildes ist nicht mehr gespeichert, daher kann es nicht bearbeitet werden.",
         "cpu_no_edit_offer": "Es wurde also nichts neu gezeichnet: Version {version} bleibt, wie sie ist. Die nächstliegende Möglichkeit ist, es aus seiner Beschreibung mit dieser Änderung und demselben Ausgangspunkt neu zu zeichnen: Die Komposition bleibt ähnlich, andere Details können sich aber ändern. Sagen Sie mir „ja“, dann zeichne ich es so; eine Bearbeitung des Bildes selbst kann später erneut versucht werden.",
+        "raster_export": "Das gezeigte Bild ist eine Rastergrafik, die Datei ist daher PNG.",
         "cpu_redrawn": "Dieses Bild wurde nicht direkt bearbeitet: Wie vorgeschlagen wurde es aus seiner Beschreibung mit der Änderung neu gezeichnet, daher können andere Details von der vorherigen Version abweichen.",
         "expired": (
             "Diese Vorschläge sind nicht mehr gespeichert (Aufbewahrung 30 Tage)."
@@ -300,6 +303,7 @@ TEXTS: dict[str, dict[str, str]] = {
         "cpu_no_edit_failed": "El servidor de imágenes no consiguió editar la imagen esta vez.",
         "cpu_no_edit_original": "El original de esta imagen ya no está guardado, así que no se puede editar.",
         "cpu_no_edit_offer": "Así que no se ha redibujado nada: la versión {version} se queda como está. La opción más cercana es dibujarla de nuevo a partir de su descripción con este cambio y el mismo punto de partida: la composición queda parecida, pero otros detalles pueden cambiar. Dígame «sí» para hacerlo; una edición de la imagen misma se puede intentar de nuevo más tarde.",
+        "raster_export": "La imagen mostrada es una imagen de mapa de bits, por lo que el archivo es PNG.",
         "cpu_redrawn": "Esta imagen no se editó directamente: como se propuso, se dibujó de nuevo a partir de su descripción con el cambio, así que otros detalles pueden diferir de la versión anterior.",
         "expired": "Estas propuestas ya no se conservan (conservación de 30 días).",
         "reading": "Leyendo la petición…",
@@ -384,6 +388,7 @@ TEXTS: dict[str, dict[str, str]] = {
         "cpu_no_edit_failed": "Il server di immagini non è riuscito a modificare l'immagine questa volta.",
         "cpu_no_edit_original": "L'originale di questa immagine non è più conservato, quindi non può essere modificata.",
         "cpu_no_edit_offer": "Quindi non è stato ridisegnato nulla: la versione {version} resta com'è. L'opzione più vicina è ridisegnarla dalla sua descrizione con questa modifica e lo stesso punto di partenza: la composizione resta simile, ma altri dettagli possono cambiare. Dimmi «sì» per farlo; una modifica dell'immagine stessa si può riprovare più tardi.",
+        "raster_export": "L'immagine mostrata è un'immagine raster, quindi il file è PNG.",
         "cpu_redrawn": "Questa immagine non è stata modificata direttamente: come proposto, è stata ridisegnata dalla sua descrizione con la modifica, quindi altri dettagli possono differire dalla versione precedente.",
         "expired": "Queste proposte non sono più conservate (conservazione di 30 giorni).",
         "reading": "Lettura della richiesta…",
