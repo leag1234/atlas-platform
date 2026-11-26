@@ -109,6 +109,17 @@ _CHECK = re.compile(
     r"|prufe?\w*|uberpruf\w*|teste?|probier\w*|kontrollier\w*"
     r"|comprueba|prueba|probar|verifica|controlla|prova)\b"
 )
+_BROKEN = re.compile(
+    r"\b(?:app|appli|application|webseite|pagina web|web page"
+    r"|anwendung|aplicacion|applicazione)\b"
+    r".{0,40}\b(?:shows? nothing|displays? nothing|is empty|is blank"
+    r"|affiche rien|est vide|est vide a l ecran"
+    r"|zeigt nichts|ist leer"
+    r"|no muestra nada|esta vacia"
+    r"|non mostra nulla|e vuota)\b"
+    r"|\b(?:nothing shows|nothing is displayed|rien ne s affiche"
+    r"|nichts wird angezeigt|no se muestra nada|non si vede nulla)\b"
+)
 # "Can you add ...?", "Kannst du ... einbauen?": a request in the form of a
 # question. Staging -184 (class suite): such follow-ups to the conversation's
 # app were read as questions about it when the routing call had timed out, and
@@ -160,15 +171,20 @@ def app_intent(text: str, history: Sequence[Mapping[str, object]]) -> Intent | N
         and bool(_APP.search(normalized))
         and bool(_CHECK.search(normalized))
     )
-    if not _is_app_request(normalized) and not checks:
+    broken = has_artifact and bool(_BROKEN.search(normalized))
+    if not _is_app_request(normalized) and not checks and not broken:
         return None
-    if _QUESTION.search(normalized) and not _polite_request(normalized, has_artifact):
+    if (
+        _QUESTION.search(normalized)
+        and not _polite_request(normalized, has_artifact)
+        and not broken
+    ):
         return None
     if not has_artifact:
         # "Write a short message to ..." is a text for the chat: a writing verb
         # alone is not an app request (staging 2026-11-16).
         return None if plain_writing(normalized) else "create"
-    if _CHANGE.search(normalized) or checks:
+    if _CHANGE.search(normalized) or checks or broken:
         return "modify"
     return None if plain_writing(normalized) else "available"
 
