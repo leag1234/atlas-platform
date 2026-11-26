@@ -25,7 +25,7 @@ from packages.user_errors import (
 )
 
 from services.orchestrator.chat_schema import ChatRequest, markdown_tail_viable
-from services.orchestrator.deadline import request_deadline
+from services.orchestrator.deadline import remaining, request_deadline
 from services.orchestrator.interactions import Interaction, write_interaction
 from services.orchestrator.stream_client import sink_context
 from services.orchestrator.substitution_notice import turn_substitution
@@ -1064,6 +1064,12 @@ def response(
                     }
                 else:
                     item.erreurs.append("cancelled")
+                    left = remaining()
+                    if left is not None and left <= 0:
+                        item.state = "error"
+                        await close_by_time()
+                        await queue.put(None)
+                        return
                 raise
             except ProjectError as exc:
                 from services.orchestrator.project_transcript import failure_location

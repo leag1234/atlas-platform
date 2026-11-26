@@ -1983,13 +1983,12 @@ async def _process_request(request: ChatRequest, item: Interaction) -> None:
     from services.orchestrator import request_router
 
     if request_router.enabled():
-        before = request.timeout_seconds
         if await request_router.route(request) is not None:
-            from services.orchestrator.deadline import extend
+            from services.orchestrator.deadline import extend_for_path
 
             # The request deadline was set before routing: an app, a drawing in
             # the panel or a file turn gets its 300 s.
-            extend(request.timeout_seconds - before)
+            extend_for_path(request)
     language = conversation_language(request.conversation_messages, request.ui_locale)
     if not request.continuation and is_appearance_request(
         request.user_text, history=request.messages[:-1]

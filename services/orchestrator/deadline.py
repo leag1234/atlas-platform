@@ -4,11 +4,16 @@ import asyncio
 from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from collections.abc import AsyncIterator, Callable, Iterator
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from services.orchestrator.chat_schema import ChatRequest
 import time
 
 _current: ContextVar[asyncio.Timeout | None] = ContextVar(
     "request_deadline", default=None
 )
+_started: ContextVar[float | None] = ContextVar("request_deadline_start", default=None)
 # The seconds a chat answer written after research leaves before the
 # deadline, for the checks that follow it and for an answer written again
 # from the pages read when it fails (a trip: travel_rebuild.recover). Read
@@ -35,12 +40,15 @@ def recovery_seconds() -> float:
 
 @asynccontextmanager
 async def request_deadline(seconds: float) -> AsyncIterator[None]:
+    started = asyncio.get_running_loop().time()
     async with asyncio.timeout(seconds) as deadline:
         token = _current.set(deadline)
+        started_token = _started.set(started)
         try:
             yield
         finally:
             _current.reset(token)
+            _started.reset(started_token)
 
 
 def remaining() -> float | None:
@@ -64,6 +72,25 @@ def extend(seconds: float) -> None:
     when = deadline.when()
     if when is not None:
         deadline.reschedule(when + seconds)
+
+
+def extend_for_path(request: "ChatRequest", total: float | None = None) -> None:
+    """Give a late handoff the deadline its direct route would have had.
+
+    A turn can be read as a plain chat answer, then handed to Work, an app or a
+    file path after the deadline was set. The handoff must never shorten the
+    deadline; it moves it to the full allowance of the path, minus the time
+    already spent. `total` gives that allowance when the request alone does
+    not show the new path (a plain answer handed to Work after routing).
+    """
+    deadline = _current.get()
+    before = deadline.when() if deadline is not None else None
+    started = _started.get()
+    if deadline is None or before is None or started is None:
+        return
+    wanted = started + (request.timeout_seconds if total is None else total)
+    if wanted > before:
+        deadline.reschedule(wanted)
 
 
 @asynccontextmanager
