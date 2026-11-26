@@ -77,7 +77,7 @@ FOLLOW_TOKENS = 700
 REVIEW_SECONDS = 45.0
 REVIEW_BUDGET = Decimal("0.02")
 REVIEW_TOKENS = 900
-KINDS = ("change", "review", "new", "other")
+KINDS = ("change", "review", "new", "file", "other")
 
 FOLLOW_SYSTEM = (
     "You read the end of a conversation between a user and Atlas, an assistant "
@@ -101,8 +101,16 @@ FOLLOW_SYSTEM = (
     "wrong, why something changed or moved), or propose a plan or a strategy, "
     "without asking to draw it now;\n"
     '- "new": a different picture with another subject;\n'
+    '- "file": the last message asks for the current picture as a file: a '
+    "file format, a file name, a download, an export, an attachment, or a "
+    "complaint about the file that was downloaded, without asking for "
+    "anything to look different; a message that also asks for a visual "
+    'change is "change";\n'
     '- "other": anything else: a question or a task about something other than '
     "the picture.\n"
+    "'change' and 'requirements' describe only what the picture must SHOW. "
+    "A file format, a file name, a download link or an attachment is never "
+    "a visual change or a requirement.\n"
     "'change' (only for kind change): the whole change to draw, in English, "
     "as concrete visual instructions: what the last message asks and, when it "
     "refers to earlier turns ('go ahead', 'again', 'apply your plan', 'still "
