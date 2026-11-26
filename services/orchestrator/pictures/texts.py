@@ -96,6 +96,7 @@ TEXTS: dict[str, dict[str, str]] = {
         "review_method_cpu": "How changes work here: each change rewrites the picture's description and draws it again, so details the description does not fix can move.",
         "review_method_edit": "How changes work here: each change edits the current picture with the image model, and the rest is kept as it is.",
         "review_method_code": "How changes work here: each change asks the drawing model to edit its own drawing.",
+        "download": "Download {filename}",
     },
     "fr": {
         "intro": (
@@ -184,6 +185,7 @@ TEXTS: dict[str, dict[str, str]] = {
         "review_method_cpu": "Comment fonctionnent les modifications ici : chaque modification réécrit la description de l'image et la redessine, donc les détails que la description ne fixe pas peuvent bouger.",
         "review_method_edit": "Comment fonctionnent les modifications ici : chaque modification retouche l'image actuelle avec le modèle d'images, et le reste est conservé.",
         "review_method_code": "Comment fonctionnent les modifications ici : chaque modification demande au modèle de dessin de retoucher son propre dessin.",
+        "download": "Télécharger {filename}",
     },
     "de": {
         "intro": (
@@ -269,6 +271,7 @@ TEXTS: dict[str, dict[str, str]] = {
         "review_method_cpu": "So funktionieren Änderungen hier: Jede Änderung schreibt die Bildbeschreibung neu und zeichnet das Bild neu, daher können Details, die die Beschreibung nicht festlegt, sich verschieben.",
         "review_method_edit": "So funktionieren Änderungen hier: Jede Änderung bearbeitet das aktuelle Bild mit dem Bildmodell, der Rest bleibt erhalten.",
         "review_method_code": "So funktionieren Änderungen hier: Jede Änderung lässt das Zeichenmodell seine eigene Zeichnung bearbeiten.",
+        "download": "{filename} herunterladen",
     },
     "es": {
         "intro": "Aquí tienes {n} propuestas; la primera, enmarcada, es la que sugiero.",
@@ -352,6 +355,7 @@ TEXTS: dict[str, dict[str, str]] = {
         "review_method_cpu": "Cómo funcionan los cambios aquí: cada cambio reescribe la descripción de la imagen y la vuelve a dibujar, así que los detalles que la descripción no fija pueden moverse.",
         "review_method_edit": "Cómo funcionan los cambios aquí: cada cambio retoca la imagen actual con el modelo de imágenes y el resto se conserva.",
         "review_method_code": "Cómo funcionan los cambios aquí: cada cambio pide al modelo de dibujo que retoque su propio dibujo.",
+        "download": "Descargar {filename}",
     },
     "it": {
         "intro": "Ecco {n} proposte; la prima, incorniciata, è quella che suggerisco.",
@@ -435,6 +439,7 @@ TEXTS: dict[str, dict[str, str]] = {
         "review_method_cpu": "Come funzionano le modifiche qui: ogni modifica riscrive la descrizione dell'immagine e la ridisegna, quindi i dettagli che la descrizione non fissa possono spostarsi.",
         "review_method_edit": "Come funzionano le modifiche qui: ogni modifica ritocca l'immagine attuale con il modello di immagini e il resto viene conservato.",
         "review_method_code": "Come funzionano le modifiche qui: ogni modifica chiede al modello di disegno di ritoccare il proprio disegno.",
+        "download": "Scarica {filename}",
     },
 }
 

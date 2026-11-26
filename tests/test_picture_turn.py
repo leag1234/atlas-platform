@@ -17,6 +17,7 @@ from unittest.mock import patch
 from services.orchestrator.interactions import Interaction
 from services.orchestrator.loop import GatewayError
 from services.orchestrator import pictures
+from services.orchestrator.request_router import DECISION_KEY, Decision
 from services.orchestrator.pictures import choice, painter, store, turn
 from services.orchestrator.pictures.choice import choice_number, latest_set_id
 from picture_jobs import memoise_drafts
@@ -319,6 +320,58 @@ class TurnTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertIn("/versions/1/open", text)
         self.assertNotIn("unverified", text)
+
+    async def test_a_picture_requested_as_a_file_is_named_on_each_version(self) -> None:
+        gateway = FakeGateway("cats")
+        request = Request(
+            "Please draw three cats in a hot-air balloon as a file I can download."
+        )
+        item = Interaction()
+        await turn.process_picture_turn(request, item, complete=gateway)
+        filename = "dessin.html"
+        self.assertIn(f"**{filename}**", item.reponse)
+        self.assertIn("/versions/1/download", item.reponse)
+        set_id = latest_set_id([{"role": "assistant", "content": item.reponse}])
+        assert set_id is not None
+        picture_set = store.load(set_id)
+        assert picture_set is not None
+        self.assertTrue(picture_set.file_requested)
+
+        changed = Interaction()
+        from services.orchestrator.pictures.followup import process_picture_followup
+
+        done = await process_picture_followup(
+            Request("make the red scarf larger"),
+            changed,
+            FollowupTests.current(item.reponse),
+            complete=gateway,
+        )
+        self.assertTrue(done)
+        self.assertIn(f"**{filename}**", changed.reponse)
+        self.assertIn("/versions/2/download", changed.reponse)
+
+    async def test_a_drawing_router_decision_keeps_an_explicit_file_request(
+        self,
+    ) -> None:
+        gateway = FakeGateway("cats")
+        request = Request(
+            "Please draw three cats in a hot-air balloon as an SVG file I can download."
+        )
+        request.__dict__[DECISION_KEY] = Decision(kind="drawing")
+        item = Interaction()
+        await turn.process_picture_turn(request, item, complete=gateway)
+        self.assertIn("**dessin.html**", item.reponse)
+        self.assertIn("/versions/1/download", item.reponse)
+        set_id = latest_set_id([{"role": "assistant", "content": item.reponse}])
+        assert set_id is not None
+        picture_set = store.load(set_id)
+        assert picture_set is not None
+        self.assertTrue(picture_set.file_requested)
+
+    async def test_an_ordinary_picture_answer_does_not_name_a_file(self) -> None:
+        gateway = FakeGateway("banc")
+        item = await self.run_turn(gateway)
+        self.assertNotIn("**dessin.html**", item.reponse)
 
     async def test_partial_result_when_drafts_fail(self) -> None:
         failures: dict[int, Exception] = {

@@ -477,6 +477,18 @@ async def process_picture_followup(
     )
     lines = [" ".join(filter(None, [lead, checked]))]
     lines.append(f"![{picture_set.title}]({image})")
+    if picture_set.file_requested:
+        from services.orchestrator.pictures.turn import file_line
+
+        lines.append(
+            file_line(
+                picture_set.artifact_id,
+                picture_set.artifact_version,
+                previous.filename,
+                language,
+                found=found,
+            )
+        )
     lines.append(
         footer(
             picture_set.artifact_id,
