@@ -58,6 +58,13 @@ from typing import Any
 
 from packages import addressing
 
+
+def _reasoning_room(model: object) -> int:
+    """The model's reasoning allowance for check calls; 0 when unknown."""
+    room = getattr(model, "reasoning_room", 0)
+    return room if isinstance(room, int) and not isinstance(room, bool) else 0
+
+
 log = logging.getLogger(__name__)
 
 KINDS = ("app", "document", "deck", "spreadsheet")
@@ -1528,9 +1535,14 @@ class TurnLedger:
     # Added to the turn's spending (GatewayModel.spent) as calls are made.
     spend: Callable[[Decimal], None] | None = None
     complete: COMPLETE | None = None
+    # The gateway's reasoning allowance for the turn's profile, added to the
+    # answer budget of every check call.
+    reasoning_room: int = 0
     updated: bool = False
     # Gateway calls made (a fallback to the fast profile counts).
     calls: int = 0
+    # Gateway calls that failed (timeout, provider error, empty output).
+    failed_calls: list[str] = field(default_factory=list)
     # The checks of the latest file of the turn (documents: saved with it).
     last_results: list[Result] = field(default_factory=list)
 
@@ -1595,13 +1607,13 @@ class TurnLedger:
             "tools": [],
             "response_format": {"type": "json_object"},
             "profile": profile,
-            "max_tokens": tokens,
+            "max_tokens": tokens + self.reasoning_room,
             "timeout": round(seconds, 1),
             "budget_eur": str(
                 CALL_BUDGET_EUR.quantize(Decimal("0.0001"), rounding=ROUND_FLOOR)
             ),
             "reasoning_effort": "none",
-            "reasoning_disabled": True,
+            "reasoning_ceiling": "low",
             "sampling_temperature": 0.0,
             "single_attempt": True,
             "local_enabled": False,
@@ -1614,12 +1626,14 @@ class TurnLedger:
             async with asyncio.timeout(seconds + 5):
                 reply = await call(payload, seconds + 5)
         except Exception as error:  # noqa: BLE001 - a failed call never blocks the turn
+            cause = _call_cause(error)
+            self.failed_calls.append(cause)
             log.warning(
                 json.dumps(
                     {
                         "event": "expectations_call_failed",
                         "profile": profile,
-                        "error": type(error).__name__,
+                        "error": cause,
                         "code": str(getattr(error, "code", ""))[:40],
                         "status": str(getattr(error, "status", ""))[:8],
                     }
@@ -1891,6 +1905,8 @@ class TurnLedger:
                     "extraction_calls": self.extraction_calls,
                     "judge_calls": self.judge_calls,
                     "gateway_calls": self.calls,
+                    "failed_calls": len(self.failed_calls),
+                    "failed_call_causes": self.failed_calls,
                     "repairs": self.repairs,
                     "cost_eur": str(self.cost_eur),
                     "changes": self.events[:20],
@@ -1902,6 +1918,17 @@ class TurnLedger:
 
 def failed(results: Sequence[Result]) -> list[Result]:
     return [result for result in results if result.passed is False]
+
+
+def _call_cause(error: Exception) -> str:
+    code = str(getattr(error, "code", "") or "")
+    if code:
+        return code[:40]
+    if isinstance(error, TimeoutError):
+        return "timeout"
+    if isinstance(error, RuntimeError):
+        return "provider_error"
+    return type(error).__name__ or "error"
 
 
 async def _complete(payload: dict[str, Any], seconds: float) -> dict[str, Any]:
@@ -2165,6 +2192,7 @@ async def document_check(
             profile,
             str(getattr(tools, "lang", "") or "en"),
             strict=bool(getattr(model, "strict", False)),
+            reasoning_room=_reasoning_room(model),
             spend=spend,
             complete=getattr(tools, "expectations_complete", None),
         )

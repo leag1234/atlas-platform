@@ -48,8 +48,8 @@ log = logging.getLogger(__name__)
 
 COMPLETE = Callable[[dict[str, Any], float], Awaitable[dict[str, Any]]]
 CALL_BUDGET_EUR = Decimal("0.01")
-READ_SECONDS = 12.0
-VERIFY_SECONDS = 12.0
+READ_SECONDS = 20.0
+VERIFY_SECONDS = 20.0
 REPAIR_SECONDS = 25.0
 MIN_SECONDS = 4.0
 # Kinds a rewrite of the text can fix.
@@ -103,6 +103,8 @@ class Outcome:
     # The repairs tried ("code", "model") and why one was not kept.
     attempted: list[str] = field(default_factory=list)
     dropped: list[str] = field(default_factory=list)
+    # Gateway calls that failed (timeout, provider error, empty output).
+    failed_calls: list[str] = field(default_factory=list)
 
     def unmet(self) -> list[Constraint]:
         """What code decided, with certainty, is not met: never an undecided
@@ -138,6 +140,8 @@ class Outcome:
                 "repair_dropped": self.dropped,
                 "noted": bool(self.note),
                 "calls": self.calls,
+                "failed_calls": len(self.failed_calls),
+                "failed_call_causes": self.failed_calls,
                 "cost_eur": str(self.cost_eur),
                 "seconds": round(self.seconds, 2),
             },
@@ -152,13 +156,16 @@ class _Calls:
         strict: bool,
         complete: COMPLETE | None,
         spend: Callable[[Decimal], None] | None,
+        reasoning_room: int = 0,
     ) -> None:
         self.profile = profile
         self.strict = strict
         self.complete = complete
         self.spend = spend
+        self.reasoning_room = reasoning_room
         self.count = 0
         self.cost = Decimal(0)
+        self.failed: list[str] = []
 
     def profiles(self) -> list[str]:
         from packages.profiles import picture_profile
@@ -198,13 +205,13 @@ class _Calls:
             "tools": [],
             "response_format": {"type": "json_object"},
             "profile": profile,
-            "max_tokens": tokens,
+            "max_tokens": tokens + self.reasoning_room,
             "timeout": round(seconds, 1),
             "budget_eur": str(
                 CALL_BUDGET_EUR.quantize(Decimal("0.0001"), rounding=ROUND_FLOOR)
             ),
             "reasoning_effort": "none",
-            "reasoning_disabled": True,
+            "reasoning_ceiling": "low",
             "sampling_temperature": 0.0,
             "single_attempt": True,
             "local_enabled": False,
@@ -217,11 +224,13 @@ class _Calls:
             async with asyncio.timeout(seconds + 3):
                 reply = await call(payload, seconds + 3)
         except Exception as error:  # noqa: BLE001 - a failed call never blocks the turn
+            cause = _call_cause(error)
+            self.failed.append(cause)
             log.warning(
                 json.dumps(
                     {
                         "event": "answer_constraints_call_failed",
-                        "error": type(error).__name__,
+                        "error": cause,
                         "code": str(getattr(error, "code", ""))[:40],
                         "status": str(getattr(error, "status", ""))[:8],
                     }
@@ -236,7 +245,19 @@ class _Calls:
             self.cost += spent
             if self.spend is not None:
                 self.spend(spent)
+
         return str(reply.get("text") or "")
+
+
+def _call_cause(error: Exception) -> str:
+    code = str(getattr(error, "code", "") or "")
+    if code:
+        return code[:40]
+    if isinstance(error, TimeoutError):
+        return "timeout"
+    if isinstance(error, RuntimeError):
+        return "provider_error"
+    return type(error).__name__ or "error"
 
 
 async def _complete(payload: dict[str, Any], seconds: float) -> dict[str, Any]:
@@ -703,6 +724,7 @@ async def enforce(
     seconds: float = 40.0,
     complete: COMPLETE | None = None,
     spend: Callable[[Decimal], None] | None = None,
+    reasoning_room: int = 0,
     run_mode: str | None = None,
     stopped: bool = False,
 ) -> Outcome:
@@ -726,7 +748,7 @@ async def enforce(
     shown = next(
         (text for role, text in reversed(messages[:-1]) if role == "assistant"), ""
     )
-    calls = _Calls(profile, strict, complete, spend)
+    calls = _Calls(profile, strict, complete, spend, reasoning_room)
 
     def left() -> float:
         return seconds - (time.monotonic() - started)
@@ -745,6 +767,7 @@ async def enforce(
     if not items:
         outcome.seconds = time.monotonic() - started
         outcome.calls, outcome.cost_eur = calls.count, calls.cost
+        outcome.failed_calls = calls.failed
         return outcome
     facts: dict[str, Any] = {"produced": produced, "made": made}
     allowed = [text for item in items for text in (item.text, *item.items) if text]
@@ -825,5 +848,6 @@ async def enforce(
     outcome.results = [results[item.id] for item in items]
     outcome.note = note(language, outcome.unmet(), results)
     outcome.calls, outcome.cost_eur = calls.count, calls.cost
+    outcome.failed_calls = calls.failed
     outcome.seconds = time.monotonic() - started
     return outcome

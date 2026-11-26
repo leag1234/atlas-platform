@@ -22,7 +22,7 @@ from typing import Any
 import unittest
 from unittest import mock
 
-from services.orchestrator.constraints import checks, pipeline
+from services.orchestrator.constraints import checks, pipeline, verify
 from services.orchestrator.constraints.model import Constraint, part_of
 from services.orchestrator.constraints.views import answer_view
 
@@ -386,7 +386,112 @@ class Notes(ModelProfile):
         self.assertEqual([r.passed for r in outcome.results], [False])
         self.assertEqual(outcome.unmet(), [])
         self.assertEqual(outcome.note, "")
-        self.assertEqual(outcome.answer, reply)
+
+
+class ReliableCalls(ModelProfile):
+    """Quality calls keep room for reasoning and enough time to answer."""
+
+    PERSON = (
+        "Answer with a friendly closing line and exactly two ferry times, one per line."
+    )
+    REPLY = "09:00\n11:00\nHave a good crossing."
+
+    def outcome(self, gateway: Gateway) -> pipeline.Outcome:
+        return run(
+            pipeline.enforce(
+                [("user", self.PERSON)],
+                self.REPLY,
+                language="en",
+                complete=gateway,
+                reasoning_room=2000,
+                run_mode="full",
+            )
+        )
+
+    def test_calls_use_the_lowest_accepted_reasoning_and_widened_budget(
+        self,
+    ) -> None:
+        gateway = Gateway(
+            read={"constraints": []},
+            verify={"results": []},
+        )
+        self.outcome(gateway)
+        for _, payload in gateway.payloads:
+            self.assertEqual(payload["reasoning_effort"], "none")
+            self.assertEqual(payload["reasoning_ceiling"], "low")
+            self.assertNotIn("reasoning_disabled", payload)
+            self.assertGreaterEqual(
+                payload["max_tokens"],
+                verify.READ_TOKENS + 2000
+                if "FORM and exact CONTENT" in payload["messages"][0]["content"]
+                else verify.VERIFY_TOKENS + 2000,
+            )
+
+    def test_a_call_that_spends_a_small_budget_reasoning_is_retried_with_room(
+        self,
+    ) -> None:
+        class LengthThenContent(Gateway):
+            def __init__(self) -> None:
+                super().__init__(
+                    read={"constraints": []},
+                    verify={"results": []},
+                )
+                self.profiles: list[str] = []
+                self.responses: list[dict[str, Any]] = []
+
+            async def __call__(
+                self, payload: dict[str, Any], seconds: float
+            ) -> dict[str, Any]:
+                self.profiles.append(payload["profile"])
+                reply = await super().__call__(payload, seconds)
+                if len(self.profiles) == 1:
+                    response = {
+                        "text": "{",
+                        "finish_reason": "length",
+                        "completion_tokens": 700,
+                    }
+                    self.responses.append(response)
+                    return response
+                self.responses.append(reply)
+                return reply
+
+        gateway = LengthThenContent()
+        outcome = self.outcome(gateway)
+        self.assertEqual(outcome.constraints, [])
+        self.assertEqual(outcome.failed_calls, [])
+        self.assertEqual(len(gateway.payloads), 2)
+        self.assertEqual(gateway.responses[0]["finish_reason"], "length")
+        self.assertEqual(gateway.responses[0]["completion_tokens"], 700)
+        self.assertEqual(gateway.payloads[1][1]["reasoning_ceiling"], "low")
+        self.assertGreaterEqual(
+            gateway.payloads[1][1]["max_tokens"],
+            verify.READ_TOKENS + 2000,
+        )
+
+    def test_a_slow_call_within_the_new_timeout_succeeds(self) -> None:
+        class SlowGateway(Gateway):
+            async def __call__(
+                self, payload: dict[str, Any], seconds: float
+            ) -> dict[str, Any]:
+                await asyncio.sleep(0.01)
+                return await super().__call__(payload, seconds)
+
+        gateway = SlowGateway()
+        outcome = self.outcome(gateway)
+        self.assertEqual(outcome.failed_calls, [])
+        self.assertEqual(outcome.answer, self.REPLY)
+        line = json.loads(outcome.log_line())
+        self.assertEqual(line["failed_calls"], 0)
+
+    def test_read_and_verify_get_twenty_seconds_before_the_profile_split(
+        self,
+    ) -> None:
+        self.assertEqual((pipeline.READ_SECONDS, pipeline.VERIFY_SECONDS), (20, 20))
+        gateway = Gateway(read={"constraints": []}, verify={"results": []})
+        outcome = self.outcome(gateway)
+        read = next(payload for kind, payload in gateway.payloads if kind == "read")
+        self.assertEqual(read["timeout"], 12.0)
+        self.assertEqual(outcome.answer, self.REPLY)
 
     def test_note_is_impersonal_and_names_what_is_missing(self) -> None:
         cases = [

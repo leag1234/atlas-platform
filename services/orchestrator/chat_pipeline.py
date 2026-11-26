@@ -109,6 +109,12 @@ from services.orchestrator.appearance import (
 )
 
 
+def _reasoning_room(model: object) -> int:
+    """The model's reasoning allowance for check calls; 0 when unknown."""
+    room = getattr(model, "reasoning_room", 0)
+    return room if isinstance(room, int) and not isinstance(room, bool) else 0
+
+
 def search_failure_notice(outcome: str, language: str) -> str:
     """Keep application-generated search caveats in the conversation language."""
     notices = {
@@ -1074,6 +1080,7 @@ async def process(request: ChatRequest, item: Interaction) -> None:
         else None
     )
     checking = grounding.current.set(check)
+    model: GatewayModel | None = None
     # A turn that streams (no held check) has the specific details of its
     # answer looked up in the texts it read once it ends; what none holds is
     # named in one closing note, without a model call (unsourced_details.
@@ -1654,7 +1661,7 @@ async def process(request: ChatRequest, item: Interaction) -> None:
                 }
             )
     if item.state == "done" and item.task_type != "drawing" and item.reponse.strip():
-        await _answer_constraints(request, item, holder)
+        await _answer_constraints(request, item, holder, model)
     if provenance is not None and item.state == "done" and item.task_type != "work":
         number_provenance.record(
             provenance,
@@ -1680,7 +1687,10 @@ async def process(request: ChatRequest, item: Interaction) -> None:
 
 
 async def _answer_constraints(
-    request: ChatRequest, item: Interaction, holder: "_HeldAnswer | None"
+    request: ChatRequest,
+    item: Interaction,
+    holder: "_HeldAnswer | None",
+    model: GatewayModel | None = None,
 ) -> None:
     """The person's constraints on the reply, checked by code, repaired once,
     the rest said (constraints/pipeline.py, docs/33).
@@ -1722,6 +1732,7 @@ async def _answer_constraints(
         strict=privacy.owned_only(),
         seconds=min(40.0, max(0.0, (left if left is not None else 60.0) - 5.0)),
         spend=spent.append,
+        reasoning_room=_reasoning_room(model),
         # The turn's plan stopped: the reply is code's explanation of what
         # failed (staging -197: a provider refusal rewritten into an invented
         # answer).
@@ -1748,6 +1759,7 @@ async def _answer_constraints(
             "constraints": len(outcome.constraints),
             "unmet": len(outcome.unmet()),
             "repaired": outcome.repaired,
+            "checks_skipped": len(outcome.failed_calls),
         }
     )
 

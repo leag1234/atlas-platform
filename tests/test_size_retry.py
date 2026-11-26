@@ -154,7 +154,9 @@ def work_tools() -> Mock:
     tools.request_text = ASKED
     tools.earlier_requests = []
     tools.calculation_refusals = set()
-    tools.check_model = Mock(profile="atlas-qwen", spent=Decimal(0), strict=False)
+    tools.check_model = Mock(
+        profile="atlas-qwen", spent=Decimal(0), strict=False, reasoning_room=0
+    )
     tools.expectations_complete = complete
     tools.expectations = None
     tools.picture_scope = "reader|conversation-9"

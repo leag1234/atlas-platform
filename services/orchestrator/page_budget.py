@@ -23,6 +23,13 @@ import json
 import logging
 from typing import Any
 
+
+def _reasoning_room(model: object) -> int:
+    """The model's reasoning allowance for check calls; 0 when unknown."""
+    room = getattr(model, "reasoning_room", 0)
+    return room if isinstance(room, int) and not isinstance(room, bool) else 0
+
+
 PLAIN_WORDS = 530
 HEADING_WORDS = 25
 LINE_WORDS = 12
@@ -97,6 +104,7 @@ async def first_brief(tools: Any) -> str:
         profile,
         str(getattr(tools, "lang", "") or "en"),
         strict=bool(getattr(model, "strict", False)),
+        reasoning_room=_reasoning_room(model),
         spend=spend,
         complete=getattr(tools, "expectations_complete", None),
     )

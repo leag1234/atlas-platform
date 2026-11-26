@@ -56,6 +56,7 @@ class FakeModel:
         self.spent = Decimal(0)
         self.provider_model = ""
         self.reasoning_retried = False
+        self.reasoning_room = 0
         self.reasoning_used = "none"
         self.messages: list[Message] = []
 
