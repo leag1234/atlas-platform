@@ -146,6 +146,29 @@ class ParseTests(unittest.TestCase):
                 self.assertEqual(settled.kind, "app")
                 self.assertEqual(rule, "")
 
+    def test_prompt_orders_deliverables_before_later_proposals(self) -> None:
+        self.assertIn("The ORDER decides", request_router.SYSTEM)
+        self.assertIn(
+            "a deliverable asked for NOW keeps its kind", request_router.SYSTEM
+        )
+        examples = (
+            "Bau mir jetzt eine kleine App für meine Pflanzengiesser, "
+            "danach schlag mir zwei Varianten vor",
+            "make me a tiny recipe file in Markdown now, then ask me what I'd change",
+            "hazme un dibujo de un gato astronauta, despues dime dos ideas para mejorarlo",
+            "creami subito un disegno di una barca, poi proponimi due varianti",
+            "fais-moi une petite appli de minuteur tout de suite, "
+            "apres propose deux variantes",
+        )
+        for example in examples:
+            with self.subTest(example=example):
+                self.assertIn(example, request_router.SYSTEM)
+        self.assertIn(
+            '"propose d\'abord deux plans ici, puis attends mon choix" '
+            '{"kind": "answer"',
+            request_router.SYSTEM,
+        )
+
     def test_invalid_outputs_raise(self) -> None:
         for text in ("", "no json here", '{"kind": "poem"}', '{"format": "pdf"}'):
             with self.subTest(text=text):
