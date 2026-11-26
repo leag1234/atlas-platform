@@ -9,11 +9,13 @@ from collections.abc import Coroutine
 from decimal import Decimal
 import importlib.util
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
 from typing import Any
 import unittest
+from unittest import mock
 
 from services.orchestrator.constraints import checks, phrases, pipeline, verify
 from services.orchestrator.constraints.model import Constraint, validated
@@ -70,6 +72,159 @@ class Reading(unittest.TestCase):
         )
         self.assertEqual(
             [c.text for c in found if c.kind == "starts_with"], ["Dear all"]
+        )
+
+
+class BeforeWriting(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self._before = os.environ.get("ATLAS_CONSTRAINTS_BEFORE")
+        self._answer = os.environ.get("ATLAS_ANSWER_CONSTRAINTS")
+
+    def tearDown(self) -> None:
+        for name, value in (
+            ("ATLAS_CONSTRAINTS_BEFORE", self._before),
+            ("ATLAS_ANSWER_CONSTRAINTS", self._answer),
+        ):
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+    def test_block_is_numbered_and_off_by_default(self) -> None:
+        messages = [
+            ("user", "Réponds en trois phrases. Écris seulement « Marché du matin »."),
+            ("assistant", "Marché du matin."),
+            ("user", "Commence par « Bonjour » et termine par « Merci »."),
+        ]
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("ATLAS_CONSTRAINTS_BEFORE", None)
+            self.assertEqual(pipeline.before_enabled(), False)
+            self.assertEqual(
+                asyncio.run(
+                    pipeline.before_messages(
+                        messages, profile="test", strict=False, seconds=12.0
+                    )
+                ),
+                ([], 0.0),
+            )
+        with mock.patch.dict(os.environ, {"ATLAS_CONSTRAINTS_BEFORE": "on"}):
+            result = asyncio.run(
+                pipeline.before_messages(
+                    messages, profile="test", strict=False, seconds=12.0
+                )
+            )
+        self.assertEqual(
+            result[0],
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "Constraints of this request, all must hold:\n"
+                        "1. Commence par « Bonjour »\n"
+                        "2. par « Bonjour » et termine par « Merci »"
+                    ),
+                }
+            ],
+        )
+
+    def test_multilingual_order_and_no_constraints(self) -> None:
+        cases = [
+            (
+                [
+                    (
+                        "user",
+                        "Schreibe fünf Wörter. Beginne mit „Sonne“ und endet mit „Mond“.",
+                    )
+                ],
+                ["Beginne mit „Sonne“"],
+            ),
+            (
+                [("user", "Escribe solo « Faro » y usa tres puntos.")],
+                ["Escribe solo « Faro » y usa tres puntos."],
+            ),
+            (
+                [("user", "Scrivi due frasi e comincia con « Ciao ».")],
+                [
+                    "Scrivi due frasi e comincia con « Ciao »",
+                    "Scrivi due frasi e comincia con « Ciao ».",
+                ],
+            ),
+        ]
+        with mock.patch.dict(os.environ, {"ATLAS_CONSTRAINTS_BEFORE": "on"}):
+            for messages, quotes in cases:
+                result = asyncio.run(
+                    pipeline.before_messages(
+                        messages, profile="test", strict=False, seconds=12.0
+                    )
+                )
+                content = result[0][0]["content"]
+                self.assertTrue(
+                    content.startswith("Constraints of this request, all must hold:")
+                )
+                self.assertEqual(
+                    [line[3:] for line in content.splitlines()[1:]], quotes
+                )
+            result = asyncio.run(
+                pipeline.before_messages(
+                    [("user", "Raconte une histoire de marché.")],
+                    profile="test",
+                    strict=False,
+                    seconds=12.0,
+                )
+            )
+            self.assertEqual(
+                result[0],
+                ([]),
+            )
+
+    def test_failed_reading_never_blocks_the_answer(self) -> None:
+        async def fail(messages: dict[str, Any], seconds: float) -> dict[str, Any]:
+            raise RuntimeError("reader unavailable")
+
+        with mock.patch.dict(
+            os.environ,
+            {"ATLAS_CONSTRAINTS_BEFORE": "on", "ATLAS_ANSWER_CONSTRAINTS": "full"},
+        ):
+            result = asyncio.run(
+                pipeline.before_messages(
+                    [("user", "Answer with a constraint the tables cannot read.")],
+                    profile="test",
+                    strict=False,
+                    seconds=12.0,
+                    complete=fail,
+                )
+            )
+            self.assertEqual(result[0], [])
+
+    async def test_the_block_is_last_on_a_closing_call(self) -> None:
+        from services.orchestrator.loop import Limits, Query, Turn, run
+        from packages.profiles import PROFILES
+        from test_search_limit_closing import Research, Scripted, search
+
+        model = Scripted([Turn("", (search("s1"),)), Turn("Réponse finale.")])
+        result = await run(
+            Query(question="Réponds en trois mots.", lang="fr"),
+            model,
+            Research(allowance=0),
+            "",
+            Limits(profile=PROFILES[0], cost=Decimal("0.05")),
+            final_only=True,
+            final_messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Constraints of this request, all must hold:\n"
+                        "1. Réponds en trois mots."
+                    ),
+                }
+            ],
+        )
+        self.assertEqual((result.state, result.text), ("done", "Réponse finale."))
+        self.assertEqual(model.seen[1][-1]["role"], "system")
+        self.assertTrue(
+            str(model.seen[1][-1]["content"]).startswith(
+                "Constraints of this request, all must hold:"
+            )
         )
 
 

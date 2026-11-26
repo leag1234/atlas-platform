@@ -345,6 +345,7 @@ async def run(
     initial_calls: tuple[Call, ...] = (),
     references: ResultReferences | None = None,
     skill_messages: list[Message] | None = None,
+    final_messages: list[Message] | None = None,
     include_intermediate: bool = True,
     final_only: bool = False,
     before_final: Callable[[list[str]], str | None] | None = None,
@@ -672,6 +673,8 @@ async def run(
                 prepare_context = getattr(type(model), "prepare_context", None)
                 if prepare_context is not None:
                     await prepare_context(model, messages)
+                if final_messages is not None:
+                    messages.extend(dict(message) for message in final_messages)
                 reserved = model.estimate(messages)
                 reserve(reserved)
                 if isinstance(result, CodeResult):

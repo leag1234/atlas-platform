@@ -244,6 +244,16 @@ async def process_project(request: ChatRequest, item: Interaction) -> None:
             ensure_ascii=False,
         )
     )
+    from services.orchestrator.constraints import pipeline as answer_constraints
+
+    constraint_messages, constraint_ms = await answer_constraints.before_messages(
+        [(message.role, message.text) for message in request.messages],
+        profile=request.model,
+        strict=context.privacy == "strict",
+        seconds=request.timeout_seconds,
+    )
+    if constraint_ms:
+        item.latence_ms["constraints_before"] = constraint_ms
     try:
         result = await run(
             Query(
@@ -263,6 +273,7 @@ async def process_project(request: ChatRequest, item: Interaction) -> None:
                 ),
             ),
             history=history,
+            final_messages=constraint_messages,
             terminal_tools=frozenset({"generate_image"})
             if images_enabled()
             else frozenset(),

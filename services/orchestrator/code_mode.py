@@ -491,6 +491,14 @@ async def execute_turn(
         # instead of being cut at its per-call deadline (staging 2026-11-13:
         # an answer streaming for 120 s was cut and the turn failed, twice).
         model.progress_deadline = time.monotonic() + limits.wall_clock
+    from services.orchestrator.constraints import pipeline as answer_constraints
+
+    constraint_messages, constraint_ms = await answer_constraints.before_messages(
+        [(message.role, message.text) for message in request.messages],
+        profile=request.model,
+        strict=getattr(model, "privacy", "") == "strict",
+        seconds=limits.wall_clock,
+    )
     result = await run(
         Query(
             question=redact(request.user_text),
@@ -517,9 +525,12 @@ async def execute_turn(
         limits,
         history=history,
         references=references,
-        skill_messages=tools.skills.instructions
-        if isinstance(tools, WorkTools) and tools.skills is not None
-        else None,
+        skill_messages=(
+            tools.skills.instructions
+            if isinstance(tools, WorkTools) and tools.skills is not None
+            else []
+        ),
+        final_messages=constraint_messages,
         # A Work turn answers with its last statement. What the agent says between
         # tool calls ("I will first…", "that failed, let me retry…") is progress,
         # not the answer: it was glued in front of the result without a space.
