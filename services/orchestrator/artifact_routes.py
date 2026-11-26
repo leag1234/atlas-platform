@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import mimetypes
 from urllib.parse import quote, urlsplit
 
 import aiohttp
@@ -13,6 +14,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from services.orchestrator import artifact_store
 from services.orchestrator.artifact_store import ArtifactError
+from packages.artifact_source import drawing_source, is_drawing
 from services.orchestrator.artifact_tokens import issue_token, verify_token
 from services.orchestrator.project_ui import verified_subject
 from services.retrieval.project_identity import ProjectError
@@ -140,9 +142,10 @@ def _artifact_response(content: bytes, filename: str) -> Response:
 
 def _download_response(content: bytes, filename: str) -> Response:
     ascii_name = re.sub(r"[^A-Za-z0-9._ -]", "_", filename)
+    media_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
     return Response(
         content,
-        media_type="text/html; charset=utf-8",
+        media_type=media_type,
         headers={
             "Content-Disposition": (
                 f'attachment; filename="{ascii_name}"; '
@@ -151,6 +154,18 @@ def _download_response(content: bytes, filename: str) -> Response:
             )
         },
     )
+
+
+def _download_content(content: bytes, filename: str) -> bytes:
+    if filename.lower().endswith(".svg") and is_drawing(
+        content.decode("utf-8", "replace")
+    ):
+        svg = drawing_source(content.decode("utf-8"))
+        opening = re.match(r"(?is)<svg\b[^>]*>", svg)
+        if opening and "xmlns" not in opening.group(0):
+            svg = f'{svg[:4]} xmlns="http://www.w3.org/2000/svg"{svg[4:]}'
+        return svg.encode("utf-8")
+    return content
 
 
 def _insert_storage_shim(content: bytes) -> bytes:
@@ -222,7 +237,9 @@ async def download_artifact(
         artifact = artifact_store.read(artifact_id, subject, version_number)
     except (ProjectError, ArtifactError):
         return _not_found()
-    return _download_response(artifact.content, artifact.filename)
+    return _download_response(
+        _download_content(artifact.content, artifact.filename), artifact.filename
+    )
 
 
 @router.api_route(

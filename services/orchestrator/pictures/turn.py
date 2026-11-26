@@ -26,12 +26,13 @@ import logging
 import os
 import re
 import time
+import unicodedata
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from decimal import ROUND_FLOOR, Decimal
 from typing import Any
 
-from packages.artifact_source import Block, filename_for, prepare, title_of
+from packages.artifact_source import Block, prepare, title_of
 from packages.file_intent import requests_file_delivery
 from packages.limits import LimitError
 from packages.profiles import picture_profile
@@ -54,6 +55,10 @@ from services.orchestrator.pictures.texts import answer_language, checklist_text
 from services.orchestrator.pictures.worker import PictureJobError, run_job
 
 LOGGER = logging.getLogger(__name__)
+FILE_NAME = re.compile(
+    r"(?<![\w.-])([A-Za-z0-9][A-Za-z0-9_-]{0,127}\.(?:svg|png))(?![\w.-])",
+    re.IGNORECASE,
+)
 CEILING = Decimal("0.10")
 CEILING_LIMIT = Decimal("0.30")
 CHECKLIST_BUDGET = Decimal("0.01")
@@ -602,6 +607,97 @@ def file_line(
     return f"**{filename}** · [{label}]({prefix}/download)"
 
 
+def _slug(title: str, default: str) -> str:
+    ascii_title = (
+        unicodedata.normalize("NFKD", title).encode("ascii", "ignore").decode("ascii")
+    )
+    slug = re.sub(r"[^a-z0-9]+", "-", ascii_title.casefold()).strip("-")[:60]
+    return slug or default
+
+
+def _export_name(request_text: str, title: str, extension: str) -> str:
+    match = FILE_NAME.search(request_text)
+    if match:
+        stem = match.group(1).rsplit(".", 1)[0]
+        return f"{stem}.{extension}"
+    return f"{_slug(title, 'picture')}.{extension}"
+
+
+def _standalone_svg(content: bytes) -> bytes:
+    from packages.artifact_source import drawing_source
+
+    svg = drawing_source(content.decode("utf-8"))
+    opening = re.match(r"(?is)<svg\b[^>]*>", svg)
+    if opening and "xmlns" not in opening.group(0):
+        svg = f'{svg[:4]} xmlns="http://www.w3.org/2000/svg"{svg[4:]}'
+    return svg.encode("utf-8")
+
+
+def export_picture(
+    request: Any,
+    item: Any,
+    picture_set: store.PictureSet,
+    *,
+    requested_svg: bool,
+) -> str | None:
+    """Store the picture the person sees as a downloadable image version."""
+    from services.orchestrator import artifact_store
+    from services.orchestrator.artifact_store import ArtifactError
+
+    owner = str(getattr(request, "artifact_owner", "") or "")
+    if not owner or not picture_set.artifact_id:
+        return None
+    try:
+        current = artifact_store.read(
+            picture_set.artifact_id, owner, picture_set.artifact_version
+        )
+    except ArtifactError as error:
+        item.erreurs.append("picture_export_" + error.code)
+        return None
+    if picture_set.engine == "code" or picture_set.by_code:
+        extension = "svg"
+        content = _standalone_svg(current.content)
+    else:
+        extension = "png"
+        image = store.image_bytes(store.current_image_key(picture_set))
+        if image is None:
+            item.erreurs.append("picture_export_unavailable")
+            return None
+        content = image
+    filename = _export_name(
+        str(request.user_text), picture_set.title or current.filename, extension
+    )
+    try:
+        stored = artifact_store.update(
+            picture_set.artifact_id,
+            owner,
+            picture_set.title,
+            filename,
+            content,
+            str(getattr(item, "request_id", "") or "picture-export"),
+            base_version=picture_set.artifact_version,
+        )
+    except ArtifactError as error:
+        item.erreurs.append("picture_export_" + error.code)
+        return None
+    version = int(stored["version"])
+    picture_set.artifact_version = version
+    picture_set.file_requested = True
+    store.update(picture_set)
+    language = answer_language(picture_set.language, request.lang)
+    line = file_line(picture_set.artifact_id, version, filename, language)
+    if extension == "png" and requested_svg:
+        raster = {
+            "en": "The picture shown is a raster image, so the file is PNG.",
+            "fr": "L'image affichée est une image matricielle, le fichier est donc un PNG.",
+            "de": "Das gezeigte Bild ist eine Rastergrafik, die Datei ist daher PNG.",
+            "es": "La imagen mostrada es una imagen de mapa de bits, por lo que el archivo es PNG.",
+            "it": "L'immagine mostrata è un'immagine raster, quindi il file è PNG.",
+        }[language]
+        return f"{raster}\n\n{line}"
+    return line
+
+
 def cpu_pictures() -> int:
     from services.orchestrator.pictures.cpu_turn import CANDIDATES
 
@@ -934,7 +1030,7 @@ async def process_picture_turn(
         if prepared.problems:
             item.erreurs.append("picture_artifact_invalid")
         else:
-            filename = filename_for(title, "drawing")
+            filename = _export_name(request_text, title, "svg")
             try:
                 stored = artifact_store.create(
                     owner,

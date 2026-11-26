@@ -260,6 +260,46 @@ for (const name of ['localStorage', 'sessionStorage']) {
         self.assertEqual(response.headers["cache-control"], "private, no-store")
         self.assertEqual(response.headers["x-content-type-options"], "nosniff")
 
+    def test_image_downloads_use_their_media_type(self) -> None:
+        artifact = artifact_store.create(
+            "owner@example.test",
+            "Kite",
+            "kite.svg",
+            b'<svg xmlns="http://www.w3.org/2000/svg"></svg>',
+            "request-svg",
+        )
+        response = self.client.get(
+            f"/api/atlas/artifacts/{artifact['id']}/versions/1/download",
+            headers=self.owner(),
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["content-type"], "image/svg+xml")
+
+    def test_drawing_downloads_extract_the_inline_svg(self) -> None:
+        artifact = artifact_store.create(
+            "owner@example.test",
+            "Teapot",
+            "teapot.svg",
+            (
+                '<!DOCTYPE html><html><head><meta charset="utf-8">'
+                '<meta name="atlas-kind" content="drawing"><title>Teapot</title>'
+                '</head><body><svg width="20" height="10"><path d="M0 0"/></svg>'
+                "</body></html>"
+            ).encode("utf-8"),
+            "request-drawing",
+        )
+        response = self.client.get(
+            f"/api/atlas/artifacts/{artifact['id']}/versions/1/download",
+            headers=self.owner(),
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["content-type"], "image/svg+xml")
+        self.assertEqual(
+            response.content,
+            b'<svg xmlns="http://www.w3.org/2000/svg" width="20" height="10">'
+            b'<path d="M0 0"/></svg>',
+        )
+
     def test_isolation_headers_are_set_exactly_once(self) -> None:
         open_response = self.client.get(
             f"/api/atlas/artifacts/{self.artifact_id}/versions/1/open",

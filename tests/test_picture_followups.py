@@ -248,6 +248,8 @@ class FollowUpTests(Base):
         from services.orchestrator.artifact_tools import current_artifact_message
 
         request = Request(text, history)
+        if routed is not None:
+            request.__dict__["model_route"] = routed
         messages: list[dict[str, object]] = [
             {"role": r, "content": t} for r, t in history
         ]
@@ -355,35 +357,56 @@ class FollowUpTests(Base):
                 self.assertEqual(len(server.renders), 2)  # the first two only
                 self.assertEqual(item.cout_eur, 0)
 
-    async def test_file_requests_leave_the_picture_path(self) -> None:
+    async def test_file_requests_export_the_picture_shown(self) -> None:
         cases = [
-            ("fr", "donne le phare en SVG s'il te plaît"),
-            ("en", "can I get the lighthouse as a downloadable SVG?"),
-            ("de", "exportiere das Leuchtturmbild als SVG-Datei"),
-            ("es", "el archivo descargado del faro no es un SVG"),
-            ("fr", "mets la bicyclette dans un fichier nommée bicyclette.svg"),
-            ("en", "save the bicycle as bicycle.svg"),
-            ("de", "die heruntergeladene Datei für das Fahrrad ist kein SVG"),
-            ("es", "exporta el helecho como archivo SVG"),
+            ("fr", "donne le moulin en SVG s'il te plaît", "le-moulin.svg"),
+            ("en", "can I get the teapot as a downloadable SVG?", "teapot.svg"),
+            ("de", "exportiere das Drachenbild als kite.svg", "kite.svg"),
+            ("es", "exporta la cometa como archivo SVG", "cometa.svg"),
         ]
-        for language, text in cases:
+        for language, text, filename in cases:
             with self.subTest(language=language, text=text):
+                patcher = patch.dict(
+                    os.environ,
+                    {"ATLAS_PICTURES_BY_CODE": "1", "ATLAS_PICTURES_CPU": "0"},
+                )
+                patcher.start()
+                self.addCleanup(patcher.stop)
                 gateway = DialogueGateway(follow_reply("file"))
                 server = FakeServer()
                 first, _ = await self.start(gateway, server)
-                rewrite_calls = len(gateway.payloads)
+                picture_set = self.picture_set(first)
+                picture_set.title = {
+                    "fr": "Le moulin",
+                    "en": "Teapot",
+                    "de": "Kite",
+                    "es": "Cometa",
+                }[language]
+                store.update(picture_set)
+                from services.orchestrator import artifact_store
+
+                current = artifact_store.read(
+                    picture_set.artifact_id,
+                    "owner@example.test",
+                    picture_set.artifact_version,
+                )
+                expected = picture_turn._standalone_svg(current.content).decode("utf-8")
                 history = [("user", FIRST), ("assistant", first.reponse)]
                 renders = len(server.renders)
                 done, item = await self.follow(gateway, history, text)
-                self.assertFalse(done)
+                self.assertTrue(done)
                 self.assertEqual(len(server.renders), renders)
-                self.assertEqual(item.cout_eur, 0)
-                self.assertNotIn(
-                    rewrite.SYSTEM,
-                    [
-                        payload["messages"][0]["content"]
-                        for payload in gateway.payloads[rewrite_calls:]
-                    ],
+                self.assertIn(f"**{filename}**", item.reponse)
+                self.assertIn("/download", item.reponse)
+                after = self.picture_set(first)
+                exported = artifact_store.read(
+                    after.artifact_id, "owner@example.test", after.artifact_version
+                )
+                self.assertEqual(exported.filename, filename)
+                self.assertEqual(exported.content.decode("utf-8"), expected)
+                self.assertIn(
+                    'xmlns="http://www.w3.org/2000/svg"',
+                    exported.content.decode("utf-8"),
                 )
 
     async def test_a_mixed_file_request_is_a_visual_change(self) -> None:
@@ -413,6 +436,36 @@ class FollowUpTests(Base):
             prompt,
         )
 
+    async def test_a_raster_picture_with_svg_asked_is_exported_as_png(self) -> None:
+        gateway = DialogueGateway(follow_reply("file"))
+        server = FakeServer()
+        first, _ = await self.start(gateway, server)
+        picture_set = self.picture_set(first)
+        picture_set.title = "Windmill"
+        picture_set.engine = "cpu"
+        picture_set.by_code = False
+        store.update(picture_set)
+        history = [("user", FIRST), ("assistant", first.reponse)]
+        done, item = await self.follow(gateway, history, "please give windmill.svg")
+        self.assertTrue(done)
+        self.assertRegex(
+            item.reponse.lower(),
+            r"raster image|image matricielle|mapa de bits",
+        )
+        self.assertIn("**windmill.png**", item.reponse)
+        self.assertIn("/download", item.reponse)
+        after = self.picture_set(first)
+        from services.orchestrator import artifact_store
+
+        exported = artifact_store.read(
+            after.artifact_id, "owner@example.test", after.artifact_version
+        )
+        self.assertEqual(exported.filename, "windmill.png")
+        self.assertEqual(
+            exported.content,
+            store.image_bytes(store.current_image_key(picture_set)),
+        )
+
     async def test_outside_kinds_skip_the_reading_call(self) -> None:
         from services.orchestrator.request_router import Decision
 
@@ -420,7 +473,10 @@ class FollowUpTests(Base):
         first, _ = await self.start(gateway, server)
         history = [("user", "un jardinier"), ("assistant", first.reponse)]
         done, _ = await self.follow(
-            gateway, history, "make a spreadsheet of it", routed=Decision(kind="file")
+            gateway,
+            history,
+            "make a spreadsheet of it",
+            routed=Decision(kind="remote"),
         )
         self.assertFalse(done)
         self.assertEqual(gateway.follows, [])

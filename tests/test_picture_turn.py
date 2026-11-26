@@ -328,7 +328,7 @@ class TurnTests(unittest.IsolatedAsyncioTestCase):
         )
         item = Interaction()
         await turn.process_picture_turn(request, item, complete=gateway)
-        filename = "dessin.html"
+        filename = "dessin.svg"
         self.assertIn(f"**{filename}**", item.reponse)
         self.assertIn("/versions/1/download", item.reponse)
         set_id = latest_set_id([{"role": "assistant", "content": item.reponse}])
@@ -360,7 +360,7 @@ class TurnTests(unittest.IsolatedAsyncioTestCase):
         request.__dict__[DECISION_KEY] = Decision(kind="drawing")
         item = Interaction()
         await turn.process_picture_turn(request, item, complete=gateway)
-        self.assertIn("**dessin.html**", item.reponse)
+        self.assertIn("**dessin.svg**", item.reponse)
         self.assertIn("/versions/1/download", item.reponse)
         set_id = latest_set_id([{"role": "assistant", "content": item.reponse}])
         assert set_id is not None
