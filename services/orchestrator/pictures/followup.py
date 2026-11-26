@@ -226,6 +226,9 @@ async def process_picture_followup(
     started = time.monotonic()
     # A change keeps the language of the picture it changes.
     language = answer_language(picture_set.language, request.lang)
+    from services.orchestrator.pictures.dialogue import person_register
+
+    found = person_register(request, language)
     item.task_type = "drawing"
     own = turn_ceiling()
     spend = Spend(min(own, cost_limit) if cost_limit is not None else own)
@@ -345,6 +348,7 @@ async def process_picture_followup(
                 item.reponse = text(
                     language,
                     "same_drawing_again" if method_changed else "same_drawing",
+                    found=found,
                     version=picture_set.artifact_version,
                 )
                 item.state = "done"
@@ -405,6 +409,7 @@ async def process_picture_followup(
         item.reponse = text(
             language,
             "code_kept",
+            found=found,
             n=len(tried),
             items=cpu_checks.gapped(language, list(unmet or []), gaps),
             version=picture_set.artifact_version,
@@ -441,18 +446,23 @@ async def process_picture_followup(
         checked = text(
             language,
             "code_unsatisfied",
+            found=found,
             n=len(tried),
             items=cpu_checks.gapped(language, list(unmet or []), gaps),
         )
     elif unmet is None:
         item.erreurs.append("picture_change_unchecked")
         checked = text(
-            language, "code_check_unknown", items=cpu_checks.items(language, statements)
+            language,
+            "code_check_unknown",
+            found=found,
+            items=cpu_checks.items(language, statements),
         )
     elif len(tried) > 1:
         checked = text(
             language,
             "code_retried",
+            found=found,
             n=len(tried),
             items=cpu_checks.items(language, statements),
         )
@@ -463,6 +473,7 @@ async def process_picture_followup(
         "redrawn_after_same"
         if method_changed
         else ("redrawn" if redrawn else "changed"),
+        found=found,
     )
     lines = [" ".join(filter(None, [lead, checked]))]
     lines.append(f"![{picture_set.title}]({image})")

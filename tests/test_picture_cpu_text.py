@@ -304,6 +304,28 @@ class RegisterTests(unittest.TestCase):
         finally:
             addressing.end(token)
 
+    def test_a_neutral_turn_keeps_the_register_of_the_conversation(self) -> None:
+        # The turn itself says nothing about the register ("two wheels"): the
+        # fixed texts follow the earlier messages, with nothing recorded for
+        # the turn.
+        from types import SimpleNamespace
+
+        from services.orchestrator.pictures import texts as picture_texts
+        from services.orchestrator.pictures.dialogue import person_register
+
+        for language, pattern in self.POLITE.items():
+            request = SimpleNamespace(
+                person_texts=[self.FAMILIAR[language], "2"],
+            )
+            found = person_register(request, language)
+            with self.subTest(language=language):
+                self.assertEqual(found, "informal")
+                for key in ("cpu_unsatisfied_all", "code_failed_too", "changed"):
+                    template = picture_texts.TEXTS[language][key]
+                    values = {name: "X" for name in re.findall(r"\{(\w+)\}", template)}
+                    written = picture_texts.text(language, key, found=found, **values)
+                    self.assertIsNone(pattern.search(written), written)
+
     def test_polite_or_unknown_register_keeps_the_tables(self) -> None:
         from services.orchestrator.pictures import texts as picture_texts
 

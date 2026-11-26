@@ -230,7 +230,10 @@ async def _status(key: str, language: str, **values: object) -> None:
     sink = sink_context.get()
     if sink is not None:
         await sink(
-            {"phase": "artifact_progress", "description": text(language, key, **values)}
+            {
+                "phase": "artifact_progress",
+                "description": text(language, key, found=None, **values),
+            }
         )
 
 

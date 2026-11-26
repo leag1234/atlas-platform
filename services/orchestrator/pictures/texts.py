@@ -520,9 +520,9 @@ FAMILIAR: dict[str, tuple[tuple[str, str], ...]] = {
 }
 
 
-def text(language: str, key: str, **values: object) -> str:
+def text(language: str, key: str, *, found: str | None = None, **values: object) -> str:
     """A fixed text in the register of the turn's person, then filled in
     (the values, such as the person's own statements, are never rewritten)."""
     table = TEXTS.get(language, TEXTS["en"])
-    template = addressed(table[key], language, extra=FAMILIAR.get(language, ()))
+    template = addressed(table[key], language, found, extra=FAMILIAR.get(language, ()))
     return template.format(**values)
