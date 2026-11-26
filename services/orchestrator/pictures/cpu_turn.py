@@ -651,6 +651,7 @@ async def change(
     from services.orchestrator.artifact_tools import footer
     from services.orchestrator.pictures import cpu_enabled, store
     from services.orchestrator.pictures.texts import text
+    from services.orchestrator.pictures.dialogue import person_register
     from services.orchestrator.pictures.turn import (
         Refused,
         Spend,
@@ -663,6 +664,7 @@ async def change(
 
     started = time.monotonic()
     language = answer_language(picture_set.language, request.lang)
+    found = person_register(request, language)
     item.task_type = "drawing"
     owner = str(getattr(request, "artifact_owner", "") or "")
     unchanged = app_failure(
@@ -698,9 +700,12 @@ async def change(
         item.cout_eur = float(spend.total)
         item.reponse = " ".join(
             [
-                text(language, "cpu_no_edit_" + reason),
+                text(language, "cpu_no_edit_" + reason, found=found),
                 text(
-                    language, "cpu_no_edit_offer", version=picture_set.artifact_version
+                    language,
+                    "cpu_no_edit_offer",
+                    found=found,
+                    version=picture_set.artifact_version,
                 ),
             ]
         )
@@ -752,7 +757,10 @@ async def change(
             "drawing", language, unchanged_version=picture_set.artifact_version
         )
         if plan.refused:
-            item.reponse, item.state = text(language, "cpu_refused"), "done"
+            item.reponse, item.state = (
+                text(language, "cpu_refused", found=found),
+                "done",
+            )
             item.cout_eur = float(spend.total)
             return True
         if variation and wanted and not plan.checks:
@@ -762,7 +770,10 @@ async def change(
             item.erreurs.extend([*errors, "picture_cpu_not_applied"])
             item.cout_eur = float(spend.total)
             item.reponse = text(
-                language, "cpu_not_applied", version=picture_set.artifact_version
+                language,
+                "cpu_not_applied",
+                found=found,
+                version=picture_set.artifact_version,
             )
             item.state = "done"
             LOGGER.info("picture_cpu_change applied=false reason=unchanged_prompt")
@@ -912,7 +923,9 @@ async def change(
     item.tokens = {"in": spend.tokens_in, "out": spend.tokens_out}
     item.latence_ms.update({f"picture_{k}": v for k, v in timings.items()})
     if not finished:
-        item.reponse = text(language, "cpu_filtered") if filtered else unchanged
+        item.reponse = (
+            text(language, "cpu_filtered", found=found) if filtered else unchanged
+        )
         item.state = "done"
         return True
     result = ranked(finished)[0]
@@ -928,20 +941,24 @@ async def change(
         item.reponse = text(
             language,
             "cpu_kept",
+            found=found,
             n=attempts,
             items=cpu_checks.gapped(language, list(result.get("unmet") or []), gaps),
             version=picture_set.artifact_version,
         )
         if "picture_code_instead_unmet" in errors:
             # The drawing by code was tried too: said, not hidden.
-            item.reponse += " " + text(language, "code_failed_too")
+            item.reponse += " " + text(language, "code_failed_too", found=found)
         item.state = "done"
         return True
     if current_hash and result.get("render_hash") == current_hash:
         # The same picture again: no new version, and no claimed change.
         item.erreurs.append("picture_cpu_same_image")
         item.reponse = text(
-            language, "cpu_same_image", version=picture_set.artifact_version
+            language,
+            "cpu_same_image",
+            found=found,
+            version=picture_set.artifact_version,
         )
         item.state = "done"
         return True
@@ -1017,27 +1034,34 @@ async def change(
     # stated): new draws of it, checked, never "nothing precise to change"
     # and never a request to say again what the message just said.
     if redrawn_instead and strategy == "cpu":
-        lead = text(language, "cpu_redrawn")
+        lead = text(language, "cpu_redrawn", found=found)
     elif not variation:
-        lead = text(language, "changed")
+        lead = text(language, "changed", found=found)
     elif not wanted:
-        lead = text(language, "cpu_variation")
+        lead = text(language, "cpu_variation", found=found)
     elif plan.checks:
         lead = text(
             language,
             "cpu_again_checked",
+            found=found,
             items=cpu_checks.items(language, plan.checks),
         )
     else:
-        lead = text(language, "cpu_again")
+        lead = text(language, "cpu_again", found=found)
     if strategy == "code_first":
         # Say what changes: another method, not the same draw again.
-        lead = text(language, "strategy_code", items=cpu_checks.items(language, missed))
+        lead = text(
+            language,
+            "strategy_code",
+            found=found,
+            items=cpu_checks.items(language, missed),
+        )
         checks_said = ""
     elif strategy == "code":
         checks_said = text(
             language,
             "code_instead",
+            found=found,
             n=attempts,
             items=cpu_checks.items(language, plan.checks),
         )
@@ -1046,7 +1070,7 @@ async def change(
             language, plan.checks, [result.get("unmet")], attempts, unsatisfied, gaps
         )
         if unsatisfied and code_ready:
-            checks_said += " " + text(language, "code_failed_too")
+            checks_said += " " + text(language, "code_failed_too", found=found)
     item.reponse = "\n\n".join(
         [
             " ".join(filter(None, [lead, checks_said])),
