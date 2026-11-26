@@ -5,6 +5,7 @@ import unittest
 from unittest.mock import patch
 
 from services.orchestrator import artifact_store
+from services.orchestrator.artifact_links import checked
 from services.orchestrator.artifact_tools import (
     clean_summary,
     compose_answer,
@@ -119,6 +120,22 @@ class ArtifactToolsTests(unittest.TestCase):
         self.assertEqual(current.artifact["version"], 1)
         self.assertEqual(current.artifact["content"], HTML)
 
+    def test_a_promised_but_unstored_version_is_not_called_unchanged(self) -> None:
+        created = artifact_store.create(
+            "user@example.test", "Plant timer", "timer.html", HTML.encode(), "request-1"
+        )
+        artifact_id = str(created["id"])
+        answer = (
+            "I am preparing a fixed version. "
+            f"[Open Plant timer 2](/api/atlas/artifacts/{artifact_id}/versions/2/open)"
+        )
+        final, removed = checked(answer, "fr", "user@example.test")
+        self.assertEqual(removed, 1)
+        self.assertIn("Aucune nouvelle version n'a été créée", final)
+        self.assertIn("Demande-moi encore la modification souhaitée", final)
+        self.assertNotIn("La modification n'a pas pu être appliquée", final)
+        self.assertNotIn("/versions/2/open", final)
+
     def test_current_artifact_omits_oversized_source(self) -> None:
         large = "<html><body>" + ("x" * 100000) + "</body></html>"
         created = artifact_store.create(
@@ -156,7 +173,8 @@ class ArtifactToolsTests(unittest.TestCase):
         )
         self.assertEqual(
             unchanged_footer(2, "en"),
-            "The change could not be applied; version 2 is unchanged.",
+            "No new version was made on this turn; version 2 is still current. "
+            "Ask me again for the change you want.",
         )
         answer = compose_answer(
             "Here it is.",

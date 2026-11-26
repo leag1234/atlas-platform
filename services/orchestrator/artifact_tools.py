@@ -22,7 +22,10 @@ FOOTER_LABELS: dict[str, dict[str, str]] = {
         "open": 'Open "{title}" (version {version})',
         "download": "Download {filename}",
         "temporary": "Temporary preview: data entered in the app is not kept.",
-        "unchanged": "The change could not be applied; version {version} is unchanged.",
+        "unchanged": (
+            "No new version was made on this turn; version {version} is still "
+            "current. Ask me again for the change you want."
+        ),
         "identical": (
             "Nothing was changed: the code written for this request is identical "
             "to version {version}, which stays the current one."
@@ -41,8 +44,9 @@ FOOTER_LABELS: dict[str, dict[str, str]] = {
             "ne sont pas conservées."
         ),
         "unchanged": (
-            "La modification n'a pas pu être appliquée ; la version {version} "
-            "reste inchangée."
+            "Aucune nouvelle version n'a été créée à ce tour ; la version "
+            "{version} reste actuelle. Demande-moi encore la modification "
+            "souhaitée."
         ),
         "identical": (
             "Rien n'a été modifié : le code écrit pour cette demande est identique "
@@ -62,8 +66,8 @@ FOOTER_LABELS: dict[str, dict[str, str]] = {
             "Temporäre Vorschau: In der App eingegebene Daten werden nicht gespeichert."
         ),
         "unchanged": (
-            "Die Änderung konnte nicht übernommen werden; Version {version} "
-            "bleibt unverändert."
+            "In diesem Zug wurde keine neue Version erstellt; Version {version} "
+            "bleibt aktuell. Bitte mir die gewünschte Änderung noch einmal."
         ),
         "identical": (
             "Es wurde nichts geändert: Der für diese Anfrage geschriebene Code ist "
@@ -83,7 +87,10 @@ FOOTER_LABELS: dict[str, dict[str, str]] = {
             "Vista previa temporal: los datos introducidos en la aplicación "
             "no se conservan."
         ),
-        "unchanged": ("No se pudo aplicar el cambio; la versión {version} no cambia."),
+        "unchanged": (
+            "No se creó ninguna versión nueva en este turno; la versión {version} "
+            "sigue siendo la actual. Pídeme otra vez el cambio que quieres."
+        ),
         "identical": (
             "No se ha cambiado nada: el código escrito para esta petición es idéntico "
             "a la versión {version}, que sigue siendo la actual."
@@ -101,8 +108,8 @@ FOOTER_LABELS: dict[str, dict[str, str]] = {
             "Anteprima temporanea: i dati inseriti nell'app non vengono conservati."
         ),
         "unchanged": (
-            "Non è stato possibile applicare la modifica; la versione {version} "
-            "resta invariata."
+            "In questo turno non è stata creata una nuova versione; la versione "
+            "{version} resta attuale. Chiedimi di nuovo la modifica che vuoi."
         ),
         "identical": (
             "Non è stato modificato nulla: il codice scritto per questa richiesta è "

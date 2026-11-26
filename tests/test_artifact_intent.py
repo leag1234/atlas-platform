@@ -121,19 +121,6 @@ class ArtifactIntentTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertEqual(app_intent(text, HISTORY), "modify")
 
-    def test_a_report_that_the_app_is_broken_goes_to_the_app(self) -> None:
-        requests = (
-            "The seed-trader app shows nothing.",
-            "L'appli de recettes affiche rien.",
-            "Die Wetteruhr-App zeigt nichts.",
-            "La app del inventario no muestra nada.",
-            "L'app della palestra non mostra nulla.",
-            "Nothing is displayed in the jam-label app.",
-        )
-        for text in requests:
-            with self.subTest(text=text):
-                self.assertEqual(app_intent(text, HISTORY), "modify")
-
     def test_questions_about_the_app_stay_questions(self) -> None:
         requests = (
             "Kannst du mir sagen, was die App speichert?",

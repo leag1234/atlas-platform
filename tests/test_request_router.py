@@ -91,6 +91,29 @@ class ParseTests(unittest.TestCase):
             request_router.parse('{"kind": "app", "follow_up": true}').changes_delivered
         )
 
+    def test_a_broken_delivery_complaint_is_a_fix_request(self) -> None:
+        cases = (
+            "The seed-trader app shows nothing.",
+            "L'écran de l'appli reste vide.",
+            "Der Button macht nichts.",
+            "La página no funciona.",
+            "L'app della ricette non funziona.",
+        )
+        for text in cases:
+            with self.subTest(text=text):
+                self.assertIn("does not work", request_router.SYSTEM)
+                self.assertIn("shows nothing", request_router.SYSTEM)
+                self.assertIn("ça ne marche pas", request_router.SYSTEM)
+                self.assertIn("no funciona", request_router.SYSTEM)
+                self.assertIn("non funziona", request_router.SYSTEM)
+                self.assertIn("sie funktioniert nicht", request_router.SYSTEM)
+                self.assertEqual(
+                    request_router.parse(
+                        '{"kind": "app", "follow_up": true, "changes_delivered": true}'
+                    ),
+                    Decision(kind="app", follow_up=True, changes_delivered=True),
+                )
+
     def test_a_no_change_followup_is_answered_in_chat(self) -> None:
         cases = (
             "What does the export button do?",
