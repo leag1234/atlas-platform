@@ -23,6 +23,8 @@ import unittest
 from unittest import mock
 
 from services.orchestrator.constraints import checks, pipeline, verify
+from services.orchestrator.constraints.pipeline import delivered
+from services.orchestrator.constraints.checks import Result
 from services.orchestrator.constraints.model import Constraint, part_of
 from services.orchestrator.constraints.views import answer_view
 
@@ -310,6 +312,38 @@ class Repairs(ModelProfile):
         self.assertIn("model:new_content", outcome.dropped)
         # What code decided is still said, naming what is missing.
         self.assertIn("the list is not in the form asked", outcome.note)
+
+    def test_repair_adding_a_turn_failure_is_dropped(self) -> None:
+        outcome, _ = self.repaired(
+            "I could not attach the file.\n\n- Sea star\n- Hermit crab\n- Anemone"
+        )
+        self.assertEqual(outcome.answer, self.NUMBERED)
+        self.assertIn("model:new_failure", outcome.dropped)
+
+    def test_repair_receives_the_delivered_files(self) -> None:
+        reply = "Here is the report.\n\n" + LINK
+        messages = verify.repair_messages(
+            reply,
+            [
+                (
+                    Constraint(
+                        "judge",
+                        "answer",
+                        "If you could not attach it, say so",
+                        1,
+                        statement="say whether the attachment failed",
+                        condition="you could not attach the file",
+                        id="K1",
+                    ),
+                    Result("K1", False, "Here is the report.", "model"),
+                )
+            ],
+            [("user", "Send the report.")],
+            sorted(delivered(reply)),
+        )
+        self.assertIn(
+            '"/api/atlas/artifacts/b7/versions/1/open"', messages[1]["content"]
+        )
 
     def test_repair_losing_a_constraint_that_passed_is_dropped(self) -> None:
         person = (

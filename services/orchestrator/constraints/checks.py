@@ -149,6 +149,12 @@ def check(item: Constraint, view: View, facts: dict[str, Any] | None = None) -> 
     """The verdict of code on one constraint; None for kinds code cannot read."""
     facts = facts or {}
     kind = item.kind
+    if item.condition:
+        outcome = _turn_outcome(item.condition, facts)
+        if outcome is None:
+            return Result(item.id, None)
+        if not outcome:
+            return Result(item.id, True)
     if kind == "judge":
         return Result(item.id, None)
     if kind == "no_new_file":
@@ -204,6 +210,34 @@ def check(item: Constraint, view: View, facts: dict[str, Any] | None = None) -> 
     if any(ok is None for ok, _ in verdicts):
         return Result(item.id, None)
     return Result(item.id, True, verdicts[0][1] if verdicts else "")
+
+
+_OUTCOME = re.compile(
+    r"\b(?:file|attachment|document|app|application|picture|image|"
+    r"fichier|piece jointe|pièce jointe|document|application|image|"
+    r"datei|anhang|dokument|app|bild|archivo|adjunto|documento|aplicacion|"
+    r"aplicación|imagen)\b",
+    re.I,
+)
+_NEGATION = re.compile(
+    r"\b(?:not|no|cannot|can't|couldn't|could not|failed|without|"
+    r"pas|ne|impossible|nicht|kein|keine|nicht konnen|nicht können|"
+    r"sin|no pude|no puedes)\b",
+    re.I,
+)
+
+
+def _turn_outcome(condition: str, facts: dict[str, Any]) -> bool | None:
+    """Whether a condition about this turn's own outcome holds; None when it
+    is about something else and belongs to the verifier."""
+    if not _OUTCOME.search(condition):
+        return None
+    produced = facts.get("produced")
+    made = str(facts.get("made") or "")
+    if produced is None and not made:
+        return None
+    happened = bool(produced) or bool(made)
+    return not happened if _NEGATION.search(condition) else happened
 
 
 def _one(item: Constraint, view: View) -> tuple[bool | None, str]:
@@ -398,6 +432,11 @@ def part_results(items: Sequence[Constraint], view: View) -> dict[str, Result]:
     parts are matched one to one with the parts, and only when there are as
     many parts as such constraints; a count no part meets is a failure."""
     results = {item.id: Result(item.id, None) for item in items}
+    for item in items:
+        if item.condition:
+            results[item.id] = check(
+                item, view, {"raw": "\n".join(block.text for block in view.blocks)}
+            )
     runs = list_runs(view)
     if len(runs) < 2:
         return results

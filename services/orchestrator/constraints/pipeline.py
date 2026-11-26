@@ -804,6 +804,21 @@ def refusal(
     return ""
 
 
+_FAILURE = re.compile(
+    r"\b(?:could not|couldn't|cannot|can't|was not|wasn't|were not|weren't|"
+    r"failed to|unable to|n'ai pas pu|n'a pas pu|n'est pas|ne suis pas|"
+    r"konnte nicht|konnte es nicht|nicht anhängen|nicht hochladen|"
+    r"no pude|no he podido|no se pudo|no está|no esta)\b",
+    re.I,
+)
+
+
+def _new_failure(repaired: str, original: str) -> bool:
+    """Whether a rewrite introduces a failure statement absent from the
+    original reply."""
+    return bool(_FAILURE.search(repaired)) and not _FAILURE.search(original)
+
+
 # ---- the pass -------------------------------------------------------------------------
 
 
@@ -929,6 +944,7 @@ async def enforce(
                     answer,
                     [(item, results[item.id]) for item in rewritable],
                     messages,
+                    sorted(delivered(answer)),
                 ),
                 verify.REPAIR_TOKENS,
                 min(REPAIR_SECONDS, left()),
@@ -938,6 +954,8 @@ async def enforce(
                 outcome.dropped.append("model:no_valid_rewrite")
             else:
                 why = refusal(answer, rewritten, person, shown, allowed)
+                if not why and _new_failure(rewritten, answer):
+                    why = "new_failure"
                 again = await judged(rewritten) if not why else results
                 if not why and not better(results, again):
                     why = "no_gain"

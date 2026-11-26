@@ -357,6 +357,45 @@ class Checkers(unittest.TestCase):
             checks.check(item, answer_view("ok"), {"produced": False}).passed
         )
 
+    def test_turn_outcome_condition_decides_the_constraint(self) -> None:
+        person = ["Envoie le rapport. Si tu ne peux pas l'attacher, dis-le."]
+        raw = {
+            "kind": "judge",
+            "scope": "answer",
+            "quote": "Si tu ne peux pas l'attacher, dis-le",
+            "statement": "dire si la pièce jointe manque",
+            "condition": "tu ne peux pas attacher le fichier",
+        }
+        item = validated(raw, 1, person)
+        assert item is not None
+        self.assertEqual(item.condition, "tu ne peux pas attacher le fichier")
+        self.assertTrue(
+            checks.check(
+                item,
+                answer_view("Voici le rapport."),
+                {"produced": True, "made": "rapport.pdf"},
+            ).passed
+        )
+        self.assertFalse(
+            checks.check(
+                item, answer_view("Voici le rapport."), {"produced": False}
+            ).passed
+        )
+
+    def test_outside_condition_is_left_to_the_verifier(self) -> None:
+        item = Constraint(
+            "judge",
+            "answer",
+            "Si le magasin est fermé le dimanche, dis-le",
+            1,
+            statement="dire si le magasin est fermé",
+            condition="le magasin est fermé le dimanche",
+            id="K1",
+        )
+        self.assertIsNone(
+            checks.check(item, answer_view("Le magasin est ouvert.")).passed
+        )
+
 
 class CodeRepairs(unittest.TestCase):
     def test_line_moved_under_the_file(self) -> None:
@@ -409,6 +448,30 @@ class CodeRepairs(unittest.TestCase):
             )
         )
         self.assertEqual([c.kind for c in outcome.unmet()], ["no_new_file"])
+
+    def test_conditional_failure_is_not_repaired_when_the_file_was_delivered(
+        self,
+    ) -> None:
+        messages = [
+            (
+                "user",
+                "Send the report. If you could not attach the file, just say so.",
+            )
+        ]
+        answer = "Here is the report.\n\n" + LINK
+        outcome = run(
+            pipeline.enforce(
+                messages,
+                answer,
+                language="en",
+                produced=True,
+                made="report.pdf",
+                run_mode="code",
+            )
+        )
+        self.assertEqual(outcome.answer, answer)
+        self.assertEqual(outcome.repaired, "")
+        self.assertEqual(outcome.note, "")
 
     def test_plain_turn_costs_nothing(self) -> None:
         outcome = run(
