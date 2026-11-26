@@ -56,7 +56,7 @@ from services.orchestrator.pictures.worker import PictureJobError, run_job
 
 LOGGER = logging.getLogger(__name__)
 FILE_NAME = re.compile(
-    r"(?<![\w.-])([A-Za-z0-9][A-Za-z0-9_-]{0,127}\.(?:svg|png))(?![\w.-])",
+    r"(?<![\w.-])([A-Za-z0-9][A-Za-z0-9_-]{0,127}\.(?:svg|png|jpe?g|webp|gif))(?![\w-])",
     re.IGNORECASE,
 )
 CEILING = Decimal("0.10")
@@ -619,6 +619,9 @@ def _export_name(request_text: str, title: str, extension: str) -> str:
     match = FILE_NAME.search(request_text)
     if match:
         stem = match.group(1).rsplit(".", 1)[0]
+        requested_extension = match.group(1).rsplit(".", 1)[1].lower()
+        if requested_extension in {"svg", "png", "jpg", "jpeg", "webp", "gif"}:
+            return match.group(1)
         return f"{stem}.{extension}"
     return f"{_slug(title, 'picture')}.{extension}"
 
@@ -664,9 +667,16 @@ def export_picture(
             item.erreurs.append("picture_export_unavailable")
             return None
         content = image
+    requested_file = FILE_NAME.search(str(request.user_text))
     filename = _export_name(
         str(request.user_text), picture_set.title or current.filename, extension
     )
+    if requested_file is not None and requested_file.group(1).lower().endswith(
+        f".{extension}"
+    ):
+        filename = requested_file.group(1)
+    elif requested_file is not None:
+        filename = f"{requested_file.group(1).rsplit('.', 1)[0]}.{extension}"
     try:
         stored = artifact_store.create(
             owner,
@@ -1022,6 +1032,8 @@ async def process_picture_turn(
             item.erreurs.append("picture_artifact_invalid")
         else:
             filename = _export_name(request_text, title, "svg")
+            if file_requested and (match := FILE_NAME.search(request_text)):
+                filename = match.group(1)
             try:
                 stored = artifact_store.create(
                     owner,

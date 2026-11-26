@@ -73,6 +73,16 @@ class ParseTests(unittest.TestCase):
             request_router.parse('{"kind": "file", "file_format": "odt"}').file_format
         )
 
+    def test_image_formats_are_valid_for_drawings(self) -> None:
+        for name in ("svg", "png", "jpg", "jpeg", "webp", "gif"):
+            with self.subTest(format=name):
+                self.assertEqual(
+                    request_router.parse(
+                        f'{{"kind": "drawing", "file_format": "{name}"}}'
+                    ),
+                    Decision(kind="drawing", file_format=name),
+                )
+
     def test_the_model_decides_whether_a_delivered_file_changes(self) -> None:
         self.assertTrue(
             request_router.parse(
@@ -570,7 +580,7 @@ class RouteTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(req.timeout_seconds, 120.0)
 
 
-class SchemaGateTests(unittest.TestCase):
+class SchemaGateTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self.environment = patch.dict(
             os.environ, {"ATLAS_MODEL_ROUTER": "1", "ATLAS_ARTIFACTS": "1"}
@@ -586,6 +596,60 @@ class SchemaGateTests(unittest.TestCase):
     def owned(self, req: ChatRequest) -> ChatRequest:
         req.__dict__["artifact_owner"] = "owner@example.test"
         return req
+
+    async def process(
+        self, req: ChatRequest, *, images: bool = False, owner: str = "o@example.test"
+    ) -> tuple[AsyncMock, AsyncMock, AsyncMock, Interaction]:
+        req.__dict__["daily_user"] = "user@example.test"
+        req.__dict__["artifact_owner"] = owner
+        item = Interaction()
+        run = AsyncMock(
+            return_value=Result("Here it is.", "done", cost=Decimal("0.01"))
+        )
+        with (
+            patch(
+                "services.orchestrator.chat_pipeline.GatewayModel.connect",
+                new=AsyncMock(return_value=self.model()),
+            ),
+            patch("services.orchestrator.chat_pipeline.run", new=run),
+            patch(
+                "services.orchestrator.chat_pipeline.images_enabled",
+                return_value=images,
+            ),
+            patch(
+                "services.orchestrator.image_tool.images_enabled", return_value=images
+            ),
+            patch(
+                "services.orchestrator.chat_pipeline.process_image", AsyncMock()
+            ) as image,
+            patch(
+                "services.orchestrator.chat_pipeline._process_simple_drawing",
+                AsyncMock(),
+            ) as inline_svg,
+            patch(
+                "services.orchestrator.chat_pipeline.process_app_turn", AsyncMock()
+            ) as app_turn,
+        ):
+            self.app_turn = app_turn
+            from services.orchestrator.chat_pipeline import _process
+
+            await _process(req, item)
+        return run, image, inline_svg, item
+
+    def model(self) -> Mock:
+        model = Mock(generation_ms=1.0, provider_retries=0)
+        model.input_tokens, model.output_tokens = 10, 5
+        model.observations = []
+        model.tools = []
+        model.prefix = []
+        model.sink = None
+        model.spent = Decimal(0)
+        model.has_attachments = False
+        model.produces_files = False
+        model.required_file_tool = None
+        model.max_tokens = 6000
+        model.reasoning_ceiling = None
+        return model
 
     def test_app_gets_the_app_deadline(self) -> None:
         req = self.owned(routed(request("un petit jeu de calcul"), kind="app"))
@@ -609,6 +673,49 @@ class SchemaGateTests(unittest.TestCase):
                 routed(request("Draw me a sheep in SVG"), kind="drawing")
             )
             self.assertTrue(explicit.app_turn)
+
+    async def test_a_drawing_with_a_named_image_file_is_a_picture_turn(self) -> None:
+        run, image, inline_svg, item = await self.process(
+            routed(
+                request("Draw a fox as a second file called fox.svg"),
+                kind="drawing",
+                file_format="svg",
+            )
+        )
+        run.assert_not_awaited()
+        image.assert_not_awaited()
+        inline_svg.assert_not_awaited()
+        self.assertEqual(item.task_type, "artifact")
+        self.app_turn.assert_awaited_once()
+        self.assertEqual(self.app_turn.call_args.kwargs["kind"], "drawing")
+        self.assertEqual(self.app_turn.call_args.kwargs["intent"], "create")
+
+    async def test_a_raster_drawing_file_is_not_sent_to_work(self) -> None:
+        run, image, inline_svg, item = await self.process(
+            routed(
+                request("Draw a bicycle as a second file called bicycle.png"),
+                kind="drawing",
+                file_format="png",
+            )
+        )
+        run.assert_not_awaited()
+        image.assert_not_awaited()
+        inline_svg.assert_not_awaited()
+        self.assertEqual(item.task_type, "artifact")
+        self.app_turn.assert_awaited_once()
+
+    async def test_a_chart_file_keeps_the_work_gate(self) -> None:
+        run, image, inline_svg, item = await self.process(
+            routed(
+                request("Make a chart of these sales as sales.png"),
+                kind="file",
+                file_format="png",
+            )
+        )
+        run.assert_awaited_once()
+        image.assert_not_awaited()
+        inline_svg.assert_not_awaited()
+        self.app_turn.assert_not_awaited()
 
     def test_answer_overrides_the_lexical_app_test(self) -> None:
         # The lexical test reads "make" + "tool" as an app; the model says answer.

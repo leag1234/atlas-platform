@@ -368,6 +368,24 @@ class TurnTests(unittest.IsolatedAsyncioTestCase):
         assert picture_set is not None
         self.assertTrue(picture_set.file_requested)
 
+    async def test_a_drawing_router_decision_keeps_a_new_image_file_name(
+        self,
+    ) -> None:
+        gateway = FakeGateway("cats")
+        request = Request("Please draw a fox as a second file called fox.svg.")
+        request.__dict__[DECISION_KEY] = Decision(
+            kind="drawing", file_format="svg", follow_up=False
+        )
+        item = Interaction()
+        await turn.process_picture_turn(request, item, complete=gateway)
+        self.assertIn("**fox.svg**", item.reponse)
+        self.assertIn("/versions/1/download", item.reponse)
+        set_id = latest_set_id([{"role": "assistant", "content": item.reponse}])
+        assert set_id is not None
+        picture_set = store.load(set_id)
+        assert picture_set is not None
+        self.assertTrue(picture_set.file_requested)
+
     async def test_an_ordinary_picture_answer_does_not_name_a_file(self) -> None:
         gateway = FakeGateway("banc")
         item = await self.run_turn(gateway)
