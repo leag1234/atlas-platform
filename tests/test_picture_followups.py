@@ -355,6 +355,64 @@ class FollowUpTests(Base):
                 self.assertEqual(len(server.renders), 2)  # the first two only
                 self.assertEqual(item.cout_eur, 0)
 
+    async def test_file_requests_leave_the_picture_path(self) -> None:
+        cases = [
+            ("fr", "donne le phare en SVG s'il te plaît"),
+            ("en", "can I get the lighthouse as a downloadable SVG?"),
+            ("de", "exportiere das Leuchtturmbild als SVG-Datei"),
+            ("es", "el archivo descargado del faro no es un SVG"),
+            ("fr", "mets la bicyclette dans un fichier nommée bicyclette.svg"),
+            ("en", "save the bicycle as bicycle.svg"),
+            ("de", "die heruntergeladene Datei für das Fahrrad ist kein SVG"),
+            ("es", "exporta el helecho como archivo SVG"),
+        ]
+        for language, text in cases:
+            with self.subTest(language=language, text=text):
+                gateway = DialogueGateway(follow_reply("file"))
+                server = FakeServer()
+                first, _ = await self.start(gateway, server)
+                rewrite_calls = len(gateway.payloads)
+                history = [("user", FIRST), ("assistant", first.reponse)]
+                renders = len(server.renders)
+                done, item = await self.follow(gateway, history, text)
+                self.assertFalse(done)
+                self.assertEqual(len(server.renders), renders)
+                self.assertEqual(item.cout_eur, 0)
+                self.assertNotIn(
+                    rewrite.SYSTEM,
+                    [
+                        payload["messages"][0]["content"]
+                        for payload in gateway.payloads[rewrite_calls:]
+                    ],
+                )
+
+    async def test_a_mixed_file_request_is_a_visual_change(self) -> None:
+        gateway, server = (
+            DialogueGateway(
+                follow_reply(
+                    "change",
+                    "Show the fern with more fronds.",
+                    requirements=["a fern", "more fronds"],
+                )
+            ),
+            FakeServer(),
+        )
+        first, _ = await self.start(gateway, server)
+        history = [("user", FIRST), ("assistant", first.reponse)]
+        done, _ = await self.follow(
+            gateway, history, "add more fronds to the fern and give it as SVG"
+        )
+        self.assertTrue(done)
+        prompt = gateway.follows[-1]["messages"][0]["content"]
+        self.assertIn(
+            'a message that also asks for a visual change is "change"', prompt
+        )
+        self.assertIn(
+            "A file format, a file name, a download link or an attachment is never "
+            "a visual change or a requirement",
+            prompt,
+        )
+
     async def test_outside_kinds_skip_the_reading_call(self) -> None:
         from services.orchestrator.request_router import Decision
 
