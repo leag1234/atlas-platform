@@ -52,6 +52,8 @@ paragraphs, list_style, order, titles, after_file, no_intro, only, no_new_file, 
 it is about a file, slide deck, document, app or picture being made
 - "quote": the person's exact words that state it (copied, short)
 - "statement": the constraint in a few words, in the person's language
+- "condition": for a constraint that applies only if something is true, that \
+condition in a few words, in the person's language; otherwise omit it
 - "text": the exact text for starts_with, ends_with, contains, excludes, after_file \
 (copied exactly as the person wrote it, or as shown in "shown" when they refer to it)
 - "items": list of exact texts for order and titles (from the messages or "shown")
@@ -75,9 +77,13 @@ columns, italics, separators, a tone or form of address, what each item must \
 or must not contain). If there is none, return {"constraints": []}."""
 
 VERIFY_SYSTEM = """You check a reply against constraints the person stated. \
-For each constraint decide met true or false, ONLY from the reply text.
+For each constraint decide met true or false, ONLY from the reply text. \
+For a constraint with a "condition", first decide whether that condition \
+holds from the reply; if it does not, the constraint is met. If you cannot \
+decide the condition, omit the constraint (it is then treated as met).
 
-Input JSON: "constraints" (id, statement, the person's words) and "reply".
+Input JSON: "constraints" (id, statement, the person's words, condition when \
+there is one) and "reply".
 Return JSON {"results": [{"id": "...", "met": true|false, "evidence": "..."}]}.
 "evidence" is copied verbatim from the reply (at most 25 words): for met=false \
 the passage that breaks the constraint, or the passage where the missing part \
@@ -98,6 +104,9 @@ into the reply (an instruction to the assistant is followed, never \
 written as a line of the reply). Do not add explanations about the correction. If a \
 constraint cannot be met by rewriting the text (a file was or was not made), \
 leave the text as it is.
+Never state or deny a fact about this turn (that a file, app or picture was \
+or was not made, attached or delivered) unless the reply already states it. \
+"delivered" lists what this turn delivered: keep it and do not contradict it.
 Return JSON {"answer": "<the corrected reply in markdown>"}."""
 
 
@@ -145,7 +154,12 @@ def parse_reading(
 def verify_messages(items: Sequence[Constraint], answer: str) -> list[dict[str, Any]]:
     data = {
         "constraints": [
-            {"id": item.id, "statement": item.label(), "person": item.quote}
+            {
+                "id": item.id,
+                "statement": item.label(),
+                "person": item.quote,
+                **({"condition": item.condition} if item.condition else {}),
+            }
             for item in items
         ],
         "reply": answer[:ANSWER_CHARACTERS],
@@ -205,6 +219,7 @@ def repair_messages(
     answer: str,
     failed: Sequence[tuple[Constraint, Result]],
     conversation: Sequence[tuple[str, str]] = (),
+    delivered: Sequence[str] = (),
 ) -> list[dict[str, Any]]:
     """The rewrite call: the same conversation the reply answers (its
     subject and content), the reply, and what each failed constraint needs."""
@@ -214,6 +229,7 @@ def repair_messages(
             for role, text in conversation
             if role in {"user", "assistant"} and text.strip()
         ][-EARLIER_MESSAGES:],
+        **({"delivered": list(delivered)} if delivered else {}),
         "failed": [
             {
                 "constraint": item.label(),

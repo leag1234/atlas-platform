@@ -58,6 +58,8 @@ class Constraint:
     quote: str
     turn: int
     statement: str = ""
+    # A constraint that applies only when this is true; "" is unconditional.
+    condition: str = ""
     text: str = ""
     items: tuple[str, ...] = ()
     count: int | None = None
@@ -87,6 +89,7 @@ class Constraint:
         return (
             self.kind,
             self.scope,
+            norm(self.condition),
             norm(self.text),
             tuple(norm(item) for item in self.items),
             self.count,
@@ -199,6 +202,7 @@ def validated(
     if not quote or not said(quote, person):
         return None
     text = _clean(raw.get("text"))
+    condition = _clean(raw.get("condition"))
     items_raw = raw.get("items") or []
     items = (
         tuple(_clean(item) for item in items_raw if _clean(item))[:MAX_ITEMS]
@@ -268,6 +272,7 @@ def validated(
         quote=quote,
         turn=turn,
         statement=_clean(raw.get("statement")),
+        condition=condition,
         text=text,
         items=items,
         count=count,
