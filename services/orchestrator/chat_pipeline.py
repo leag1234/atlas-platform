@@ -1748,6 +1748,7 @@ async def _answer_constraints(
             "constraints": len(outcome.constraints),
             "unmet": len(outcome.unmet()),
             "repaired": outcome.repaired,
+            "checks_skipped": len(outcome.failed_calls),
         }
     )
 

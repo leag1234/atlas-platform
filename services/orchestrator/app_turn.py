@@ -1387,6 +1387,13 @@ async def process_app_turn(
             expect.log(delivered_results, built=built)
         if model is not None:
             _record(item, model)
+        if expect is not None and expect.failed_calls:
+            item.steps.append(
+                {
+                    "phase": "expectations",
+                    "checks_skipped": len(expect.failed_calls),
+                }
+            )
         if plan is not None:
             plan.finish(built, item.cout_eur)
         item.latence_ms["first_progress"] = (progress.first_status or 0.0) * 1000

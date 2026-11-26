@@ -342,7 +342,7 @@ class ScriptedCalls:
             update = EXTRACTIONS.get(data["latest_message"], {"new": []})
             return {"text": json.dumps(update), "cost_eur": "0.001"}
         if self.silent:
-            return {"text": "no verdict", "cost_eur": "0.002"}
+            raise ValueError("no verdict")
         results = [
             {"id": item["id"], "met": self.judge.get(item["id"], True), "why": "seen"}
             for item in data["requirements"]
@@ -781,6 +781,13 @@ class LaterStateRules(unittest.IsolatedAsyncioTestCase):
 class LedgerWithoutBrowser(Conversation):
     """With the render check off, executable checks go to the judge (bounded)."""
 
+    render = "off"
+
+    async def quiz_turn(self, *files: str) -> tuple[Interaction, FakeModel]:
+        return await self.app_turn(
+            QUIZ_REQUEST, [answer(code, "Le quiz est prêt.") for code in files]
+        )
+
     async def test_executable_checks_fall_back_to_one_judge_call(self) -> None:
         self.calls.judge = {"R2": False}
         item, model = await self.app_turn(
@@ -792,6 +799,12 @@ class LedgerWithoutBrowser(Conversation):
         self.assertIn("« Bouton lecture qui joue le rythme »", item.reponse)
         # The judge's cost is the turn's cost.
         self.assertAlmostEqual(item.cout_eur, 0.03 + 0.001 + 3 * 0.002)
+
+    async def test_failed_check_calls_are_exposed_in_the_turn_record(self) -> None:
+        self.calls.silent = True
+        item, _ = await self.quiz_turn(colour_quiz("none"))
+        step = next(step for step in item.steps if step["phase"] == "expectations")
+        self.assertEqual(step["checks_skipped"], 2)
 
     async def test_the_ledger_off_changes_nothing(self) -> None:
         with patch.dict(os.environ, {"ATLAS_EXPECTATIONS": "0"}):
