@@ -203,6 +203,7 @@ origin: when needs_location is true and the last message or an earlier user turn
     changes_delivered: true when the last message asks to change a file or app delivered earlier, reports that it does not work or shows nothing, or asks to create a new file. False when the person asks a question about it, thanks you, asks you to resend its link or restate something, or asks you to propose options and wait before creating anything.
 
 Rules:
+- The ORDER decides. Proposals, plans, options or variants asked for BEFORE anything is made are "answer"; a deliverable asked for NOW keeps its kind when the message also asks for proposals, options, variants or questions AFTER it ("build it, then suggest two variants", "make the deck, and afterwards tell me what you would improve").
 - A complaint that a delivered app or file does not work, shows nothing, does nothing or crashes is a request to fix it: kind app/file, follow_up true, changes_delivered true. Examples: "it shows nothing", "the button does nothing", "ça ne marche pas", "no funciona", "non funziona", "sie funktioniert nicht".
 - A request for a picture is "drawing" whatever the wording or politeness ("tu peux me dessiner", "j'aimerais une illustration", "draw me", "sketch", "un logo pour").
 - Something to play with or use is "app"; a file, a format or a document to download or print is "file"; a text to read, copy or send yourself (message, email, letter, post, reply) is "answer", whatever its length, unless a file or a format is named.
@@ -239,6 +240,11 @@ After an assistant turn that delivered an app: "no muestra nada" {"kind": "app",
 After an assistant turn that delivered an app: "non mostra nulla" {"kind": "app", "file_format": null, "follow_up": true, "needs_research": false, "needs_location": false, "origin": null, "changes_delivered": true}
 After an assistant turn that delivered an app: "what does the link button do?" {"kind": "answer", "file_format": null, "follow_up": false, "needs_research": false, "needs_location": false, "origin": null, "changes_delivered": false}
 After an assistant turn that delivered a file: "propose d'abord deux plans ici, puis attends mon choix" {"kind": "answer", "file_format": null, "follow_up": false, "needs_research": false, "needs_location": false, "origin": null, "changes_delivered": false}
+"Bau mir jetzt eine kleine App für meine Pflanzengiesser, danach schlag mir zwei Varianten vor" {"kind": "app", "file_format": null, "follow_up": false, "needs_research": false, "needs_location": false, "origin": null}
+"make me a tiny recipe file in Markdown now, then ask me what I'd change" {"kind": "file", "file_format": "md", "follow_up": false, "needs_research": false, "needs_location": false, "origin": null}
+"hazme un dibujo de un gato astronauta, despues dime dos ideas para mejorarlo" {"kind": "drawing", "file_format": null, "follow_up": false, "needs_research": false, "needs_location": false, "origin": null}
+"creami subito un disegno di una barca, poi proponimi due varianti" {"kind": "drawing", "file_format": null, "follow_up": false, "needs_research": false, "needs_location": false, "origin": null}
+"fais-moi une petite appli de minuteur tout de suite, apres propose deux variantes" {"kind": "app", "file_format": null, "follow_up": false, "needs_research": false, "needs_location": false, "origin": null}
 With an app in delivered_before, after the assistant asked for sound files: "here are the links: https://example.org/kick.wav, https://example.org/snare.wav" {"kind": "app", "file_format": null, "follow_up": true, "needs_research": false, "needs_location": false, "origin": null, "changes_delivered": true}"""
 
 _HISTORY_TURNS = 4
