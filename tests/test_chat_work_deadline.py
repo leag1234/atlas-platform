@@ -6,8 +6,11 @@ reached, so no explanation came, and the cut stream's error was French in an
 English conversation.
 """
 
-import asyncio
 import os
+import json
+import tempfile
+import time
+import asyncio
 import unittest
 from pathlib import Path
 from typing import Any
@@ -17,6 +20,8 @@ from unittest.mock import AsyncMock, patch
 from services.orchestrator import work_opencode_turn as turn_module
 from services.orchestrator.chat_schema import ChatRequest
 from services.orchestrator.deadline import remaining, request_deadline
+from services.orchestrator.chat_pipeline import _process_request
+from services.orchestrator.interactions import Interaction
 
 
 def request(text: str, **kwargs: object) -> ChatRequest:
@@ -73,11 +78,178 @@ async def escalate(req: ChatRequest, work: Any) -> tuple[bool, Any]:
 class RemainingTests(unittest.IsolatedAsyncioTestCase):
     async def test_seconds_left_follow_the_current_deadline(self) -> None:
         self.assertIsNone(remaining())
+
+
+class OwnDeadlineCutTests(unittest.IsolatedAsyncioTestCase):
+    async def _cut(self, locale: str) -> tuple[list[dict[str, Any]], Interaction]:
+        from services.orchestrator.chat_stream import response
+
+        item = Interaction()
+        payload = request("Continue the long answer", lang=locale)
+        payload.__dict__["stream"] = True
+
+        async def work(r: ChatRequest, result: Interaction, **kwargs: object) -> None:
+            await asyncio.Event().wait()
+
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.dict(os.environ, {"ATLAS_INTERACTION_DIR": directory}),
+            patch.object(ChatRequest, "timeout_seconds", 0.01),
+            patch.dict(
+                os.environ,
+                {
+                    "ATLAS_CHAT_WORK": "1",
+                    "ATLAS_MODEL_ROUTER": "1",
+                },
+            ),
+            patch(
+                "services.orchestrator.chat_work.work_gate_open",
+                return_value=True,
+            ),
+            patch(
+                "services.orchestrator.chat_work._identity",
+                new=AsyncMock(
+                    return_value={
+                        "memberships": [
+                            {"org_id": "123e4567-e89b-12d3-a456-426614174000"}
+                        ]
+                    }
+                ),
+            ),
+            patch(
+                "services.orchestrator.chat_work._ensure_scratch_project",
+                new=AsyncMock(return_value="123e4567-e89b-12d3-a456-426614174002"),
+            ),
+            patch(
+                "services.orchestrator.chat_work._find_binding",
+                new=AsyncMock(
+                    return_value={
+                        "conversation_id": "123e4567-e89b-12d3-a456-426614174003",
+                        "work_session_id": "123e4567-e89b-12d3-a456-426614174004",
+                    }
+                ),
+            ),
+            patch("services.orchestrator.code_mode.process_work", new=work),
+            patch("packages.privacy.owned_only", return_value=True),
+        ):
+            stream = response(
+                payload, item, time.monotonic(), _process_request
+            ).body_iterator.__aiter__()
+            raw = [str(frame) async for frame in stream]
+        frames = [json.loads(frame[6:]) for frame in raw if frame.startswith("data: {")]
+        return frames, item
+
+    async def test_a_work_cut_by_the_request_deadline_answers_in_three_languages(
+        self,
+    ) -> None:
+        for locale, expected in (
+            ("fr", "limite de temps"),
+            ("en", "time limit"),
+            ("de", "Zeitlimit"),
+        ):
+            with self.subTest(locale=locale):
+                frames, item = await self._cut(locale)
+                shown = "".join(
+                    str(choice["delta"].get("content", ""))
+                    for frame in frames
+                    for choice in frame.get("choices", [])
+                    if isinstance(choice, dict)
+                    and isinstance(choice.get("delta"), dict)
+                )
+                self.assertTrue(shown.strip())
+                self.assertIn(expected, shown)
+                self.assertFalse(any("error" in frame for frame in frames))
+                self.assertEqual(item.state, "error")
+
+    async def test_a_real_client_disconnect_records_cancelled_and_sends_nothing(
+        self,
+    ) -> None:
+        from services.orchestrator.chat_stream import response
+
+        item = Interaction()
+        payload = request("Continue the long answer")
+        payload.__dict__["stream"] = True
+
+        async def work(r: ChatRequest, result: Interaction, **kwargs: object) -> None:
+            await asyncio.Event().wait()
+
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.dict(os.environ, {"ATLAS_INTERACTION_DIR": directory}),
+            patch.object(ChatRequest, "timeout_seconds", 30),
+            patch.dict(os.environ, {"ATLAS_CHAT_WORK": "1"}),
+            patch(
+                "services.orchestrator.chat_work.work_gate_open",
+                return_value=True,
+            ),
+            patch(
+                "services.orchestrator.chat_work._identity",
+                new=AsyncMock(
+                    return_value={
+                        "memberships": [
+                            {"org_id": "123e4567-e89b-12d3-a456-426614174000"}
+                        ]
+                    }
+                ),
+            ),
+            patch(
+                "services.orchestrator.chat_work._ensure_scratch_project",
+                new=AsyncMock(return_value="123e4567-e89b-12d3-a456-426614174002"),
+            ),
+            patch(
+                "services.orchestrator.chat_work._find_binding",
+                new=AsyncMock(
+                    return_value={
+                        "conversation_id": "123e4567-e89b-12d3-a456-426614174003",
+                        "work_session_id": "123e4567-e89b-12d3-a456-426614174004",
+                    }
+                ),
+            ),
+            patch("services.orchestrator.code_mode.process_work", new=work),
+        ):
+            stream = response(
+                payload, item, time.monotonic(), _process_request
+            ).body_iterator.__aiter__()
+            first = await stream.__anext__()
+            self.assertIn("chat.completion.chunk", first)
+            task = asyncio.current_task()
+            assert task is not None
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await stream.__anext__()
+        self.assertEqual(item.state, "cancelled")
+        self.assertIn("cancelled", item.erreurs)
+
+    async def test_late_work_handoff_gets_routed_work_deadline(self) -> None:
+        from services.orchestrator.deadline import extend_for_path
+        from services.orchestrator.request_router import Decision
+
+        req = request("plain answer", lang="en", continuation=True)
+        req.__dict__["model_route"] = Decision(kind="file")
+        with patch.dict(os.environ, {"ATLAS_MODEL_ROUTER": "1"}):
+            self.assertEqual(req.timeout_seconds, 300.0)
+            async with request_deadline(120):
+                await asyncio.sleep(0.01)
+                extend_for_path(req)
+                left = remaining()
+                assert left is not None
+                self.assertTrue(left >= 299.9)
+
+    async def test_late_handoff_never_shortens_deadline(self) -> None:
+        from services.orchestrator.deadline import extend_for_path
+
+        req = request("file", lang="en", continuation=True)
+        async with request_deadline(300):
+            await asyncio.sleep(0.01)
+            extend_for_path(req)
+            left = remaining()
+            assert left is not None
+            self.assertTrue(left >= 299.9)
+        self.assertIsNone(remaining())
         async with request_deadline(300):
             left = remaining()
             assert left is not None
             self.assertTrue(299 <= left <= 300)
-        self.assertIsNone(remaining())
 
 
 class ChatWorkTimeLimitTests(unittest.IsolatedAsyncioTestCase):

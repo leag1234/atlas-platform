@@ -650,6 +650,9 @@ async def _escalate(request: ChatRequest, item: Interaction) -> bool:
             ],
         }
     )
+    from services.orchestrator.deadline import extend_for_path
+
+    extend_for_path(request)
     scoped._project_subject = subject
     scoped.__dict__["approvals_unattended"] = True
     # The project is shared by all of this person's chats: a name another
