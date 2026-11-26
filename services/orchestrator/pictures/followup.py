@@ -482,7 +482,11 @@ async def process_picture_followup(
 
         lines.append(
             file_line(
-                picture_set.artifact_id, picture_set.artifact_version, previous.filename
+                picture_set.artifact_id,
+                picture_set.artifact_version,
+                previous.filename,
+                language,
+                found=found,
             )
         )
     lines.append(

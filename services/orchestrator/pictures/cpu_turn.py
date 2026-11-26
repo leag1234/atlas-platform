@@ -1082,6 +1082,8 @@ async def change(
                         picture_set.artifact_id,
                         picture_set.artifact_version,
                         previous.filename,
+                        language,
+                        found=found,
                     )
                 ]
                 if picture_set.file_requested

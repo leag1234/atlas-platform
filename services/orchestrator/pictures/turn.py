@@ -579,13 +579,27 @@ def _file_requested(request: Any) -> bool:
 
     decision = request_router.decision(request)
     if decision is not None:
-        return decision.kind == "file" or bool(decision.file_format)
+        return (
+            decision.kind == "file"
+            or bool(decision.file_format)
+            or (
+                decision.kind == "drawing" and requests_file_delivery(request.user_text)
+            )
+        )
     return requests_file_delivery(request.user_text)
 
 
-def file_line(artifact_id: str, version: int, filename: str) -> str:
+def file_line(
+    artifact_id: str,
+    version: int,
+    filename: str,
+    language: str = "en",
+    *,
+    found: str | None = None,
+) -> str:
     prefix = f"/api/atlas/artifacts/{artifact_id}/versions/{version}"
-    return f"**{filename}** · [Download {filename}]({prefix}/download)"
+    label = text(language, "download", found=found, filename=filename)
+    return f"**{filename}** · [{label}]({prefix}/download)"
 
 
 def cpu_pictures() -> int:
@@ -956,7 +970,11 @@ async def process_picture_turn(
                     artifact_id, version, title, filename, language, temporary=False
                 )
                 if file_requested:
-                    footer = file_line(artifact_id, version, filename) + "\n\n" + footer
+                    footer = (
+                        file_line(artifact_id, version, filename, language)
+                        + "\n\n"
+                        + footer
+                    )
     note = ""
     if cpu is not None and cpu.rewrite is not None:
         from services.orchestrator.pictures import cpu_checks

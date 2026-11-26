@@ -182,7 +182,7 @@ def _artifact_link(
     }
 
 
-def _file_line(picture_set: store.PictureSet, owner: str) -> str | None:
+def _file_line(picture_set: store.PictureSet, owner: str, language: str) -> str | None:
     from services.orchestrator import artifact_store
     from services.orchestrator.artifact_store import ArtifactError
     from services.orchestrator.pictures.turn import file_line
@@ -196,7 +196,10 @@ def _file_line(picture_set: store.PictureSet, owner: str) -> str | None:
     except ArtifactError:
         return None
     return file_line(
-        picture_set.artifact_id, picture_set.artifact_version, stored.filename
+        picture_set.artifact_id,
+        picture_set.artifact_version,
+        stored.filename,
+        language,
     )
 
 
@@ -245,7 +248,7 @@ async def handle_choice(request: Any, item: Any) -> bool:
     lines = [text(language, "chosen", n=number), f"![{number}]({image})"]
     item.images = [{"reference": image, "kind": "picture"}]
     link = await asyncio.to_thread(_artifact_link, picture_set, owner, language)
-    named_file = await asyncio.to_thread(_file_line, picture_set, owner)
+    named_file = await asyncio.to_thread(_file_line, picture_set, owner, language)
     if named_file is not None:
         lines.append(named_file)
     if link is not None:
