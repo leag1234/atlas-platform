@@ -38,7 +38,7 @@ class RewriterTests(unittest.TestCase):
             lambda artifact_id: 2 if artifact_id == "a" * 32 else None,
         )
 
-    def test_an_invented_version_is_replaced_by_the_unchanged_sentence(self) -> None:
+    def test_an_invented_version_is_replaced_by_the_no_version_sentence(self) -> None:
         invented = footer("a" * 32, 5, "Boîte à rythme", "boite.html", "fr")
         text = "Voici la version 5 avec de vrais sons.\n\n" + invented + "\n\nFin."
         for size in (1, 2, 7, 50, len(text)):
@@ -46,14 +46,15 @@ class RewriterTests(unittest.TestCase):
                 result = streamed(self.rewriter(), text, size)
                 self.assertNotIn("/api/atlas/artifacts/", result)
                 self.assertIn(
-                    "La modification n'a pas pu être appliquée ; la version 2 "
-                    "reste inchangée.",
+                    "Aucune nouvelle version n'a été créée à ce tour ; la "
+                    "version 2 reste actuelle. Demande-moi encore la "
+                    "modification souhaitée.",
                     result,
                 )
                 self.assertNotIn(" · ", result)
                 # What follows describes the change that was not made.
                 self.assertNotIn("Fin.", result)
-                self.assertTrue(result.endswith("reste inchangée."))
+                self.assertTrue(result.endswith("modification souhaitée."))
 
     def test_a_stored_version_and_other_links_are_kept_as_written(self) -> None:
         text = (
@@ -89,30 +90,32 @@ class FalseChangeClaimTests(unittest.TestCase):
             "Ja, das baue ich ein.",
             "Fahrradwerkstatt",
             "**Was sich geändert hat**\n\n- Jeder Eintrag hat jetzt einen Knopf.",
-            "Die Änderung konnte nicht übernommen werden; Version 3 "
-            "bleibt unverändert.",
+            "In diesem Zug wurde keine neue Version erstellt; Version 3 "
+            "bleibt aktuell. Bitte mir die gewünschte Änderung noch einmal.",
         ),
         (
             "en",
             "Sure, I added it.",
             "Seed Swap Board",
             "**What changed**\n\n- The list is now sorted by date.",
-            "The change could not be applied; version 3 is unchanged.",
+            "No new version was made on this turn; version 3 is still "
+            "current. Ask me again for the change you want.",
         ),
         (
             "es",
             "Listo, ya está.",
             "Huerto del barrio",
             "**Qué cambió**\n\n- Cada fila tiene ahora un botón.",
-            "No se pudo aplicar el cambio; la versión 3 no cambia.",
+            "No se creó ninguna versión nueva en este turno; la versión 3 "
+            "sigue siendo la actual. Pídeme otra vez el cambio que quieres.",
         ),
         (
             "it",
             "Fatto.",
             "Bacheca dei semi",
             "**Cosa è cambiato**\n\n- Ogni voce ha ora un pulsante.",
-            "Non è stato possibile applicare la modifica; la versione 3 "
-            "resta invariata.",
+            "In questo turno non è stata creata una nuova versione; la "
+            "versione 3 resta attuale. Chiedimi di nuovo la modifica che vuoi.",
         ),
     )
 
@@ -147,7 +150,9 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(checked(real, "en", OWNER), (real, 0))
         text, removed = checked("Done.\n\n" + invented, "en", OWNER)
         self.assertEqual(
-            text, "Done.\n\nThe change could not be applied; version 1 is unchanged."
+            text,
+            "Done.\n\nNo new version was made on this turn; version 1 is "
+            "still current. Ask me again for the change you want.",
         )
         # The download link of the same footer is withheld with the rest.
         self.assertEqual(removed, 1)
@@ -221,7 +226,8 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
             sink_context.reset(token)
         expected = (
             "Here is version 2 with real samples.\n\n"
-            "The change could not be applied; version 1 is unchanged."
+            "No new version was made on this turn; version 1 is still "
+            "current. Ask me again for the change you want."
         )
         self.assertEqual("".join(sent), expected)
         self.assertEqual(item.reponse, expected)
@@ -286,7 +292,8 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         finally:
             sink_context.reset(token)
         self.assertIn(
-            "Die Änderung konnte nicht übernommen werden; Version 1", item.reponse
+            "In diesem Zug wurde keine neue Version erstellt; Version 1",
+            item.reponse,
         )
         self.assertNotIn("modification", "".join(sent))
 
