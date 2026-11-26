@@ -59,7 +59,7 @@ from services.orchestrator.pictures.texts import answer_language, text
 
 LOGGER = logging.getLogger(__name__)
 # Router kinds that are never about the picture.
-OUTSIDE = frozenset({"file", "run", "remote", "research"})
+OUTSIDE = frozenset({"run", "remote", "research"})
 # The picture must be in one of this many last assistant messages.
 RECENT_ANSWERS = 6
 MAX_TURNS = 10
@@ -577,7 +577,8 @@ async def follow_up(
     from services.orchestrator.pictures.followup import process_picture_followup
     from services.orchestrator.pictures.turn import Spend, _gateway, turn_ceiling
 
-    if routed is not None and getattr(routed, "kind", "") in OUTSIDE:
+    routed_kind = getattr(routed, "kind", "") if routed is not None else ""
+    if routed_kind in OUTSIDE:
         return False
     from packages.closing_intent import polite_closing
 
@@ -611,6 +612,26 @@ async def follow_up(
         item.erreurs.extend("picture_review_" + e for e in errors)
         item.cout_eur = float(spend.total)
         item.latence_ms["picture_review"] = (time.monotonic() - started) * 1000
+        return True
+    if understood.kind == "file":
+        from services.orchestrator.pictures.turn import export_picture
+
+        answer = export_picture(
+            request,
+            item,
+            picture_set,
+            requested_svg=bool(re.search(r"(?i)\bsvg\b", str(request.user_text))),
+        )
+        item.task_type = "drawing"
+        item.cout_eur = float(spend.total)
+        if answer is None:
+            language = answer_language(picture_set.language, request.lang)
+            item.reponse = text(
+                language,
+                "review_unseen",
+            )
+            return True
+        item.reponse = answer
         return True
     if understood.kind == "new" and named_picture(request):
         # A picture already shown was named: what the message asks is done
