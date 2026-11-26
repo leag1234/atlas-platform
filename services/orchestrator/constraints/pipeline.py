@@ -156,11 +156,13 @@ class _Calls:
         strict: bool,
         complete: COMPLETE | None,
         spend: Callable[[Decimal], None] | None,
+        reasoning_room: int = 0,
     ) -> None:
         self.profile = profile
         self.strict = strict
         self.complete = complete
         self.spend = spend
+        self.reasoning_room = reasoning_room
         self.count = 0
         self.cost = Decimal(0)
         self.failed: list[str] = []
@@ -203,7 +205,7 @@ class _Calls:
             "tools": [],
             "response_format": {"type": "json_object"},
             "profile": profile,
-            "max_tokens": tokens,
+            "max_tokens": tokens + self.reasoning_room,
             "timeout": round(seconds, 1),
             "budget_eur": str(
                 CALL_BUDGET_EUR.quantize(Decimal("0.0001"), rounding=ROUND_FLOOR)
@@ -722,6 +724,7 @@ async def enforce(
     seconds: float = 40.0,
     complete: COMPLETE | None = None,
     spend: Callable[[Decimal], None] | None = None,
+    reasoning_room: int = 0,
     run_mode: str | None = None,
     stopped: bool = False,
 ) -> Outcome:
@@ -745,7 +748,7 @@ async def enforce(
     shown = next(
         (text for role, text in reversed(messages[:-1]) if role == "assistant"), ""
     )
-    calls = _Calls(profile, strict, complete, spend)
+    calls = _Calls(profile, strict, complete, spend, reasoning_room)
 
     def left() -> float:
         return seconds - (time.monotonic() - started)

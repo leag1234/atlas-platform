@@ -97,6 +97,7 @@ async def first_brief(tools: Any) -> str:
         profile,
         str(getattr(tools, "lang", "") or "en"),
         strict=bool(getattr(model, "strict", False)),
+        reasoning_room=int(getattr(model, "reasoning_room", 0) or 0),
         spend=spend,
         complete=getattr(tools, "expectations_complete", None),
     )

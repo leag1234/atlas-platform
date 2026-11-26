@@ -369,6 +369,7 @@ class FakeModel:
         self.observing = False
         self.local_enabled = False
         self.reasoning_ceiling: str | None = None
+        self.reasoning_room = 2000
         self.cost_ceiling: Decimal | None = None
         self.provider_retries = 0
         self.input_tokens = self.output_tokens = 0
@@ -998,7 +999,9 @@ class DocumentBase(unittest.IsolatedAsyncioTestCase):
             }
 
         return SimpleNamespace(
-            check_model=SimpleNamespace(profile="atlas-qwen", spent=Decimal(0)),
+            check_model=SimpleNamespace(
+                profile="atlas-qwen", reasoning_room=2000, spent=Decimal(0)
+            ),
             request_text=text,
             earlier_requests=earlier,
             picture_scope="reader|conversation-1",

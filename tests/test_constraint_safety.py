@@ -403,6 +403,7 @@ class ReliableCalls(ModelProfile):
                 self.REPLY,
                 language="en",
                 complete=gateway,
+                reasoning_room=2000,
                 run_mode="full",
             )
         )
@@ -421,9 +422,9 @@ class ReliableCalls(ModelProfile):
             self.assertNotIn("reasoning_disabled", payload)
             self.assertGreaterEqual(
                 payload["max_tokens"],
-                verify.READ_TOKENS
+                verify.READ_TOKENS + 2000
                 if "FORM and exact CONTENT" in payload["messages"][0]["content"]
-                else verify.VERIFY_TOKENS,
+                else verify.VERIFY_TOKENS + 2000,
             )
 
     def test_a_call_that_spends_a_small_budget_reasoning_is_retried_with_room(
@@ -464,7 +465,7 @@ class ReliableCalls(ModelProfile):
         self.assertEqual(gateway.payloads[1][1]["reasoning_ceiling"], "low")
         self.assertGreaterEqual(
             gateway.payloads[1][1]["max_tokens"],
-            verify.READ_TOKENS,
+            verify.READ_TOKENS + 2000,
         )
 
     def test_a_slow_call_within_the_new_timeout_succeeds(self) -> None:

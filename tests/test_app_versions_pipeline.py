@@ -106,6 +106,7 @@ class FakeModel:
         self.observing = False
         self.local_enabled = False
         self.reasoning_ceiling: str | None = None
+        self.reasoning_room = 0
         self.cost_ceiling: Decimal | None = None
         self.provider_retries = 0
         self.input_tokens = self.output_tokens = 0

@@ -1528,6 +1528,9 @@ class TurnLedger:
     # Added to the turn's spending (GatewayModel.spent) as calls are made.
     spend: Callable[[Decimal], None] | None = None
     complete: COMPLETE | None = None
+    # The gateway's reasoning allowance for the turn's profile, added to the
+    # answer budget of every check call.
+    reasoning_room: int = 0
     updated: bool = False
     # Gateway calls made (a fallback to the fast profile counts).
     calls: int = 0
@@ -1597,7 +1600,7 @@ class TurnLedger:
             "tools": [],
             "response_format": {"type": "json_object"},
             "profile": profile,
-            "max_tokens": tokens,
+            "max_tokens": tokens + self.reasoning_room,
             "timeout": round(seconds, 1),
             "budget_eur": str(
                 CALL_BUDGET_EUR.quantize(Decimal("0.0001"), rounding=ROUND_FLOOR)
@@ -2182,6 +2185,7 @@ async def document_check(
             profile,
             str(getattr(tools, "lang", "") or "en"),
             strict=bool(getattr(model, "strict", False)),
+            reasoning_room=int(getattr(model, "reasoning_room", 0) or 0),
             spend=spend,
             complete=getattr(tools, "expectations_complete", None),
         )
