@@ -546,6 +546,11 @@ async def execute_turn(
     )
     assert isinstance(result, CodeResult)
     if isinstance(tools, WorkTools) and guard is not None and result.state == "done":
+        guard.record(
+            str(event["tool"])
+            for event in result.trace
+            if isinstance(event, dict) and isinstance(event.get("tool"), str)
+        )
         result.text, unexecuted = guard.answer(result.text, request.lang)
         if unexecuted:
             await tools.emit(
