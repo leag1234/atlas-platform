@@ -276,6 +276,141 @@ class OnTheBuiltFile(unittest.TestCase):
 
 
 class PerUnitCounts(unittest.TestCase):
+    def test_word_lengths_are_measured_per_sheet_and_totals_whole(self) -> None:
+        def sheets(counts: tuple[int, ...]) -> object:
+            sections = [
+                {
+                    "heading": heading,
+                    "paragraphs": [
+                        "A short sentence of ordinary words. " * (count // 7)
+                    ],
+                    "page_break": True,
+                }
+                for heading, count in zip(("Lantern", "Kettle", "Ferry"), counts)
+            ]
+            content = Content.model_validate({"title": "Sheets", "sections": sections})
+            return built(content, ".pdf")[1]
+
+        _, per_sheet_check = expectations.normalized_check(
+            "document",
+            {
+                "method": "code",
+                "part": "size",
+                "unit": "words",
+                "count": 200,
+                "relation": "about",
+                "statement": "180 to 220 words per sheet",
+            },
+        )
+        per_sheet = expectations.Requirement(
+            "R1",
+            "180 to 220 words per sheet",
+            1,
+            method="code",
+            check=per_sheet_check,
+        )
+        _, total_check = expectations.normalized_check(
+            "document",
+            {
+                "method": "code",
+                "part": "size",
+                "unit": "words",
+                "count": 600,
+                "relation": "about",
+                "statement": "600 words in total",
+            },
+        )
+        total = expectations.Requirement(
+            "R2",
+            "600 words in total",
+            1,
+            method="code",
+            check=total_check,
+        )
+        met = sheets((200, 200, 200))
+        self.assertTrue(
+            expectations.size_result(
+                per_sheet, None, "", {"words_per_unit": [200, 200, 200]}
+            ).passed
+        )
+        self.assertTrue(
+            expectations.size_result(total, None, "", {"words": 600}).passed
+        )
+        short = expectations.size_result(
+            per_sheet, None, "", {"words_per_unit": [200, 120, 200]}
+        )
+        self.assertIs(short.passed, False)
+        self.assertIn("unit 2 has 120 words", short.how)
+        self.assertEqual(expectations.words_per_unit(met), [168, 168, 168])
+
+    def test_built_file_measures_words_on_each_unit(self) -> None:
+        content = Content.model_validate(
+            {
+                "title": "Sheets",
+                "sections": [
+                    {
+                        "heading": heading,
+                        "paragraphs": ["A short sentence of ordinary words. " * 24],
+                        "page_break": True,
+                    }
+                    for heading in ("Lantern", "Kettle", "Ferry")
+                ],
+            }
+        )
+        raw, _ = built(content, ".pdf")
+        ledger = expectations.Ledger("document")
+        ledger.apply(
+            {
+                "new": [
+                    {
+                        "statement": "180 to 220 words per sheet",
+                        "quote": "180 to 220 words per sheet",
+                        "method": "code",
+                        "part": "size",
+                        "unit": "words",
+                        "count": 200,
+                        "relation": "about",
+                        "where": "each",
+                    }
+                ]
+            },
+            1,
+            ["180 to 220 words per sheet"],
+        )
+        measures = asyncio.run(
+            expectations.file_measures(
+                content,
+                "A short sentence of ordinary words. " * 72,
+                ".pdf",
+                raw,
+                {"words"},
+                30,
+                ledger,
+            )
+        )
+        self.assertEqual(measures["words_per_unit"], [144, 144, 144])
+
+    def test_per_unit_word_extraction_keeps_its_scope(self) -> None:
+        for statement in (
+            "180 to 220 words per sheet",
+            "180 à 220 mots par fiche",
+            "180 bis 220 Wörter pro Seite",
+            "180 a 220 palabras por página",
+        ):
+            method, check = expectations.normalized_check(
+                "document",
+                {
+                    "method": "code",
+                    "part": "size",
+                    "unit": "words",
+                    "count": 200,
+                    "relation": "about",
+                    "statement": statement,
+                },
+            )
+            self.assertEqual(method, "code")
+            self.assertEqual(check.get("where"), "each")
+
     def test_page_counts_are_checked_per_page_and_totals_whole(self) -> None:
         pages = []
         for heading in ("North", "East", "West"):

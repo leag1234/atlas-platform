@@ -49,7 +49,7 @@ import re
 import sqlite3
 import time
 import unicodedata
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Sequence, Mapping
 from contextlib import closing
 from dataclasses import replace, asdict, dataclass, field
 from decimal import ROUND_FLOOR, Decimal
@@ -414,6 +414,12 @@ def stated_count(check: dict[str, Any], said: Sequence[str]) -> bool:
             r"\d+", re.sub(r"(?<=\d)[\s.,'\u00a0\u202f](?=\d{3}\b)", "", text)
         )
     }
+    if check.get("where") == "each":
+        bounds = sorted(figures)
+        for low, high in zip(bounds, bounds[1:]):
+            midpoint = (low + high) // 2
+            if low < midpoint < high and low <= check.get("count", 0) <= high:
+                return True
     return check.get("count") in figures
 
 
@@ -472,12 +478,15 @@ def normalized_check(kind: str, raw: dict[str, Any]) -> tuple[str, dict[str, Any
                 or not 0 < size <= MAX_SIZE
             ):
                 return "judge", {}
-            return "code", {
+            check = {
                 "part": "size",
                 "unit": unit,
                 "count": size,
                 "relation": relation if relation in RELATIONS else "about",
             }
+            if unit == "words" and _per_unit(raw.get("statement")):
+                check["where"] = "each"
+            return "code", check
         if part == "layout":
             return layout_check(raw)
         words = _words(raw.get("words"))
@@ -531,6 +540,21 @@ def layout_check(raw: dict[str, Any]) -> tuple[str, dict[str, Any]]:
         relation = raw.get("relation")
         check["relation"] = relation if relation in ("exact", "min", "max") else "exact"
     return "code", check
+
+
+PER_UNIT = re.compile(
+    r"\b(?:"
+    r"per\s+(?:page|slide|sheet|card|section)|"
+    r"par\s+(?:page|diapositive|fiche|carte|section)|"
+    r"pro\s+(?:seite|folie|karte|abschnitt)|"
+    r"por\s+(?:p[aá]gina|diapositiva|ficha|tarjeta|secci[oó]n)"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _per_unit(statement: Any) -> bool:
+    return isinstance(statement, str) and bool(PER_UNIT.search(statement))
 
 
 def _texts(value: Any) -> list[str]:
@@ -728,7 +752,7 @@ def file_view_of(raw: bytes, suffix: str) -> Any:
 
     if not raw or suffix not in {".pptx", ".docx", ".pdf", ".xlsx", ".html", ".svg"}:
         return None
-    with tempfile.TemporaryDirectory(prefix="atlas-layout-") as directory:
+    with tempfile.TemporaryDirectory(prefix="atlas-view-") as directory:
         path = Path(directory) / ("built" + suffix)
         path.write_bytes(raw)
         return file_view(path)
@@ -829,7 +853,9 @@ JUDGE_SYSTEM = (
     "the event happened. The facts, when given, were measured by code on the built "
     "file (its pages as printed, its slides, its words): they are true, and "
     "a length, a page count or a slide count is decided from them, never "
-    "from the text. A length without a number (short, brief, concise) "
+    "from the text. A quantity stated per page, slide, sheet, card or "
+    "section is checked on each unit, never on the file's total; the "
+    "evidence gives that unit's measure. A length without a number (short, brief, concise) "
     "is met when the file keeps to the size the person gave with a number "
     "(about one page, five slides) or, without one, reads as short for its "
     "kind; a one-page report is short. In an app, a feature the file "
@@ -1218,7 +1244,10 @@ def tolerance(size: int) -> int:
 
 
 def size_result(
-    item: Requirement, content: Any, text: str, measures: dict[str, int | None]
+    item: Requirement,
+    content: Any,
+    text: str,
+    measures: Mapping[str, int | list[int] | None],
 ) -> Result:
     """A size or count requirement against what code measured on the file.
 
@@ -1231,9 +1260,40 @@ def size_result(
     relation = str(check.get("relation") or "about")
     if relation == "exact" and unit in APPROXIMATE_UNITS:
         relation = "about"
-    measured = measures.get(unit)
-    if measured is None:
+    if unit == "words" and check.get("where") == "each":
+        counts = measures.get("words_per_unit")
+        if not isinstance(counts, list):
+            counts = None
+        if counts is None:
+            return Result(item.id, None, "the words on each unit could not be measured")
+        margin = tolerance(size)
+        over_margin = margin
+        asked = {
+            "exact": f"exactly {size}",
+            "about": f"about {size} (from {max(0, size - margin)} to {size + over_margin})",
+            "max": f"at most {size}",
+            "min": f"at least {size}",
+        }[relation]
+        for index, measured in enumerate(counts, 1):
+            ok = {
+                "exact": measured == size,
+                "about": size - margin <= measured <= size + over_margin,
+                "max": measured <= size,
+                "min": measured >= size,
+            }[relation]
+            if not ok:
+                return Result(
+                    item.id,
+                    False,
+                    f"unit {index} has {measured} words, {asked} were asked per unit",
+                )
+        return Result(item.id, True)
+    unit_measured: int | list[int] | None = measures.get(unit)
+    if isinstance(unit_measured, list):
+        unit_measured = None
+    if unit_measured is None:
         return Result(item.id, None, f"the number of {unit} could not be measured")
+    measured = unit_measured
     margin = tolerance(size)
     # A page begun is a page more: "about one page" printed on two pages
     # (the second a fifth full) was counted as met and the answer called it
@@ -1281,7 +1341,11 @@ def size_result(
             # Sections flow on the page (layout.py): a page break the person
             # did not ask for is the other way a file grows past its pages.
             how += "; remove each \\newpage line the person did not ask for"
-            how += page_target(measures, size, measured)
+            how += page_target(
+                {k: v for k, v in measures.items() if not isinstance(v, list)},
+                size,
+                measured,
+            )
         if headings:
             how += "; its sections are: " + "; ".join(headings[:12])
     return Result(item.id, False, how)
@@ -1418,18 +1482,41 @@ def size_measures(content: Any, text: str) -> dict[str, int | None]:
     return measures
 
 
+def words_per_unit(view: Any) -> list[int] | None:
+    """The words a reader sees on each page or slide of the built file.
+
+    A length asked per unit is checked on those units, not on the file's
+    total. Titles, tables and notes are not running text; a page or slide
+    with no readable text is still a unit and counts as zero.
+    """
+    if view is None or not getattr(view, "pages", 0):
+        return None
+    counts = [0] * view.pages
+    for block in view.blocks:
+        if (
+            1 <= block.page <= view.pages
+            and block.kind in {"paragraph", "card", "bullet", "numbered", "quote"}
+            and block.region not in {"notes", "header", "footer"}
+        ):
+            counts[block.page - 1] += len(re.findall(r"\w+", block.text))
+    return counts
+
+
 def document_result(
     item: Requirement,
     content: Any,
     text: str,
-    measures: dict[str, int | None] | None = None,
+    measures: Mapping[str, int | list[int] | None] | None = None,
 ) -> Result:
     """One code requirement of a document or deck, checked on its content."""
     check = item.check
     part = check["part"]
     if part == "size":
         return size_result(
-            item, content, text, measures or size_measures(content, text)
+            item,
+            content,
+            text,
+            measures or {**size_measures(content, text)},
         )
     words = [_fold(word) for word in check.get("words") or []]
     count = int(check.get("count") or 0)
@@ -1869,7 +1956,7 @@ class TurnLedger:
         content: Any,
         text: str,
         seconds: float,
-        measures: dict[str, int | None] | None = None,
+        measures: dict[str, int | list[int] | None] | None = None,
         name: str = "",
         view: Any = None,
     ) -> list[Result]:
@@ -2134,15 +2221,33 @@ def measured_units(ledger: Ledger, suffix: str) -> set[str]:
     return units
 
 
+def _needs_words_per_unit(ledger: Ledger) -> bool:
+    return any(
+        item.method == "code"
+        and item.check.get("part") == "size"
+        and item.check.get("unit") == "words"
+        and item.check.get("where") == "each"
+        for item in ledger.active()
+    )
+
+
 async def file_measures(
-    content: Any, text: str, suffix: str, raw: bytes, units: set[str], seconds: float
-) -> dict[str, int | None]:
+    content: Any,
+    text: str,
+    suffix: str,
+    raw: bytes,
+    units: set[str],
+    seconds: float,
+    ledger: Ledger | None = None,
+) -> dict[str, int | list[int] | None]:
     """The counts of the built file: slides of the deck, pages of the
     rendered PDF (LibreOffice in the bounded preview renderer, only when a
     page count was asked), and the content's own counts."""
     from services.orchestrator.deliverable_check import _units
 
-    measures = size_measures(content, text)
+    measures: dict[str, int | list[int] | None] = {**size_measures(content, text)}
+    if ledger is not None and _needs_words_per_unit(ledger):
+        measures["words_per_unit"] = words_per_unit(file_view_of(raw, suffix))
     if "pictures" in units and raw:
         from packages.doc_render.verify import printed_pictures
 
@@ -2160,9 +2265,9 @@ async def file_measures(
                 from packages.doc_render import form
 
                 filled = form.measure(raw).filled()
-                measures["words_per_page"] = page_capacity(
-                    measures.get("words"), filled
-                )
+                total_words = measures.get("words")
+                if isinstance(total_words, int):
+                    measures["words_per_page"] = page_capacity(total_words, filled)
                 measures["span_permille"] = round(sum(filled) * 1000)
             except Exception:  # noqa: BLE001 - the target is then not given
                 pass
@@ -2177,9 +2282,11 @@ async def file_measures(
                     timeout=min(seconds, PAGE_SECONDS),
                 )
                 measures["pages"] = rendered.total
-                measures["words_per_page"] = page_capacity(
-                    measures.get("words"), rendered.filled
-                )
+                total_words = measures.get("words")
+                if isinstance(total_words, int):
+                    measures["words_per_page"] = page_capacity(
+                        total_words, rendered.filled
+                    )
                 # The height the content spans, pages added (a table is
                 # height with few words): what a compact layout can gain on.
                 measures["span_permille"] = round(sum(rendered.filled) * 1000)
@@ -2258,7 +2365,13 @@ async def document_check(
         return []
     left = seconds - (time.monotonic() - started)
     measures = await file_measures(
-        content, text, suffix, raw, measured_units(turn.ledger, suffix), left
+        content,
+        text,
+        suffix,
+        raw,
+        measured_units(turn.ledger, suffix),
+        left,
+        turn.ledger,
     )
     # The closing may state the measured length (work_closing.py), never
     # another one.
