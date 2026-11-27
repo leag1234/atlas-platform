@@ -8,6 +8,7 @@ from collections.abc import Mapping, Sequence
 from typing import Literal
 
 from packages.closing_intent import polite_closing
+from packages.deferred_intent import creation_deferred
 from packages.writing_intent import plain_writing
 
 
@@ -132,6 +133,8 @@ _POLITE = re.compile(
 def app_intent(text: str, history: Sequence[Mapping[str, object]]) -> Intent | None:
     normalized = _normalized(text)
     if not normalized:
+        return None
+    if creation_deferred(text):
         return None
     # A thanks or a compliment after an app asks for nothing: a chat answer,
     # never the app again (staging 2026-11-16).

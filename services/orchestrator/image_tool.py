@@ -8,6 +8,7 @@ import re
 from time import monotonic
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+from packages.deferred_intent import creation_deferred
 from packages.imagegen import ImagePrompt
 from services.orchestrator.chat_schema import ChatRequest
 from services.orchestrator.followup import (
@@ -81,6 +82,8 @@ def mechanical_svg_enabled() -> bool:
 
 
 def explicit_image_request(question: str) -> bool:
+    if creation_deferred(question):
+        return False
     return bool(
         not _IMAGE_HOW_TO_QUESTION.search(question)
         and (
