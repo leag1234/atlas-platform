@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
+import io
 import json
 import os
 import shutil
@@ -19,6 +21,11 @@ from services.orchestrator.loop import GatewayError
 from services.orchestrator import pictures
 from services.orchestrator.request_router import DECISION_KEY, Decision
 from services.orchestrator.pictures import choice, painter, store, turn
+from services.orchestrator.pictures import cpu_turn
+from services.orchestrator.pictures import dialogue
+from services.orchestrator.pictures.turn import Spend
+from PIL import Image
+from services.orchestrator.pictures.dialogue import Understood
 from services.orchestrator.pictures.choice import choice_number, latest_set_id
 from picture_jobs import memoise_drafts
 
@@ -792,3 +799,105 @@ class FollowupTests(unittest.IsolatedAsyncioTestCase):
         gateway.failures = {8: GatewayError("provider_quota", 402, "credit")}
         with self.assertRaises(GatewayError):
             await self.change(gateway, first.reponse, "plus grand")
+
+    async def test_a_new_picture_asked_as_svg_uses_the_code_engine(self) -> None:
+        gateway = FakeGateway("cats")
+        request = Request(
+            "Please draw a lantern in the night as a real SVG file named lantern.svg."
+        )
+        request.__dict__[DECISION_KEY] = Decision(
+            kind="drawing", file_format="svg", follow_up=False
+        )
+        item = Interaction()
+        with patch.object(
+            turn, "_cpu_first", side_effect=AssertionError("image model called")
+        ):
+            await turn.process_picture_turn(request, item, complete=gateway)
+        self.assertIn("**lantern.svg**", item.reponse)
+        self.assertIn("/versions/1/download", item.reponse)
+        set_id = latest_set_id([{"role": "assistant", "content": item.reponse}])
+        assert set_id is not None
+        picture_set = store.load(set_id)
+        assert picture_set is not None
+        self.assertEqual(picture_set.engine, "code")
+        self.assertTrue(picture_set.current_source.strip().startswith("<svg"))
+
+    async def test_a_followup_asking_the_raster_picture_as_svg_redraws_by_code(
+        self,
+    ) -> None:
+        gateway = FakeGateway("cats")
+        first, picture_set = await self.picture(gateway)
+        picture_set.engine = "cpu"
+        picture_set.by_code = False
+        store.update(picture_set)
+        from services.orchestrator.pictures.dialogue import follow_up
+
+        item = Interaction()
+        request = Request("can I have it as an SVG file please")
+        request.lang = "en"
+        with patch.object(dialogue, "understand", return_value=Understood(kind="file")):
+            done = await follow_up(
+                request,
+                item,
+                self.current(first.reponse),
+                picture_set,
+                routed=None,
+                legacy_change=False,
+                complete=gateway,
+            )
+        self.assertTrue(done)
+        self.assertIn("redessinée en vectoriel", item.reponse)
+        set_id = latest_set_id([{"role": "assistant", "content": item.reponse}])
+        assert set_id is not None
+        after = store.load(set_id)
+        assert after is not None
+        self.assertEqual(after.engine, "code")
+        self.assertTrue(after.current_source.strip().startswith("<svg"))
+
+    async def test_a_picture_asked_as_png_keeps_the_image_model_path(self) -> None:
+        gateway = FakeGateway("cats")
+        request = Request(
+            "Please draw a lantern in the night as a file named lantern.png."
+        )
+        request.__dict__[DECISION_KEY] = Decision(
+            kind="drawing", file_format="png", follow_up=False
+        )
+        item = Interaction()
+        image = Image.new("RGB", (64, 64), (120, 180, 220))
+        buffer = io.BytesIO()
+        image.save(buffer, "PNG")
+        picture = base64.b64encode(buffer.getvalue()).decode()
+        drawing = cpu_turn.CpuDrawing(
+            candidates=[
+                {
+                    "image": {"mime": "image/png", "data": picture},
+                    "svg": "data:image/svg+xml;base64,"
+                    + base64.b64encode(b"<svg/>").decode(),
+                    "render": picture,
+                    "render_hash": cpu_turn.render_hash(picture),
+                    "unmet": [],
+                }
+            ],
+            timings={},
+            language="en",
+            attempts=1,
+            selected=True,
+        )
+
+        async def fake_cpu_first(*args: Any, **kwargs: Any) -> Any:
+            return drawing, Spend(ceiling=Decimal("1"))
+
+        calls: list[int] = []
+
+        async def spy(*args: Any, **kwargs: Any) -> Any:
+            calls.append(1)
+            return await fake_cpu_first(*args, **kwargs)
+
+        original_cpu_first = turn._cpu_first
+        turn._cpu_first = spy
+        try:
+            await turn.process_picture_turn(request, item, complete=gateway)
+        finally:
+            turn._cpu_first = original_cpu_first
+        # A raster format keeps the image model path.
+        self.assertEqual(calls, [1])

@@ -595,6 +595,26 @@ def _file_requested(request: Any) -> bool:
     return requests_file_delivery(request.user_text)
 
 
+WANTS_SVG_KEY = "picture_wants_svg"
+
+
+def _wants_svg(request: Any) -> bool:
+    """The request (or the router decision) asks for an SVG / vector file."""
+    from services.orchestrator import request_router
+
+    # A redraw asked as a vector by the follow-up path, or "SVG" in the words:
+    # neither depends on the model router being on.
+    if getattr(request, "__dict__", {}).get(WANTS_SVG_KEY):
+        return True
+    if re.search(r"(?i)\bsvg\b", str(getattr(request, "user_text", ""))):
+        return True
+    decision = request_router.decision(request)
+    if decision is not None and decision.file_format == "svg":
+        return True
+    match = FILE_NAME.search(str(request.user_text))
+    return match is not None and match.group(1).lower().endswith(".svg")
+
+
 def file_line(
     artifact_id: str,
     version: int,
@@ -902,13 +922,18 @@ async def process_picture_turn(
     deadline = started + max(60.0, limit - DEADLINE_MARGIN)
     errors: list[str] = []
     cpu: Any = None
+    wants_svg = _wants_svg(request)
     # The image model missed a checked statement on every attempt and a
     # drawing by code passes it: (statements, attempts, language) for the note.
     instead: tuple[list[str], int, str] | None = None
     try:
-        cpu, spend = await _cpu_first(
-            request_text, language, ceiling, deadline, complete, errors
-        )
+        if not wants_svg:
+            cpu, spend = await _cpu_first(
+                request_text, language, ceiling, deadline, complete, errors
+            )
+        else:
+            cpu = None
+            spend = Spend(ceiling=ceiling)
         if cpu is not None:
             candidates, ck, timings = cpu.candidates, None, dict(cpu.timings)
             if cpu.unsatisfied and cpu.rewrite is not None:
