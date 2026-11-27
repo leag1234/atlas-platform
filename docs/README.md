@@ -42,6 +42,7 @@ The default decision is therefore *not to host GPUs unless the load justifies it
 | `24-picture-follow-ups.md` | Picture follow-ups: understood with their conversation, honest about unchanged pictures, critiques from evidence, survey of open picture editors on CPU | Backend / product |
 | `25-reminders.md` | Reminders as calendar files (.ics with alarms): date and time read by code, recurrence, early alarm, library survey | Backend / product |
 | `26-app-edits-in-place.md` | App follow-ups as checked edits in place instead of whole rewrites: measured cost of rewrites, survey of edit formats, proposal and benchmark | Backend / product |
+| `34-harness-rules.md` | Lexical-rule counter and the principle that code measures and executes while the model reads meaning | All / agents |
 
 ## 2. Normative Conventions (RFC 2119)
 

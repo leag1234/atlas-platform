@@ -35,6 +35,8 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from harness_rules import check as check_harness_rules
+
 ROOT = Path(__file__).resolve().parents[1]
 CSS = Path("services/orchestrator/chat-ui.css")
 RENDERING = Path("reports/m24-rendering.json")
@@ -58,6 +60,7 @@ CI_STEPS = {
 }
 # Test modules run on every change: repository-wide rules that any diff can break.
 ALWAYS_TESTS = (
+    "test_harness_rules",
     "test_regex_lint",
     "test_repository_hygiene",
     "test_strict_privacy_egress",
@@ -415,6 +418,21 @@ def check_m24_digest() -> Result:
     return Result(label, "FAIL", hint, problems)
 
 
+def check_harness_rules_baseline() -> Result:
+    label = "harness rules"
+    passed, failures = check_harness_rules()
+    if passed:
+        return Result(label, "PASS")
+    return Result(
+        label,
+        "FAIL",
+        "remove or replace the rule; only when the addition parses a technical format "
+        "or protocol (a URL, a file format, a wire message), never a person's sentence, "
+        'run python3 tools/harness_rules.py --update --reason "..."',
+        failures,
+    )
+
+
 def check_mission() -> Result:
     size = (ROOT / MISSION).stat().st_size
     if size <= MISSION_LIMIT:
@@ -752,6 +770,7 @@ def main() -> int:
         check_m16,
         check_m23,
         check_m24_digest,
+        check_harness_rules_baseline,
         check_mission,
         lambda: check_prompts(changed),
         check_ruff_check,

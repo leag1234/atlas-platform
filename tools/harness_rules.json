@@ -1,0 +1,1700 @@
+{
+  "files": {
+    "packages/__init__.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 0
+    },
+    "packages/addressing.py": {
+      "language_tables": 6,
+      "regex": 12,
+      "word_tables": 0
+    },
+    "packages/api_content.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 2
+    },
+    "packages/artifact_html.py": {
+      "language_tables": 0,
+      "regex": 15,
+      "word_tables": 7
+    },
+    "packages/artifact_intent.py": {
+      "language_tables": 0,
+      "regex": 18,
+      "word_tables": 0
+    },
+    "packages/artifact_media.py": {
+      "language_tables": 0,
+      "regex": 8,
+      "word_tables": 0
+    },
+    "packages/artifact_source.py": {
+      "language_tables": 0,
+      "regex": 20,
+      "word_tables": 2
+    },
+    "packages/attached_blocks.py": {
+      "language_tables": 0,
+      "regex": 8,
+      "word_tables": 0
+    },
+    "packages/attachment_reader.py": {
+      "language_tables": 0,
+      "regex": 4,
+      "word_tables": 2
+    },
+    "packages/closing_intent.py": {
+      "language_tables": 0,
+      "regex": 2,
+      "word_tables": 2
+    },
+    "packages/configuration.py": {
+      "language_tables": 1,
+      "regex": 1,
+      "word_tables": 3
+    },
+    "packages/content_policy.py": {
+      "language_tables": 1,
+      "regex": 2,
+      "word_tables": 0
+    },
+    "packages/context_limit.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 0
+    },
+    "packages/context_usage.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 1
+    },
+    "packages/deferred_intent.py": {
+      "language_tables": 0,
+      "regex": 4,
+      "word_tables": 0
+    },
+    "packages/dev_format.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 2
+    },
+    "packages/dev_request.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 0
+    },
+    "packages/doc_render/__init__.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 1
+    },
+    "packages/doc_render/calculated.py": {
+      "language_tables": 0,
+      "regex": 2,
+      "word_tables": 0
+    },
+    "packages/doc_render/cells.py": {
+      "language_tables": 0,
+      "regex": 10,
+      "word_tables": 0
+    },
+    "packages/doc_render/deck.py": {
+      "language_tables": 0,
+      "regex": 3,
+      "word_tables": 0
+    },
+    "packages/doc_render/emoji.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 1
+    },
+    "packages/doc_render/figures.py": {
+      "language_tables": 0,
+      "regex": 1,
+      "word_tables": 1
+    },
+    "packages/doc_render/form.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 0
+    },
+    "packages/doc_render/formulas.py": {
+      "language_tables": 0,
+      "regex": 2,
+      "word_tables": 2
+    },
+    "packages/doc_render/glyphs.py": {
+      "language_tables": 0,
+      "regex": 2,
+      "word_tables": 0
+    },
+    "packages/doc_render/layout.py": {
+      "language_tables": 0,
+      "regex": 1,
+      "word_tables": 0
+    },
+    "packages/doc_render/preview.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 0
+    },
+    "packages/doc_render/readback.py": {
+      "language_tables": 0,
+      "regex": 5,
+      "word_tables": 3
+    },
+    "packages/doc_render/renderer.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 0
+    },
+    "packages/doc_render/schema.py": {
+      "language_tables": 0,
+      "regex": 5,
+      "word_tables": 0
+    },
+    "packages/doc_render/spacing.py": {
+      "language_tables": 0,
+      "regex": 3,
+      "word_tables": 0
+    },
+    "packages/doc_render/spreadsheet.py": {
+      "language_tables": 0,
+      "regex": 8,
+      "word_tables": 0
+    },
+    "packages/doc_render/titles.py": {
+      "language_tables": 0,
+      "regex": 3,
+      "word_tables": 2
+    },
+    "packages/doc_render/verify.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 0
+    },
+    "packages/doc_render/wordbreaks.py": {
+      "language_tables": 0,
+      "regex": 6,
+      "word_tables": 0
+    },
+    "packages/evidence.py": {
+      "language_tables": 0,
+      "regex": 1,
+      "word_tables": 0
+    },
+    "packages/file_answers.py": {
+      "language_tables": 0,
+      "regex": 2,
+      "word_tables": 0
+    },
+    "packages/file_intent.py": {
+      "language_tables": 0,
+      "regex": 8,
+      "word_tables": 0
+    },
+    "packages/gpu_ownership.py": {
+      "language_tables": 0,
+      "regex": 1,
+      "word_tables": 0
+    },
+    "packages/image_limits.py": {
+      "language_tables": 2,
+      "regex": 3,
+      "word_tables": 0
+    },
+    "packages/image_policy.py": {
+      "language_tables": 0,
+      "regex": 1,
+      "word_tables": 0
+    },
+    "packages/image_response.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 0
+    },
+    "packages/image_upload.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 0
+    },
+    "packages/imagegen.py": {
+      "language_tables": 0,
+      "regex": 6,
+      "word_tables": 0
+    },
+    "packages/images.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 0
+    },
+    "packages/language.py": {
+      "language_tables": 3,
+      "regex": 16,
+      "word_tables": 2
+    },
+    "packages/limits.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 0
+    },
+    "packages/linear_scan.py": {
+      "language_tables": 0,
+      "regex": 8,
+      "word_tables": 0
+    },
+    "packages/model_json.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 0
+    },
+    "packages/owned_server.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 3
+    },
+    "packages/pasted_text.py": {
+      "language_tables": 0,
+      "regex": 12,
+      "word_tables": 0
+    },
+    "packages/ports.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 0
+    },
+    "packages/privacy.py": {
+      "language_tables": 0,
+      "regex": 1,
+      "word_tables": 3
+    },
+    "packages/profiles.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 1
+    },
+    "packages/project_memory.py": {
+      "language_tables": 0,
+      "regex": 2,
+      "word_tables": 1
+    },
+    "packages/project_memory_tool.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 0
+    },
+    "packages/provider_calls.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 0
+    },
+    "packages/session_context.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 0
+    },
+    "packages/session_state.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 0
+    },
+    "packages/skills.py": {
+      "language_tables": 0,
+      "regex": 2,
+      "word_tables": 0
+    },
+    "packages/table_arithmetic.py": {
+      "language_tables": 0,
+      "regex": 1,
+      "word_tables": 1
+    },
+    "packages/task_schedule.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 0
+    },
+    "packages/text_deliverables.py": {
+      "language_tables": 0,
+      "regex": 2,
+      "word_tables": 0
+    },
+    "packages/tool_history.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 0
+    },
+    "packages/tool_results.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 1
+    },
+    "packages/turn_attachments.py": {
+      "language_tables": 0,
+      "regex": 4,
+      "word_tables": 1
+    },
+    "packages/user_errors.py": {
+      "language_tables": 44,
+      "regex": 4,
+      "word_tables": 3
+    },
+    "packages/user_memory.py": {
+      "language_tables": 0,
+      "regex": 5,
+      "word_tables": 0
+    },
+    "packages/user_memory_auth.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 0
+    },
+    "packages/validation.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 0
+    },
+    "packages/web_extract.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 0
+    },
+    "packages/work_intent.py": {
+      "language_tables": 0,
+      "regex": 12,
+      "word_tables": 1
+    },
+    "packages/writing_intent.py": {
+      "language_tables": 0,
+      "regex": 6,
+      "word_tables": 0
+    },
+    "services/orchestrator/api_key_admin.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 1
+    },
+    "services/orchestrator/api_key_edge.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 1
+    },
+    "services/orchestrator/api_key_messages.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 0
+    },
+    "services/orchestrator/api_key_responses.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 0
+    },
+    "services/orchestrator/api_key_ui.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 0
+    },
+    "services/orchestrator/api_keys.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 0
+    },
+    "services/orchestrator/api_limits.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 0
+    },
+    "services/orchestrator/app.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 0
+    },
+    "services/orchestrator/app_facts.py": {
+      "language_tables": 1,
+      "regex": 22,
+      "word_tables": 0
+    },
+    "services/orchestrator/app_features.py": {
+      "language_tables": 1,
+      "regex": 22,
+      "word_tables": 1
+    },
+    "services/orchestrator/app_media.py": {
+      "language_tables": 1,
+      "regex": 12,
+      "word_tables": 4
+    },
+    "services/orchestrator/app_render.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 1
+    },
+    "services/orchestrator/app_render_worker.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 0
+    },
+    "services/orchestrator/app_turn.py": {
+      "language_tables": 5,
+      "regex": 0,
+      "word_tables": 2
+    },
+    "services/orchestrator/appearance.py": {
+      "language_tables": 2,
+      "regex": 49,
+      "word_tables": 2
+    },
+    "services/orchestrator/artifact_links.py": {
+      "language_tables": 0,
+      "regex": 1,
+      "word_tables": 0
+    },
+    "services/orchestrator/artifact_routes.py": {
+      "language_tables": 1,
+      "regex": 7,
+      "word_tables": 0
+    },
+    "services/orchestrator/artifact_store.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 0
+    },
+    "services/orchestrator/artifact_tokens.py": {
+      "language_tables": 0,
+      "regex": 3,
+      "word_tables": 0
+    },
+    "services/orchestrator/artifact_tools.py": {
+      "language_tables": 1,
+      "regex": 5,
+      "word_tables": 0
+    },
+    "services/orchestrator/assistant_bridge.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 0
+    },
+    "services/orchestrator/attachment_reading.py": {
+      "language_tables": 18,
+      "regex": 5,
+      "word_tables": 0
+    },
+    "services/orchestrator/budget_identity.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 0
+    },
+    "services/orchestrator/cache.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 0
+    },
+    "services/orchestrator/calculator.py": {
+      "language_tables": 0,
+      "regex": 2,
+      "word_tables": 0
+    },
+    "services/orchestrator/call_repair.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 3
+    },
+    "services/orchestrator/cancellation.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 0
+    },
+    "services/orchestrator/capability_strategy.py": {
+      "language_tables": 0,
+      "regex": 21,
+      "word_tables": 0
+    },
+    "services/orchestrator/change_claims.py": {
+      "language_tables": 0,
+      "regex": 2,
+      "word_tables": 1
+    },
+    "services/orchestrator/chat_api.py": {
+      "language_tables": 0,
+      "regex": 3,
+      "word_tables": 0
+    },
+    "services/orchestrator/chat_file_names.py": {
+      "language_tables": 0,
+      "regex": 4,
+      "word_tables": 2
+    },
+    "services/orchestrator/chat_pipeline.py": {
+      "language_tables": 5,
+      "regex": 8,
+      "word_tables": 1
+    },
+    "services/orchestrator/chat_schema.py": {
+      "language_tables": 1,
+      "regex": 7,
+      "word_tables": 0
+    },
+    "services/orchestrator/chat_stream.py": {
+      "language_tables": 3,
+      "regex": 9,
+      "word_tables": 0
+    },
+    "services/orchestrator/chat_work.py": {
+      "language_tables": 0,
+      "regex": 1,
+      "word_tables": 2
+    },
+    "services/orchestrator/citation_cleanup.py": {
+      "language_tables": 0,
+      "regex": 16,
+      "word_tables": 0
+    },
+    "services/orchestrator/citation_fragments.py": {
+      "language_tables": 0,
+      "regex": 10,
+      "word_tables": 0
+    },
+    "services/orchestrator/closing.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 2
+    },
+    "services/orchestrator/code_api.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 0
+    },
+    "services/orchestrator/code_context.py": {
+      "language_tables": 0,
+      "regex": 7,
+      "word_tables": 0
+    },
+    "services/orchestrator/code_mode.py": {
+      "language_tables": 2,
+      "regex": 3,
+      "word_tables": 2
+    },
+    "services/orchestrator/code_tools.py": {
+      "language_tables": 0,
+      "regex": 2,
+      "word_tables": 0
+    },
+    "services/orchestrator/code_ui.py": {
+      "language_tables": 0,
+      "regex": 5,
+      "word_tables": 2
+    },
+    "services/orchestrator/code_verification.py": {
+      "language_tables": 0,
+      "regex": 12,
+      "word_tables": 0
+    },
+    "services/orchestrator/code_worker.py": {
+      "language_tables": 0,
+      "regex": 1,
+      "word_tables": 0
+    },
+    "services/orchestrator/code_workspace.py": {
+      "language_tables": 0,
+      "regex": 10,
+      "word_tables": 1
+    },
+    "services/orchestrator/commons.py": {
+      "language_tables": 0,
+      "regex": 8,
+      "word_tables": 1
+    },
+    "services/orchestrator/computation_claims.py": {
+      "language_tables": 1,
+      "regex": 6,
+      "word_tables": 1
+    },
+    "services/orchestrator/connectors.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 1
+    },
+    "services/orchestrator/constraints/__init__.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 0
+    },
+    "services/orchestrator/constraints/checks.py": {
+      "language_tables": 0,
+      "regex": 9,
+      "word_tables": 3
+    },
+    "services/orchestrator/constraints/model.py": {
+      "language_tables": 0,
+      "regex": 13,
+      "word_tables": 7
+    },
+    "services/orchestrator/constraints/phrases.py": {
+      "language_tables": 0,
+      "regex": 17,
+      "word_tables": 0
+    },
+    "services/orchestrator/constraints/pipeline.py": {
+      "language_tables": 5,
+      "regex": 15,
+      "word_tables": 2
+    },
+    "services/orchestrator/constraints/verify.py": {
+      "language_tables": 0,
+      "regex": 6,
+      "word_tables": 0
+    },
+    "services/orchestrator/constraints/views.py": {
+      "language_tables": 0,
+      "regex": 24,
+      "word_tables": 4
+    },
+    "services/orchestrator/content.py": {
+      "language_tables": 0,
+      "regex": 9,
+      "word_tables": 0
+    },
+    "services/orchestrator/content_recovery.py": {
+      "language_tables": 1,
+      "regex": 1,
+      "word_tables": 0
+    },
+    "services/orchestrator/context_trim.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 0
+    },
+    "services/orchestrator/conversation_privacy.py": {
+      "language_tables": 0,
+      "regex": 1,
+      "word_tables": 0
+    },
+    "services/orchestrator/current_file.py": {
+      "language_tables": 0,
+      "regex": 4,
+      "word_tables": 0
+    },
+    "services/orchestrator/daily_budget.py": {
+      "language_tables": 3,
+      "regex": 0,
+      "word_tables": 3
+    },
+    "services/orchestrator/dangling_words.py": {
+      "language_tables": 0,
+      "regex": 6,
+      "word_tables": 3
+    },
+    "services/orchestrator/datecalc.py": {
+      "language_tables": 0,
+      "regex": 4,
+      "word_tables": 1
+    },
+    "services/orchestrator/deadline.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 0
+    },
+    "services/orchestrator/deliverable_check.py": {
+      "language_tables": 0,
+      "regex": 4,
+      "word_tables": 0
+    },
+    "services/orchestrator/derived_values.py": {
+      "language_tables": 0,
+      "regex": 3,
+      "word_tables": 0
+    },
+    "services/orchestrator/dev_auth.py": {
+      "language_tables": 0,
+      "regex": 1,
+      "word_tables": 0
+    },
+    "services/orchestrator/dev_chat.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 0
+    },
+    "services/orchestrator/dev_health.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 0
+    },
+    "services/orchestrator/dev_inference.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 0
+    },
+    "services/orchestrator/dev_input.py": {
+      "language_tables": 0,
+      "regex": 1,
+      "word_tables": 1
+    },
+    "services/orchestrator/dev_messages.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 2
+    },
+    "services/orchestrator/dev_responses.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 1
+    },
+    "services/orchestrator/devapi.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 0
+    },
+    "services/orchestrator/diagram.py": {
+      "language_tables": 1,
+      "regex": 10,
+      "word_tables": 0
+    },
+    "services/orchestrator/dictation.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 0
+    },
+    "services/orchestrator/dictation_cleanup.py": {
+      "language_tables": 0,
+      "regex": 4,
+      "word_tables": 0
+    },
+    "services/orchestrator/dictation_text.py": {
+      "language_tables": 2,
+      "regex": 7,
+      "word_tables": 1
+    },
+    "services/orchestrator/document_chat.py": {
+      "language_tables": 1,
+      "regex": 0,
+      "word_tables": 0
+    },
+    "services/orchestrator/document_quotes.py": {
+      "language_tables": 1,
+      "regex": 15,
+      "word_tables": 0
+    },
+    "services/orchestrator/document_stats.py": {
+      "language_tables": 1,
+      "regex": 14,
+      "word_tables": 1
+    },
+    "services/orchestrator/document_stream.py": {
+      "language_tables": 0,
+      "regex": 2,
+      "word_tables": 0
+    },
+    "services/orchestrator/documents.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 0
+    },
+    "services/orchestrator/encyclopedia.py": {
+      "language_tables": 0,
+      "regex": 6,
+      "word_tables": 2
+    },
+    "services/orchestrator/eu_statistics.py": {
+      "language_tables": 1,
+      "regex": 3,
+      "word_tables": 1
+    },
+    "services/orchestrator/exact_tools.py": {
+      "language_tables": 0,
+      "regex": 4,
+      "word_tables": 0
+    },
+    "services/orchestrator/expectations.py": {
+      "language_tables": 6,
+      "regex": 17,
+      "word_tables": 11
+    },
+    "services/orchestrator/figure_nouns.py": {
+      "language_tables": 0,
+      "regex": 3,
+      "word_tables": 0
+    },
+    "services/orchestrator/figure_units.py": {
+      "language_tables": 3,
+      "regex": 2,
+      "word_tables": 1
+    },
+    "services/orchestrator/file_claims.py": {
+      "language_tables": 3,
+      "regex": 13,
+      "word_tables": 1
+    },
+    "services/orchestrator/file_content.py": {
+      "language_tables": 0,
+      "regex": 17,
+      "word_tables": 0
+    },
+    "services/orchestrator/file_results.py": {
+      "language_tables": 4,
+      "regex": 3,
+      "word_tables": 0
+    },
+    "services/orchestrator/followup.py": {
+      "language_tables": 0,
+      "regex": 15,
+      "word_tables": 0
+    },
+    "services/orchestrator/foreign_words.py": {
+      "language_tables": 5,
+      "regex": 14,
+      "word_tables": 0
+    },
+    "services/orchestrator/forge_publication.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 1
+    },
+    "services/orchestrator/fr_communes.py": {
+      "language_tables": 0,
+      "regex": 5,
+      "word_tables": 0
+    },
+    "services/orchestrator/fx_rates.py": {
+      "language_tables": 0,
+      "regex": 1,
+      "word_tables": 0
+    },
+    "services/orchestrator/grounding.py": {
+      "language_tables": 5,
+      "regex": 41,
+      "word_tables": 1
+    },
+    "services/orchestrator/guest_activity.py": {
+      "language_tables": 1,
+      "regex": 0,
+      "word_tables": 1
+    },
+    "services/orchestrator/hosted_tools.py": {
+      "language_tables": 0,
+      "regex": 1,
+      "word_tables": 1
+    },
+    "services/orchestrator/image_errors.py": {
+      "language_tables": 2,
+      "regex": 1,
+      "word_tables": 0
+    },
+    "services/orchestrator/image_store.py": {
+      "language_tables": 0,
+      "regex": 4,
+      "word_tables": 0
+    },
+    "services/orchestrator/image_tool.py": {
+      "language_tables": 2,
+      "regex": 7,
+      "word_tables": 0
+    },
+    "services/orchestrator/image_truth.py": {
+      "language_tables": 3,
+      "regex": 11,
+      "word_tables": 1
+    },
+    "services/orchestrator/image_verification.py": {
+      "language_tables": 4,
+      "regex": 1,
+      "word_tables": 0
+    },
+    "services/orchestrator/imagegen.py": {
+      "language_tables": 5,
+      "regex": 1,
+      "word_tables": 1
+    },
+    "services/orchestrator/interactions.py": {
+      "language_tables": 0,
+      "regex": 2,
+      "word_tables": 0
+    },
+    "services/orchestrator/journey.py": {
+      "language_tables": 1,
+      "regex": 4,
+      "word_tables": 0
+    },
+    "services/orchestrator/key_subject.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 0
+    },
+    "services/orchestrator/kiwix.py": {
+      "language_tables": 0,
+      "regex": 6,
+      "word_tables": 1
+    },
+    "services/orchestrator/latest_version.py": {
+      "language_tables": 1,
+      "regex": 15,
+      "word_tables": 1
+    },
+    "services/orchestrator/link_requests.py": {
+      "language_tables": 7,
+      "regex": 22,
+      "word_tables": 1
+    },
+    "services/orchestrator/location.py": {
+      "language_tables": 0,
+      "regex": 20,
+      "word_tables": 0
+    },
+    "services/orchestrator/location_memory.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 0
+    },
+    "services/orchestrator/location_route.py": {
+      "language_tables": 10,
+      "regex": 0,
+      "word_tables": 0
+    },
+    "services/orchestrator/loop.py": {
+      "language_tables": 2,
+      "regex": 3,
+      "word_tables": 0
+    },
+    "services/orchestrator/loop_nudge.py": {
+      "language_tables": 0,
+      "regex": 1,
+      "word_tables": 0
+    },
+    "services/orchestrator/machine_connect.py": {
+      "language_tables": 0,
+      "regex": 1,
+      "word_tables": 0
+    },
+    "services/orchestrator/markers.py": {
+      "language_tables": 7,
+      "regex": 4,
+      "word_tables": 1
+    },
+    "services/orchestrator/mcp_client.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 0
+    },
+    "services/orchestrator/mcp_confirmation.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 0
+    },
+    "services/orchestrator/mcp_http.py": {
+      "language_tables": 0,
+      "regex": 1,
+      "word_tables": 0
+    },
+    "services/orchestrator/mcp_transport.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 0
+    },
+    "services/orchestrator/memory.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 0
+    },
+    "services/orchestrator/mermaid_check.py": {
+      "language_tables": 0,
+      "regex": 14,
+      "word_tables": 0
+    },
+    "services/orchestrator/model.py": {
+      "language_tables": 0,
+      "regex": 2,
+      "word_tables": 0
+    },
+    "services/orchestrator/narration.py": {
+      "language_tables": 0,
+      "regex": 9,
+      "word_tables": 1
+    },
+    "services/orchestrator/nearby.py": {
+      "language_tables": 7,
+      "regex": 2,
+      "word_tables": 4
+    },
+    "services/orchestrator/nearby_chat.py": {
+      "language_tables": 0,
+      "regex": 1,
+      "word_tables": 0
+    },
+    "services/orchestrator/nearby_presentation.py": {
+      "language_tables": 1,
+      "regex": 2,
+      "word_tables": 0
+    },
+    "services/orchestrator/news_feeds.py": {
+      "language_tables": 0,
+      "regex": 4,
+      "word_tables": 0
+    },
+    "services/orchestrator/number_provenance.py": {
+      "language_tables": 0,
+      "regex": 25,
+      "word_tables": 1
+    },
+    "services/orchestrator/only_request.py": {
+      "language_tables": 0,
+      "regex": 16,
+      "word_tables": 0
+    },
+    "services/orchestrator/own_facts.py": {
+      "language_tables": 0,
+      "regex": 3,
+      "word_tables": 0
+    },
+    "services/orchestrator/owned_wait.py": {
+      "language_tables": 1,
+      "regex": 0,
+      "word_tables": 0
+    },
+    "services/orchestrator/page_budget.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 0
+    },
+    "services/orchestrator/page_refs.py": {
+      "language_tables": 2,
+      "regex": 8,
+      "word_tables": 0
+    },
+    "services/orchestrator/person_lookup.py": {
+      "language_tables": 1,
+      "regex": 15,
+      "word_tables": 2
+    },
+    "services/orchestrator/pictures/__init__.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 0
+    },
+    "services/orchestrator/pictures/animal_kit.py": {
+      "language_tables": 0,
+      "regex": 2,
+      "word_tables": 7
+    },
+    "services/orchestrator/pictures/bare.py": {
+      "language_tables": 0,
+      "regex": 8,
+      "word_tables": 1
+    },
+    "services/orchestrator/pictures/body_kit.py": {
+      "language_tables": 4,
+      "regex": 13,
+      "word_tables": 8
+    },
+    "services/orchestrator/pictures/chain.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 0
+    },
+    "services/orchestrator/pictures/checklist.py": {
+      "language_tables": 0,
+      "regex": 3,
+      "word_tables": 6
+    },
+    "services/orchestrator/pictures/checks.py": {
+      "language_tables": 0,
+      "regex": 4,
+      "word_tables": 3
+    },
+    "services/orchestrator/pictures/choice.py": {
+      "language_tables": 0,
+      "regex": 3,
+      "word_tables": 0
+    },
+    "services/orchestrator/pictures/cpu_checks.py": {
+      "language_tables": 1,
+      "regex": 0,
+      "word_tables": 0
+    },
+    "services/orchestrator/pictures/cpu_finish.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 0
+    },
+    "services/orchestrator/pictures/cpu_server.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 0
+    },
+    "services/orchestrator/pictures/cpu_turn.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 0
+    },
+    "services/orchestrator/pictures/dialogue.py": {
+      "language_tables": 0,
+      "regex": 4,
+      "word_tables": 2
+    },
+    "services/orchestrator/pictures/drawing.py": {
+      "language_tables": 1,
+      "regex": 5,
+      "word_tables": 1
+    },
+    "services/orchestrator/pictures/face_kit.py": {
+      "language_tables": 1,
+      "regex": 1,
+      "word_tables": 5
+    },
+    "services/orchestrator/pictures/finish.py": {
+      "language_tables": 2,
+      "regex": 0,
+      "word_tables": 0
+    },
+    "services/orchestrator/pictures/followup.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 0
+    },
+    "services/orchestrator/pictures/geometry.py": {
+      "language_tables": 0,
+      "regex": 6,
+      "word_tables": 2
+    },
+    "services/orchestrator/pictures/job.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 0
+    },
+    "services/orchestrator/pictures/judge.py": {
+      "language_tables": 1,
+      "regex": 4,
+      "word_tables": 2
+    },
+    "services/orchestrator/pictures/labels.py": {
+      "language_tables": 1,
+      "regex": 1,
+      "word_tables": 0
+    },
+    "services/orchestrator/pictures/locate.py": {
+      "language_tables": 0,
+      "regex": 1,
+      "word_tables": 0
+    },
+    "services/orchestrator/pictures/ndimage.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 0
+    },
+    "services/orchestrator/pictures/ordering.py": {
+      "language_tables": 0,
+      "regex": 1,
+      "word_tables": 0
+    },
+    "services/orchestrator/pictures/painter.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 0
+    },
+    "services/orchestrator/pictures/reference.py": {
+      "language_tables": 1,
+      "regex": 3,
+      "word_tables": 2
+    },
+    "services/orchestrator/pictures/render.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 2
+    },
+    "services/orchestrator/pictures/rewrite.py": {
+      "language_tables": 0,
+      "regex": 12,
+      "word_tables": 1
+    },
+    "services/orchestrator/pictures/routes.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 0
+    },
+    "services/orchestrator/pictures/sanitise.py": {
+      "language_tables": 0,
+      "regex": 10,
+      "word_tables": 1
+    },
+    "services/orchestrator/pictures/store.py": {
+      "language_tables": 0,
+      "regex": 2,
+      "word_tables": 0
+    },
+    "services/orchestrator/pictures/svg_doc.py": {
+      "language_tables": 0,
+      "regex": 8,
+      "word_tables": 2
+    },
+    "services/orchestrator/pictures/svg_text.py": {
+      "language_tables": 0,
+      "regex": 14,
+      "word_tables": 1
+    },
+    "services/orchestrator/pictures/text_setting.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 0
+    },
+    "services/orchestrator/pictures/texts.py": {
+      "language_tables": 2,
+      "regex": 2,
+      "word_tables": 1
+    },
+    "services/orchestrator/pictures/turn.py": {
+      "language_tables": 0,
+      "regex": 5,
+      "word_tables": 1
+    },
+    "services/orchestrator/pictures/worker.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 1
+    },
+    "services/orchestrator/presentation_delivery.py": {
+      "language_tables": 0,
+      "regex": 2,
+      "word_tables": 4
+    },
+    "services/orchestrator/project_chat.py": {
+      "language_tables": 0,
+      "regex": 1,
+      "word_tables": 0
+    },
+    "services/orchestrator/project_citations.py": {
+      "language_tables": 0,
+      "regex": 6,
+      "word_tables": 0
+    },
+    "services/orchestrator/project_commands.py": {
+      "language_tables": 0,
+      "regex": 1,
+      "word_tables": 0
+    },
+    "services/orchestrator/project_document_input.py": {
+      "language_tables": 0,
+      "regex": 11,
+      "word_tables": 0
+    },
+    "services/orchestrator/project_document_tools.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 1
+    },
+    "services/orchestrator/project_forge.py": {
+      "language_tables": 0,
+      "regex": 3,
+      "word_tables": 0
+    },
+    "services/orchestrator/project_memory_tools.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 0
+    },
+    "services/orchestrator/project_scheduler.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 0
+    },
+    "services/orchestrator/project_stream.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 0
+    },
+    "services/orchestrator/project_transcript.py": {
+      "language_tables": 2,
+      "regex": 7,
+      "word_tables": 0
+    },
+    "services/orchestrator/project_ui.py": {
+      "language_tables": 0,
+      "regex": 1,
+      "word_tables": 1
+    },
+    "services/orchestrator/protected_text.py": {
+      "language_tables": 0,
+      "regex": 3,
+      "word_tables": 0
+    },
+    "services/orchestrator/redirects.py": {
+      "language_tables": 0,
+      "regex": 12,
+      "word_tables": 1
+    },
+    "services/orchestrator/reference_fetch.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 1
+    },
+    "services/orchestrator/relative_dates.py": {
+      "language_tables": 0,
+      "regex": 24,
+      "word_tables": 4
+    },
+    "services/orchestrator/reminder_ics.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 4
+    },
+    "services/orchestrator/reminder_parse.py": {
+      "language_tables": 4,
+      "regex": 63,
+      "word_tables": 2
+    },
+    "services/orchestrator/reminder_route.py": {
+      "language_tables": 27,
+      "regex": 1,
+      "word_tables": 0
+    },
+    "services/orchestrator/request_owners.py": {
+      "language_tables": 0,
+      "regex": 1,
+      "word_tables": 0
+    },
+    "services/orchestrator/request_router.py": {
+      "language_tables": 0,
+      "regex": 12,
+      "word_tables": 6
+    },
+    "services/orchestrator/result_references.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 0
+    },
+    "services/orchestrator/route_facts.py": {
+      "language_tables": 0,
+      "regex": 50,
+      "word_tables": 0
+    },
+    "services/orchestrator/router_local.py": {
+      "language_tables": 0,
+      "regex": 2,
+      "word_tables": 1
+    },
+    "services/orchestrator/schedule_tools.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 0
+    },
+    "services/orchestrator/scoped_claims.py": {
+      "language_tables": 1,
+      "regex": 9,
+      "word_tables": 0
+    },
+    "services/orchestrator/search_freshness.py": {
+      "language_tables": 1,
+      "regex": 4,
+      "word_tables": 0
+    },
+    "services/orchestrator/search_guard.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 1
+    },
+    "services/orchestrator/search_policy.py": {
+      "language_tables": 0,
+      "regex": 15,
+      "word_tables": 0
+    },
+    "services/orchestrator/searxng.py": {
+      "language_tables": 1,
+      "regex": 1,
+      "word_tables": 5
+    },
+    "services/orchestrator/serve_owner.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 0
+    },
+    "services/orchestrator/serving.py": {
+      "language_tables": 0,
+      "regex": 3,
+      "word_tables": 5
+    },
+    "services/orchestrator/session_context.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 0
+    },
+    "services/orchestrator/session_updates.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 1
+    },
+    "services/orchestrator/shopping_links.py": {
+      "language_tables": 0,
+      "regex": 3,
+      "word_tables": 0
+    },
+    "services/orchestrator/shopping_prices.py": {
+      "language_tables": 1,
+      "regex": 5,
+      "word_tables": 0
+    },
+    "services/orchestrator/side_view.py": {
+      "language_tables": 1,
+      "regex": 0,
+      "word_tables": 0
+    },
+    "services/orchestrator/skill_catalog.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 0
+    },
+    "services/orchestrator/skill_tools.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 0
+    },
+    "services/orchestrator/slide_parts.py": {
+      "language_tables": 0,
+      "regex": 2,
+      "word_tables": 1
+    },
+    "services/orchestrator/source_faithfulness.py": {
+      "language_tables": 2,
+      "regex": 11,
+      "word_tables": 1
+    },
+    "services/orchestrator/source_tools.py": {
+      "language_tables": 0,
+      "regex": 7,
+      "word_tables": 2
+    },
+    "services/orchestrator/source_truth.py": {
+      "language_tables": 2,
+      "regex": 27,
+      "word_tables": 2
+    },
+    "services/orchestrator/stray_script.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 3
+    },
+    "services/orchestrator/stream_client.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 0
+    },
+    "services/orchestrator/substitution_notice.py": {
+      "language_tables": 1,
+      "regex": 0,
+      "word_tables": 0
+    },
+    "services/orchestrator/svg_raster.py": {
+      "language_tables": 0,
+      "regex": 2,
+      "word_tables": 1
+    },
+    "services/orchestrator/svg_raster_worker.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 0
+    },
+    "services/orchestrator/terminal_client.py": {
+      "language_tables": 0,
+      "regex": 2,
+      "word_tables": 1
+    },
+    "services/orchestrator/terminal_stack.py": {
+      "language_tables": 0,
+      "regex": 20,
+      "word_tables": 1
+    },
+    "services/orchestrator/time_cut.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 1
+    },
+    "services/orchestrator/title.py": {
+      "language_tables": 2,
+      "regex": 4,
+      "word_tables": 0
+    },
+    "services/orchestrator/tool_failures.py": {
+      "language_tables": 0,
+      "regex": 1,
+      "word_tables": 1
+    },
+    "services/orchestrator/tools.py": {
+      "language_tables": 2,
+      "regex": 2,
+      "word_tables": 1
+    },
+    "services/orchestrator/transit_planner.py": {
+      "language_tables": 3,
+      "regex": 59,
+      "word_tables": 9
+    },
+    "services/orchestrator/travel_claims.py": {
+      "language_tables": 6,
+      "regex": 112,
+      "word_tables": 3
+    },
+    "services/orchestrator/travel_rebuild.py": {
+      "language_tables": 7,
+      "regex": 30,
+      "word_tables": 0
+    },
+    "services/orchestrator/ui_injection.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 0
+    },
+    "services/orchestrator/units.py": {
+      "language_tables": 1,
+      "regex": 1,
+      "word_tables": 0
+    },
+    "services/orchestrator/unsourced_details.py": {
+      "language_tables": 4,
+      "regex": 44,
+      "word_tables": 3
+    },
+    "services/orchestrator/user_memory.py": {
+      "language_tables": 11,
+      "regex": 0,
+      "word_tables": 0
+    },
+    "services/orchestrator/user_memory_ui.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 0
+    },
+    "services/orchestrator/vision.py": {
+      "language_tables": 0,
+      "regex": 2,
+      "word_tables": 0
+    },
+    "services/orchestrator/visual_copy.py": {
+      "language_tables": 2,
+      "regex": 2,
+      "word_tables": 1
+    },
+    "services/orchestrator/visual_tools.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 1
+    },
+    "services/orchestrator/voice_ui.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 0
+    },
+    "services/orchestrator/web.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 0
+    },
+    "services/orchestrator/webui.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 0
+    },
+    "services/orchestrator/wikidata_local.py": {
+      "language_tables": 0,
+      "regex": 2,
+      "word_tables": 0
+    },
+    "services/orchestrator/work_clock.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 1
+    },
+    "services/orchestrator/work_closing.py": {
+      "language_tables": 0,
+      "regex": 3,
+      "word_tables": 0
+    },
+    "services/orchestrator/work_delivery.py": {
+      "language_tables": 3,
+      "regex": 1,
+      "word_tables": 0
+    },
+    "services/orchestrator/work_egress.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 1
+    },
+    "services/orchestrator/work_estimates.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 2
+    },
+    "services/orchestrator/work_execution.py": {
+      "language_tables": 2,
+      "regex": 1,
+      "word_tables": 1
+    },
+    "services/orchestrator/work_forge_tools.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 0
+    },
+    "services/orchestrator/work_instructions.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 0
+    },
+    "services/orchestrator/work_machine_tools.py": {
+      "language_tables": 41,
+      "regex": 9,
+      "word_tables": 4
+    },
+    "services/orchestrator/work_opencode.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 1
+    },
+    "services/orchestrator/work_opencode_container.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 1
+    },
+    "services/orchestrator/work_opencode_turn.py": {
+      "language_tables": 0,
+      "regex": 2,
+      "word_tables": 2
+    },
+    "services/orchestrator/work_orphan_sweep.py": {
+      "language_tables": 0,
+      "regex": 0,
+      "word_tables": 1
+    },
+    "services/orchestrator/work_pictures.py": {
+      "language_tables": 2,
+      "regex": 1,
+      "word_tables": 0
+    },
+    "services/orchestrator/work_plan.py": {
+      "language_tables": 1,
+      "regex": 1,
+      "word_tables": 4
+    },
+    "services/orchestrator/work_progress.py": {
+      "language_tables": 2,
+      "regex": 0,
+      "word_tables": 1
+    },
+    "services/orchestrator/work_remote_tools.py": {
+      "language_tables": 0,
+      "regex": 1,
+      "word_tables": 0
+    },
+    "services/orchestrator/work_save.py": {
+      "language_tables": 3,
+      "regex": 2,
+      "word_tables": 1
+    },
+    "services/orchestrator/work_tool_selection.py": {
+      "language_tables": 0,
+      "regex": 4,
+      "word_tables": 4
+    }
+  },
+  "raised": [],
+  "totals": {
+    "language_tables": 347,
+    "regex": 1732,
+    "word_tables": 284
+  }
+}
