@@ -57,7 +57,20 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 Kind = Literal["answer", "research", "drawing", "app", "file", "run", "remote", "other"]
-FileFormat = Literal["docx", "xlsx", "pptx", "pdf", "csv", "md"]
+FileFormat = Literal[
+    "docx",
+    "xlsx",
+    "pptx",
+    "pdf",
+    "csv",
+    "md",
+    "svg",
+    "png",
+    "jpg",
+    "jpeg",
+    "webp",
+    "gif",
+]
 
 # Kinds that Work answers behind the chat (ATLAS_CHAT_WORK=1).
 WORK_KINDS = frozenset({"file", "run", "remote"})
@@ -91,6 +104,23 @@ _FORMAT_ALIASES = {
     "slides": "pptx",
     "markdown": "md",
 }
+_FORMATS = frozenset(
+    {
+        "docx",
+        "xlsx",
+        "pptx",
+        "pdf",
+        "csv",
+        "md",
+        "svg",
+        "png",
+        "jpg",
+        "jpeg",
+        "webp",
+        "gif",
+    }
+)
+_IMAGE_FORMATS = frozenset({"svg", "png", "jpg", "jpeg", "webp", "gif"})
 
 
 class Decision(BaseModel):
@@ -137,7 +167,7 @@ class Decision(BaseModel):
         name = value.strip().lower().lstrip(".")
         name = _FORMAT_ALIASES.get(name, name)
         # An unknown or empty format is "unspecified", not an invalid decision.
-        return name if name in ("docx", "xlsx", "pptx", "pdf", "csv", "md") else None
+        return name if name in _FORMATS else None
 
     @property
     def work(self) -> bool:
@@ -189,12 +219,12 @@ kind is one of:
 - "research": the reply needs current or external facts from the web: news, prices, weather, schedules, opening hours, recent events, a specific product, company, place or web page.
 - "drawing": something visual to LOOK at: drawing, illustration, picture, image, photo, logo, icon, poster, cartoon, diagram, schema, flowchart.
 - "app": something interactive to USE in the browser: game, quiz, flashcards, tool, calculator, converter, timer, simulator, music or drum toy, interactive chart, small web page.
-- "file": a real file to download: Word, Excel, PowerPoint, PDF, CSV or Markdown file, spreadsheet, slide deck, a CV, a text asked as a document or a file.
+- "file": a real document, data, slides, code or archive to download: Word, Excel, PowerPoint, PDF, CSV or Markdown file, spreadsheet, slide deck, a CV, a text asked as a document or a file.
 - "run": code or tests to execute, data to compute by running a program, or a program to build that is not a single web page (Python script, bot, server, API, scraper). A script or function only to write and show is "answer". A request to run code that appears earlier in the conversation (the user's or yours), as it is or with a value changed, is "run" with follow_up true.
 - "remote": an action on a computer the user owns and reaches over SSH or connected to this assistant (their server, VPS, NAS, laptop, a named machine), including connecting, renaming, forgetting, removing or disconnecting one of those machines. Bookings, payments, phone calls, messages to people and smart-home devices are not "remote": they are "other".
 - "other": none of these.
 
-file_format, only when kind is "file", else null: "docx", "xlsx", "pptx", "pdf", "csv" or "md"; null when no format is named or clearly implied. A spreadsheet, budget or tracking table is "xlsx"; a slide deck "pptx"; a Word document "docx".
+file_format, only when kind is "file" or "drawing", else null: "docx", "xlsx", "pptx", "pdf", "csv", "md", "svg", "png", "jpg", "jpeg", "webp" or "gif"; null when no format is named or clearly implied. A spreadsheet, budget or tracking table is "xlsx"; a slide deck "pptx"; a Word document "docx". A picture asked as an image file, or as a file whose name has an image extension, is "drawing" with that image format. "file" is not for pictures.
 follow_up: true when the last message changes, continues, fixes or reruns something produced earlier in this conversation (the previous app, drawing, file, script or machine task); false for a new request.
 delivered_before, when present, names what the assistant delivered before earlier_turns. A last message that brings what that delivery needs (links, files, data or values to use in it) or asks to change it is its follow-up and keeps its kind.
 needs_research: true only when a drawing or a file needs current facts from the web.
@@ -206,6 +236,7 @@ Rules:
 - The ORDER decides. Proposals, plans, options or variants asked for BEFORE anything is made are "answer"; a deliverable asked for NOW keeps its kind when the message also asks for proposals, options, variants or questions AFTER it ("build it, then suggest two variants", "make the deck, and afterwards tell me what you would improve").
 - A complaint that a delivered app or file does not work, shows nothing, does nothing or crashes is a request to fix it: kind app/file, follow_up true, changes_delivered true. Examples: "it shows nothing", "the button does nothing", "ça ne marche pas", "no funciona", "non funziona", "sie funktioniert nicht".
 - A request for a picture is "drawing" whatever the wording or politeness ("tu peux me dessiner", "j'aimerais une illustration", "draw me", "sketch", "un logo pour").
+- A chart or diagram made from data keeps its own kind and rules; do not turn it into a picture because it is asked as a file.
 - Something to play with or use is "app"; a file, a format or a document to download or print is "file"; a text to read, copy or send yourself (message, email, letter, post, reply) is "answer", whatever its length, unless a file or a format is named.
 - A question about how to do something, why, or what something is, is "answer" (or "research" when it needs current facts), even when it mentions files, code, drawings or servers.
 - When a message asks for an explanation and also for something to see, use or download, choose the kind of that thing.
@@ -216,6 +247,13 @@ Rules:
 
 Examples (last message, then the reply):
 "Tu pourrais me faire un chat qui joue de la guitare ?" {"kind": "drawing", "file_format": null, "follow_up": false, "needs_research": false, "needs_location": false, "origin": null}
+"dessine un renard roux en svg" {"kind": "drawing", "file_format": "svg", "follow_up": false, "needs_research": false, "needs_location": false, "origin": null}
+"zeichne mir ein fahrrad als png-datei" {"kind": "drawing", "file_format": "png", "follow_up": false, "needs_research": false, "needs_location": false, "origin": null}
+"hazme el dibujo de una tetera en un archivo teapot.jpg" {"kind": "drawing", "file_format": "jpg", "follow_up": false, "needs_research": false, "needs_location": false, "origin": null}
+"vorrei un disegno di una volpe in un file fox.webp" {"kind": "drawing", "file_format": "webp", "follow_up": false, "needs_research": false, "needs_location": false, "origin": null}
+"fais moi un dessin de velo dans fichier.png" {"kind": "drawing", "file_format": "png", "follow_up": false, "needs_research": false, "needs_location": false, "origin": null}
+"make a picture of a teapot as a second file called teapot.gif next to the first one" {"kind": "drawing", "file_format": "gif", "follow_up": false, "needs_research": false, "needs_location": false, "origin": null, "changes_delivered": true}
+After an assistant turn that delivered a picture: "the image file does not show the bicycle" {"kind": "drawing", "file_format": null, "follow_up": true, "needs_research": false, "needs_location": false, "origin": null, "changes_delivered": true}
 "zeichne mir ein Haus am See bitte" {"kind": "drawing", "file_format": null, "follow_up": false, "needs_research": false, "needs_location": false, "origin": null}
 "make me a little piano I can play with my keyboard" {"kind": "app", "file_format": null, "follow_up": false, "needs_research": false, "needs_location": false, "origin": null}
 "Hazme una hoja de cálculo para el presupuesto del viaje" {"kind": "file", "file_format": "xlsx", "follow_up": false, "needs_research": false, "needs_location": false, "origin": null}
@@ -255,7 +293,9 @@ _FILE_PATTERN = re.compile(
     r"/deliverables/|https?://\S+\.(docx|xlsx|pptx|pdf|csv|md)\b|\.(docx|xlsx|pptx|pdf|csv)\)",
     re.I,
 )
-_FILE_EXTENSION = re.compile(r"\.(?:docx|xlsx|pptx|pdf|csv|md)\b", re.I)
+_FILE_EXTENSION = re.compile(
+    r"\.(?:docx|xlsx|pptx|pdf|csv|md|svg|png|jpe?g|webp|gif)\b", re.I
+)
 _SPACE = re.compile(r"\s")
 
 
@@ -386,7 +426,7 @@ def parse(text: object) -> Decision:
         else:
             raise ValueError("router_invalid_json") from None
     routed = Decision.model_validate(value)
-    if routed.kind != "file" and routed.file_format is not None:
+    if routed.kind not in ("file", "drawing") and routed.file_format is not None:
         routed = routed.model_copy(update={"file_format": None})
     return routed
 
@@ -735,6 +775,27 @@ def named_formats(text: str) -> tuple[str, ...]:
     return tuple(found)
 
 
+def named_image_format(text: str) -> str | None:
+    """The one image format a request names, by extension or format word."""
+    folded = "".join(
+        character
+        for character in unicodedata.normalize("NFKD", text.casefold())
+        if not unicodedata.combining(character)
+    )
+    found = [
+        name
+        for name in ("svg", "png", "jpg", "jpeg", "webp", "gif")
+        if re.search(r"(?<!\w)" + re.escape(name) + r"(?!\w)", folded)
+    ]
+    if not found:
+        return None
+    if len(found) == 1:
+        return found[0]
+    if set(found) == {"jpg", "jpeg"}:
+        return "jpg"
+    return None
+
+
 def deliver_fallback(text: str) -> Decision | None:
     """The decision of a turn no profile decided: a file when it names a format.
 
@@ -746,6 +807,9 @@ def deliver_fallback(text: str) -> Decision | None:
     found = named_formats(text)
     if not found or work_reason(text) in ("remote", "run"):
         return None
+    image_format = named_image_format(text)
+    if image_format is not None:
+        return Decision.model_validate({"kind": "drawing", "file_format": image_format})
     if creation_deferred(text):
         # The format is named for later, after the person's choice.
         return Decision(kind="answer")
@@ -782,6 +846,15 @@ def _settle(text: str, routed: Decision | None) -> tuple[Decision | None, str]:
         return None, ""
     if routed.kind != "remote" and manages_machine(text):
         return Decision(kind="remote"), "machine"
+    if routed.kind == "file" and not routed.follow_up:
+        image_format = named_image_format(text)
+        if image_format is not None:
+            return (
+                routed.model_copy(
+                    update={"kind": "drawing", "file_format": image_format}
+                ),
+                "image_file",
+            )
     if routed.kind in _REDELIVER and polite_closing(text):
         return Decision(kind="answer"), "closing"
     if (
@@ -1044,7 +1117,14 @@ def svg_drawing(request: ChatRequest, routed: Decision | None) -> bool:
         or is_appearance_request(text, history=request.messages[:-1])
     ):
         return False
-    return not images_enabled() or svg_requested(text)
+    return (
+        not images_enabled()
+        or svg_requested(text)
+        or (
+            routed.file_format in _IMAGE_FORMATS
+            and named_image_format(text) is not None
+        )
+    )
 
 
 def app_route(
