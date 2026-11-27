@@ -22,6 +22,7 @@ finished.
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
 import os
 import re
@@ -619,8 +620,9 @@ def _export_name(request_text: str, title: str, extension: str) -> str:
     match = FILE_NAME.search(request_text)
     if match:
         stem = match.group(1).rsplit(".", 1)[0]
-        requested_extension = match.group(1).rsplit(".", 1)[1].lower()
-        if requested_extension in {"svg", "png", "jpg", "jpeg", "webp", "gif"}:
+        # The extension is always the real format of the bytes: a code drawing
+        # asked as "fox.gif" is saved as "fox.svg", never as an SVG named .gif.
+        if match.group(1).rsplit(".", 1)[1].lower() == extension:
             return match.group(1)
         return f"{stem}.{extension}"
     return f"{_slug(title, 'picture')}.{extension}"
@@ -662,11 +664,43 @@ def export_picture(
         content = _standalone_svg(current.content)
     else:
         extension = "png"
+        requested_file = FILE_NAME.search(str(request.user_text))
+        requested_extension = (
+            requested_file.group(1).rsplit(".", 1)[1].lower()
+            if requested_file is not None
+            else None
+        )
+        if requested_extension in {"jpg", "jpeg", "webp", "gif"}:
+            extension = requested_extension
         image = store.image_bytes(store.current_image_key(picture_set))
         if image is None:
             item.erreurs.append("picture_export_unavailable")
             return None
         content = image
+        if requested_extension in {"jpg", "jpeg", "webp", "gif"}:
+            from PIL import Image
+
+            try:
+                with Image.open(io.BytesIO(image)) as source:
+                    converted = (
+                        source.convert("RGB")
+                        if requested_extension in {"jpg", "jpeg"}
+                        else source
+                    )
+                    buffer = io.BytesIO()
+                    converted.save(
+                        buffer,
+                        format={
+                            "jpg": "JPEG",
+                            "jpeg": "JPEG",
+                            "webp": "WEBP",
+                            "gif": "GIF",
+                        }[requested_extension],
+                    )
+                    content = buffer.getvalue()
+            except Exception:
+                item.erreurs.append("picture_export_unavailable")
+                return None
     requested_file = FILE_NAME.search(str(request.user_text))
     filename = _export_name(
         str(request.user_text), picture_set.title or current.filename, extension
@@ -1032,8 +1066,6 @@ async def process_picture_turn(
             item.erreurs.append("picture_artifact_invalid")
         else:
             filename = _export_name(request_text, title, "svg")
-            if file_requested and (match := FILE_NAME.search(request_text)):
-                filename = match.group(1)
             try:
                 stored = artifact_store.create(
                     owner,

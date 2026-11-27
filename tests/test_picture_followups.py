@@ -514,6 +514,80 @@ class FollowUpTests(Base):
             store.image_bytes(store.current_image_key(picture_set)),
         )
 
+    async def test_a_raster_picture_is_exported_in_the_requested_format(self) -> None:
+        for extension, expected_format in (("jpg", "JPEG"), ("webp", "WEBP")):
+            with self.subTest(extension=extension):
+                from services.orchestrator import image_store
+
+                gateway = DialogueGateway(follow_reply("file"))
+                server = FakeServer()
+                first, _ = await self.start(gateway, server)
+                picture_set = self.picture_set(first)
+                picture_set.title = "Windmill"
+                picture_set.engine = "cpu"
+                picture_set.by_code = False
+                picture_set.image_key = image_store.store(
+                    "data:image/png;base64," + test_picture_cpu.png()
+                ).rsplit("/", 1)[-1]
+                store.update(picture_set)
+                history = [("user", FIRST), ("assistant", first.reponse)]
+                done, item = await self.follow(
+                    gateway, history, f"please give windmill.{extension}"
+                )
+                self.assertTrue(done)
+                self.assertEqual(item.task_type, "drawing")
+                self.assertIn(f"**windmill.{extension}**", item.reponse)
+                self.assertIn("/download", item.reponse)
+                after = self.picture_set(first)
+                self.assertEqual(after.artifact_version, picture_set.artifact_version)
+                from services.orchestrator import artifact_store
+
+                export_id = re.search(r"/artifacts/([^/]+)/versions/", item.reponse)
+                assert export_id is not None
+                exported = artifact_store.read(
+                    export_id.group(1), "owner@example.test", 1
+                )
+                self.assertEqual(exported.filename, f"windmill.{extension}")
+                with Image.open(io.BytesIO(exported.content)) as image:
+                    self.assertEqual(image.format, expected_format)
+
+    async def test_a_routed_drawing_follow_up_exports_the_picture_shown(self) -> None:
+        from services.orchestrator.request_router import Decision
+        from services.orchestrator import image_store
+
+        gateway = DialogueGateway(follow_reply("file"))
+        server = FakeServer()
+        first, _ = await self.start(gateway, server)
+        picture_set = self.picture_set(first)
+        picture_set.title = "Windmill"
+        picture_set.engine = "cpu"
+        picture_set.by_code = False
+        picture_set.image_key = image_store.store(
+            "data:image/png;base64," + test_picture_cpu.png()
+        ).rsplit("/", 1)[-1]
+        store.update(picture_set)
+        history = [("user", FIRST), ("assistant", first.reponse)]
+        done, item = await self.follow(
+            gateway,
+            history,
+            "the image file does not show the windmill; give it as windmill.jpg",
+            routed=Decision(kind="drawing", file_format="jpg", follow_up=True),
+        )
+        self.assertTrue(done)
+        self.assertEqual(item.task_type, "drawing")
+        self.assertIn("**windmill.jpg**", item.reponse)
+        self.assertIn("/download", item.reponse)
+        after = self.picture_set(first)
+        self.assertEqual(after.artifact_version, picture_set.artifact_version)
+        from services.orchestrator import artifact_store
+
+        export_id = re.search(r"/artifacts/([^/]+)/versions/", item.reponse)
+        assert export_id is not None
+        exported = artifact_store.read(export_id.group(1), "owner@example.test", 1)
+        self.assertEqual(exported.filename, "windmill.jpg")
+        with Image.open(io.BytesIO(exported.content)) as image:
+            self.assertEqual(image.format, "JPEG")
+
     async def test_a_router_file_request_is_not_exported_before_reading(self) -> None:
         from services.orchestrator.request_router import Decision
 

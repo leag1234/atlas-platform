@@ -386,6 +386,26 @@ class TurnTests(unittest.IsolatedAsyncioTestCase):
         assert picture_set is not None
         self.assertTrue(picture_set.file_requested)
 
+    async def test_a_code_drawing_asked_as_a_raster_name_keeps_its_real_format(
+        self,
+    ) -> None:
+        for asked in ("teapot.gif", "kite.png", "fern.jpg"):
+            with self.subTest(asked=asked):
+                gateway = FakeGateway("cats")
+                request = Request(f"Draw it as a file called {asked} please.")
+                request.__dict__[DECISION_KEY] = Decision.model_validate(
+                    {
+                        "kind": "drawing",
+                        "file_format": asked.rsplit(".", 1)[1],
+                        "follow_up": False,
+                    }
+                )
+                item = Interaction()
+                await turn.process_picture_turn(request, item, complete=gateway)
+                stem = asked.rsplit(".", 1)[0]
+                self.assertIn(f"**{stem}.svg**", item.reponse)
+                self.assertNotIn(f"**{asked}**", item.reponse)
+
     async def test_an_ordinary_picture_answer_does_not_name_a_file(self) -> None:
         gateway = FakeGateway("banc")
         item = await self.run_turn(gateway)
