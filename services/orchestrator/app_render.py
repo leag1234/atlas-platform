@@ -267,8 +267,12 @@ async def reap_orphans() -> None:
             identifier, _, created = line.partition(" ")
             if not identifier:
                 continue
+            # Docker prints "2026-11-27 10:09:17 +0000 UTC": the zone name
+            # after the offset is not parsed.
             try:
-                created_at = datetime.strptime(created, "%Y-%m-%d %H:%M:%S %z")
+                created_at = datetime.strptime(
+                    " ".join(created.split()[:3]), "%Y-%m-%d %H:%M:%S %z"
+                )
             except ValueError:
                 continue
             age = (datetime.now(timezone.utc) - created_at).total_seconds()

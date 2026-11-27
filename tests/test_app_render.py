@@ -268,11 +268,12 @@ class CheckTests(unittest.IsolatedAsyncioTestCase):
             returncode = 0
 
             async def communicate(self) -> tuple[bytes, bytes]:
+                # Docker's own format: offset then zone name.
                 return (
                     (
-                        f"old {old.strftime('%Y-%m-%d %H:%M:%S %z')}\n"
-                        f"young {young.strftime('%Y-%m-%d %H:%M:%S %z')}\n"
-                        f"plain {plain.strftime('%Y-%m-%d %H:%M:%S %z')}\n"
+                        f"old {old.strftime('%Y-%m-%d %H:%M:%S %z')} UTC\n"
+                        f"young {young.strftime('%Y-%m-%d %H:%M:%S %z')} UTC\n"
+                        f"plain {plain.strftime('%Y-%m-%d %H:%M:%S %z')} UTC\n"
                     ).encode("utf-8"),
                     b"",
                 )
