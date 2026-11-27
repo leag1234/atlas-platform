@@ -319,6 +319,32 @@ class PerUnitCounts(unittest.TestCase):
             set(),
         )
 
+    def test_a_count_without_unit_met_on_every_sheet_is_no_gap(self) -> None:
+        # The extraction split "a section with exactly 4 checkboxes" on each
+        # sheet into "exactly 4 checkboxes" with no unit (staging -214): the
+        # 12 boxes of the whole file must not be reported as a gap.
+        def sheets(counts: tuple[int, ...]) -> object:
+            sections = [
+                {
+                    "heading": heading,
+                    "bullets": [f"[ ] Task {n}" for n in range(count)],
+                    "page_break": True,
+                }
+                for heading, count in zip(("Lantern", "Kettle", "Ferry"), counts)
+            ]
+            content = Content.model_validate({"title": "Sheets", "sections": sections})
+            return built(content, ".pdf")[1]
+
+        unit_less = requirement(
+            "R1",
+            {"method": "code", "part": "layout", "rule": "items", "count": 4},
+        )
+        self.assertTrue(expectations.layout_result(unit_less, sheets((4, 4, 4))).passed)
+        # One sheet short: still a real gap.
+        self.assertIs(
+            expectations.layout_result(unit_less, sheets((4, 3, 4))).passed, False
+        )
+
     def test_a_short_page_names_its_own_count(self) -> None:
         content = Content.model_validate(
             {

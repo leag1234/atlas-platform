@@ -51,7 +51,7 @@ import time
 import unicodedata
 from collections.abc import Awaitable, Callable, Sequence
 from contextlib import closing
-from dataclasses import asdict, dataclass, field
+from dataclasses import replace, asdict, dataclass, field
 from decimal import ROUND_FLOOR, Decimal
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -663,9 +663,28 @@ def layout_result(item: Requirement, view: Any) -> Result:
         # measure, so it claims neither a pass nor a violation.
         return Result(item.id, None, "no text could be read from the built file")
     verdict = checks.check(layout_constraint(item), view)
+    if verdict.passed is False and _met_on_every_unit(item, view):
+        # A count with no unit, in a file made of pages or slides that each
+        # meet it exactly: the extraction lost "per sheet" ("4 checkboxes" on
+        # each of 3 sheets read as 4 in the whole file, staging -214). Never
+        # state a gap that a per-unit reading of the request satisfies.
+        return Result(item.id, True, "met on every page or slide")
     if verdict.passed is False:
         return Result(item.id, False, "measured on the built file: " + verdict.evidence)
     return Result(item.id, verdict.passed, "")
+
+
+def _met_on_every_unit(item: Requirement, view: Any) -> bool:
+    """A unit-less count that every page or slide of the file meets."""
+    from services.orchestrator.constraints import checks
+
+    check = item.check
+    if check.get("where") or check.get("rule") not in {"items", "paragraphs"}:
+        return False
+    if check.get("count") is None or int(getattr(view, "pages", 0) or 0) < 2:
+        return False
+    per_unit = replace(item, check={**check, "where": "each"})
+    return checks.check(layout_constraint(per_unit), view).passed is True
 
 
 def _asks_bullets(ledger: Ledger) -> bool:
