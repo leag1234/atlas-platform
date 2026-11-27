@@ -128,6 +128,37 @@ class CodeContextTests(unittest.TestCase):
         self.assertIn("boxes.py", hint)
         self.assertNotIn("boxes = [4, 9, 2]", hint)
 
+    def test_only_a_recent_code_file_of_yours_is_named(self) -> None:
+        from services.orchestrator.code_context import code_hint
+
+        # A file the person names, or a non-code file of yours, is not the code.
+        person = [
+            ("user", "Mon fichier notes.txt et rapport.docx sont prêts."),
+            ("assistant", "Voici rapport.docx et l'image sur atlas.eu.com."),
+        ]
+        self.assertNotIn("notes.txt", code_hint(person, "relance-le"))
+        self.assertNotIn("rapport.docx", code_hint(person, "relance-le"))
+        # New code from the person after a delivered file is what "run it" means.
+        newer = [
+            (
+                "assistant",
+                "J'ai exécuté [Télécharger lanterne.py](/api/x/deliverables/1/download).",
+            ),
+            ("user", "Et celui-ci ?\n```python\nprint(3 * 7)\n```"),
+        ]
+        hint = code_hint(newer, "lance-le")
+        self.assertNotIn("lanterne.py", hint)
+        self.assertIn("print(3 * 7)", hint)
+        # Your own delivered code file, after the person's code, is named.
+        older = [
+            *newer,
+            (
+                "assistant",
+                "Fait : [Herunterladen rechner.js](/api/x/deliverables/2/download).",
+            ),
+        ]
+        self.assertIn("rechner.js", code_hint(older, "nochmal ausführen"))
+
     def test_a_fenced_hint_is_unchanged(self) -> None:
         hint = code_hint([("user", FENCED)], "Run it again.")
         self.assertIn("x = 3\nprint(x * 2)", hint)

@@ -37,7 +37,10 @@ _CODE_IN_SENTENCE = re.compile(
 
 _LIST = re.compile(r"^\s*(?:[-*+•>]|\d+[.)])\s")
 _PUNCTUATION = re.compile(r"[=()\[\]{}:;]")
-_FILE_NAME = re.compile(r"\b[A-Za-z0-9_][A-Za-z0-9_.-]*\.[A-Za-z0-9]{1,8}\b")
+# A code file an answer delivered: a name with a programming-language suffix.
+_CODE_FILE = re.compile(
+    r"(?<![\w./-])([A-Za-z0-9_][\w-]*+\.(?:py|js|mjs|ts|sh|bash|rb|go|rs|java|kt|c|cpp|cs|php|r|R|sql|pl|lua|swift))\b"
+)
 
 
 def _bare_block(text: str) -> str:
@@ -91,11 +94,18 @@ def last_code(messages: Sequence[tuple[str, str]]) -> tuple[str, str, int] | Non
 
 
 def _delivered_code_file(messages: Sequence[tuple[str, str]]) -> str:
-    """The code file named in the latest assistant answer that delivered one."""
-    for _, text in reversed(messages):
-        if _assistant_code_of(text):
+    """The code file an answer of yours delivered after the person's latest code.
+
+    Only your own answers count, only names with a programming-language suffix,
+    and only answers more recent than any code the person wrote since: new code
+    from the person is what a later "run it" means.
+    """
+    for role, text in reversed(messages):
+        if role == "user":
+            if code_of(text):
+                return ""
             continue
-        names = _FILE_NAME.findall(text)
+        names = _CODE_FILE.findall(re.sub(r"\]\([^)]*\)", "]", text))
         if names:
             return str(names[-1])
     return ""
