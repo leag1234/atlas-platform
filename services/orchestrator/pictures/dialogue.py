@@ -624,6 +624,10 @@ async def follow_up(
         )
         item.task_type = "drawing"
         item.cout_eur = float(spend.total)
+        # Every answered branch ends the turn as done: without it the stream
+        # took the turn for an unfinished one and dropped the answer (staging
+        # -209, an export answered empty in one second).
+        item.state = "done"
         if answer is None:
             language = answer_language(picture_set.language, request.lang)
             item.reponse = text(
