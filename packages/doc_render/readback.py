@@ -337,6 +337,8 @@ def _themed(shapes: list[Any], section: Section, result: Readback) -> None:
             result.title = result.title or text
         elif role == "title":
             section.heading = text
+        elif role == "subheading":
+            section.add("paragraph", text)
         elif role == "metric-value":
             values.append(text)
         elif role == "metric-label":

@@ -55,6 +55,15 @@ class RequestedTests(unittest.TestCase):
                 (part,) = slide_parts.requested([request])
                 self.assertEqual(part.role, role)
 
+    def test_a_quoted_label_is_kept_as_a_requested_text(self) -> None:
+        request = (
+            "Five slides, each slide with exactly three bullets and a "
+            "subheading “Field note” followed by one sentence."
+        )
+        (part,) = slide_parts.requested([request])
+        self.assertEqual(part.text, "Field note")
+        self.assertEqual(part.role, "text")
+
 
 class PlacedTests(unittest.TestCase):
     def test_text_held_only_by_notes_goes_on_the_slide(self) -> None:
@@ -114,6 +123,71 @@ class PlacedTests(unittest.TestCase):
         parts = slide_parts.requested([REQUEST])
         content = deck([dict(heading="Autumn", paragraphs=["Feed the colony."])])
         self.assertEqual(slide_parts.placed(content, parts).sections, content.sections)
+
+    def test_a_quoted_labelled_bullet_becomes_a_subpart(self) -> None:
+        request = (
+            "Five slides, each slide with exactly three bullets and a "
+            "subheading “Field note” followed by one sentence."
+        )
+        parts = slide_parts.requested([request])
+        sections: list[dict[str, object]] = [
+            dict(
+                heading=f"Walk {number}",
+                bullets=[
+                    "Pack the lanterns",
+                    "Count the candles",
+                    "Leave the matches",
+                    f"Field note: the river group walks at dusk ({number}).",
+                ],
+            )
+            for number in range(1, 6)
+        ]
+        content = deck(sections)
+        repaired = slide_parts.placed(content, parts)
+        self.assertEqual(len(repaired.sections), 10)
+        for slide, subpart in zip(repaired.sections[::2], repaired.sections[1::2]):
+            self.assertEqual(len(slide.bullets), 3)
+            self.assertEqual(subpart.heading, "Field note")
+            self.assertTrue(subpart.paragraphs[0].startswith("The river group"))
+            self.assertTrue(subpart.continued)
+            self.assertEqual(subpart.level, 2)
+        shown, _ = slides_text(repaired)
+        self.assertEqual(len(shown), 5)
+        for text in shown:
+            self.assertIn("Field note", text)
+            self.assertIn("The river group walks", text)
+
+    def test_a_label_mentioned_in_the_middle_stays_a_bullet(self) -> None:
+        parts = slide_parts.requested(
+            ["Each slide has a subheading “Field note” and one sentence."]
+        )
+        content = deck(
+            [
+                dict(
+                    heading="Morning",
+                    bullets=[
+                        "Pack",
+                        "Count",
+                        "The field note says that the river group walks at dusk.",
+                    ],
+                )
+            ]
+        )
+        repaired = slide_parts.placed(content, parts)
+        self.assertEqual(repaired.sections, content.sections)
+
+    def test_an_unquoted_label_is_left_untouched(self) -> None:
+        parts = slide_parts.requested(["Each slide has a subheading and one sentence."])
+        content = deck(
+            [
+                dict(
+                    heading="Morning",
+                    bullets=["Pack", "Count", "Field note: the river group walks."],
+                )
+            ]
+        )
+        repaired = slide_parts.placed(content, parts)
+        self.assertEqual(repaired.sections, content.sections)
 
 
 class MissingTests(unittest.TestCase):

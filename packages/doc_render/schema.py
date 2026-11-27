@@ -242,6 +242,9 @@ class Section(ContentModel):
     # The text goes on under the heading of the section before it, which is
     # not written again: a paragraph after a list stays after it.
     continued: bool = Field(default=False, strict=True)
+    # A deck draws this heading on the slide of the section before it, under
+    # its bullets: a named part is not one of them.
+    subheading: Text | None = None
 
     def has_body(self) -> bool:
         return bool(
@@ -266,7 +269,7 @@ class Section(ContentModel):
 
     def drawn(self) -> bool:
         """Whether the heading is written (a continuation does not repeat it)."""
-        return not self.continued
+        return not self.continued or self.subheading is not None
 
 
 class Content(ContentModel):
@@ -319,7 +322,13 @@ class Content(ContentModel):
         result = [shown(self.title)]
         for section in self.sections:
             heading = (section.heading,) if section.drawn() else ()
-            result.extend(map(shown, (*heading, *section.paragraphs, *section.bullets)))
+            subheading = (section.subheading,) if section.subheading else ()
+            result.extend(
+                map(
+                    shown,
+                    (*heading, *subheading, *section.paragraphs, *section.bullets),
+                )
+            )
             result.extend(map(shown, slide_texts(section)))
             for table in section.tables:
                 for row in table.read():

@@ -35,6 +35,8 @@ TITLE_WORD = re.compile(
     re.I,
 )
 MIN_TEXT_WORDS = 3
+MIN_LABEL_WORDS = 1
+LABEL_SEPARATORS = (":", "–", "—", "-")
 
 
 @dataclass(frozen=True)
@@ -56,7 +58,7 @@ def requested(requests: list[str]) -> list[Part]:
             # Only what precedes the quote in its own sentence names its role.
             before = re.split(r"[.!?\n]", before)[-1]
             role = "title" if TITLE_WORD.search(before) else "text"
-            if words < (1 if role == "title" else MIN_TEXT_WORDS):
+            if words < (MIN_LABEL_WORDS if role == "text" else 1):
                 continue
             if all(part.text != text for part in found):
                 found.append(Part(text, role))
@@ -91,8 +93,13 @@ def placed(content: Any, parts: list[Part]) -> Any:
         return content
     data = content.model_dump(mode="json")
     sections: list[dict[str, Any]] = data["sections"]
+    _labelled_bullets(sections, parts)
     for part in parts:
         folded = _fold(part.text)
+        # A short quoted label only names a sub-part (_labelled_bullets); only
+        # a text of a few words is inserted when it is missing.
+        if part.role == "text" and len(part.text.split()) < MIN_TEXT_WORDS:
+            continue
         if not folded:
             continue
         if part.role == "title":
@@ -111,7 +118,8 @@ def placed(content: Any, parts: list[Part]) -> Any:
                 section["paragraphs"] = [part.text, *section["paragraphs"]]
             elif section["bullets"]:
                 # A sentence beside a list goes under it (a continued section,
-                # which the deck draws on the same slide).
+                # which the deck draws on the same slide). A named part keeps
+                # its own subheading instead of becoming another list item.
                 at = sections.index(section) + 1
                 sections.insert(
                     at,
@@ -120,6 +128,7 @@ def placed(content: Any, parts: list[Part]) -> Any:
                         heading=section["heading"],
                         paragraphs=[part.text],
                         continued=True,
+                        level=section["level"],
                     ),
                 )
             else:
@@ -128,6 +137,47 @@ def placed(content: Any, parts: list[Part]) -> Any:
     from packages.doc_render.schema import Content
 
     return Content.model_validate(data)
+
+
+def _labelled_bullets(sections: list[dict[str, Any]], parts: list[Part]) -> None:
+    """A quoted label at the start of a bullet names a sub-part, not a point."""
+    labels = [part.text for part in parts if part.role == "text"]
+    if not labels:
+        return
+    for section in reversed(sections):
+        bullets = section.get("bullets", [])
+        for index in reversed(range(len(bullets))):
+            label, separator, text = _split_label(bullets[index])
+            if separator is None:
+                continue
+            named = next((text for text in labels if _fold(text) == _fold(label)), None)
+            if named is None:
+                continue
+            sentence = text.strip()
+            if not sentence:
+                continue
+            # Its own sentence now, no longer the end of a list item.
+            sentence = sentence[0].upper() + sentence[1:]
+            del bullets[index]
+            sections.insert(
+                sections.index(section) + 1,
+                dict(
+                    _empty(section),
+                    heading=named,
+                    paragraphs=[sentence],
+                    continued=True,
+                    level=2,
+                    subheading=named,
+                ),
+            )
+
+
+def _split_label(bullet: str) -> tuple[str, str | None, str]:
+    for separator in LABEL_SEPARATORS:
+        label, found, text = bullet.partition(separator)
+        if found:
+            return label, found, text
+    return bullet, None, ""
 
 
 def _empty(section: dict[str, Any]) -> dict[str, Any]:

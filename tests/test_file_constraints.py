@@ -50,6 +50,32 @@ def deck(bulleted: bool, notes: bool) -> Content:
     return Content.model_validate({"title": "Lantern walk", "sections": sections})
 
 
+def subpart_deck(missing: bool = False) -> Content:
+    sections = []
+    for index, heading in enumerate(("Before", "During", "After")):
+        sections.append(
+            {
+                "heading": heading,
+                "bullets": POINTS,
+                "bulleted": True,
+                "paragraphs": [],
+            }
+        )
+        if not (missing and index == 1):
+            sections.append(
+                {
+                    "heading": "Field note",
+                    "paragraphs": [
+                        f"Field note: the river group walks at {heading.lower()}."
+                    ],
+                    "continued": True,
+                    "level": 2,
+                    "subheading": "Field note",
+                }
+            )
+    return Content.model_validate({"title": "Lantern walk", "sections": sections})
+
+
 def built(content: Content, suffix: str) -> tuple[bytes, Any]:
     with tempfile.TemporaryDirectory() as directory:
         path = Path(directory) / ("file" + suffix)
@@ -527,6 +553,47 @@ class PerUnitCounts(unittest.TestCase):
             },
         )
         self.assertTrue(expectations.layout_result(bullets, deck_view).passed)
+
+    def test_a_named_subpart_is_not_counted_as_a_bullet(self) -> None:
+        _, view = built(subpart_deck(), ".pptx")
+        three = requirement(
+            "R1",
+            {
+                "method": "code",
+                "part": "layout",
+                "rule": "items",
+                "count": 3,
+                "where": "each",
+            },
+        )
+        subheading = requirement(
+            "R2",
+            {
+                "method": "code",
+                "part": "layout",
+                "rule": "contains",
+                "texts": ["Field note"],
+                "where": "each",
+            },
+        )
+        self.assertTrue(expectations.layout_result(three, view).passed)
+        self.assertTrue(expectations.layout_result(subheading, view).passed)
+
+    def test_a_missing_named_subpart_names_its_slide(self) -> None:
+        _, view = built(subpart_deck(missing=True), ".pptx")
+        subheading = requirement(
+            "R1",
+            {
+                "method": "code",
+                "part": "layout",
+                "rule": "contains",
+                "texts": ["Field note"],
+                "where": "each",
+            },
+        )
+        result = expectations.layout_result(subheading, view)
+        self.assertIs(result.passed, False)
+        self.assertIn("page 2", result.how)
 
 
 class InTheLedger(unittest.TestCase):

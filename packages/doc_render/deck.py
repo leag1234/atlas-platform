@@ -707,7 +707,13 @@ def short(texts: tuple[str, ...], most: int, length: int) -> bool:
 
 
 def bare(section: Section) -> bool:
-    return not (section.tables or section.images or section.metrics or section.chart)
+    return not (
+        section.tables
+        or section.images
+        or section.metrics
+        or section.chart
+        or (section.level > 1 and section.continued and section.subheading is None)
+    )
 
 
 # A year, a quarter or half (Q1, T2, H1, S2), a day and month (12/03,
@@ -777,6 +783,8 @@ def quoted(section: Section) -> bool:
 
 
 def kind(section: Section, index: int, count: int) -> str:
+    if section.level > 1 and section.continued and section.subheading is None:
+        return "content"
     if section.bulleted and section.bullets:
         # Bullet points were asked for: a list with its bullets.
         return "content"
@@ -970,9 +978,15 @@ def content_slide(
     number: int,
     part: dict[str, Any],
 ) -> None:
+    subheading = section.subheading
     chrome(slide, theme, section.heading, deck, number)
     area = Rect(SIDE, BODY_TOP, W - 2 * SIDE, BODY_BOTTOM - BODY_TOP)
     items: list[tuple[str, bool]] = part["items"]
+    if subheading and all(text != subheading for text, _ in items):
+        # The named part reads under the bullets, its label right above its
+        # sentence: a line of its own, never one of the bullets.
+        at = next((i for i, (_, bullet) in enumerate(items) if not bullet), len(items))
+        items = [*items[:at], (subheading, False), *items[at:]]
     if callouts(section) and part["metrics"]:
         alone = not (items or part.get("visual"))
         height = 170.0 if alone else 150.0
@@ -1110,12 +1124,15 @@ def merged(sections: tuple[Section, ...]) -> list[tuple[Section, int]]:
             and not section.bullets
             and result[-1][0].bullets
             and bare(result[-1][0])
+            and result[-1][0].level == 1
+            and (section.level == 1 or section.subheading is not None)
         ):
             before, trailing = result[-1]
             joined = before.model_copy(
                 update=dict(
                     paragraphs=(*before.paragraphs, *section.paragraphs),
                     notes=(*before.notes, *section.notes),
+                    subheading=section.subheading,
                 )
             )
             count = trailing + len(section.paragraphs)
