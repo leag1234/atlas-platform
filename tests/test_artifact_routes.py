@@ -325,6 +325,38 @@ for (const name of ['localStorage', 'sessionStorage']) {
         self.assertEqual(response.headers["content-type"], "image/png")
         self.assertEqual(response.content, b"\x89PNG\r\n\x1a\nlantern")
 
+    def test_a_jpeg_picture_named_png_downloads_as_a_real_png(self) -> None:
+        import base64
+        import io
+
+        from PIL import Image
+
+        buffer = io.BytesIO()
+        Image.new("RGB", (6, 4), (200, 120, 40)).save(buffer, format="JPEG")
+        raster = base64.b64encode(buffer.getvalue()).decode("ascii")
+        artifact = artifact_store.create(
+            "owner@example.test",
+            "Harbour",
+            "harbour.png",
+            (
+                '<!DOCTYPE html><html><head><meta charset="utf-8">'
+                '<meta name="atlas-kind" content="drawing"><title>Harbour</title>'
+                '</head><body><svg viewBox="0 0 6 4"><image href="data:image/jpeg;base64,'
+                + raster
+                + '" width="6" height="4"/></svg></body></html>'
+            ).encode("utf-8"),
+            "request-jpeg",
+        )
+        response = self.client.get(
+            f"/api/atlas/artifacts/{artifact['id']}/versions/1/download",
+            headers=self.owner(),
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["content-type"], "image/png")
+        with Image.open(io.BytesIO(response.content)) as image:
+            self.assertEqual(image.format, "PNG")
+            self.assertEqual(image.size, (6, 4))
+
     def test_isolation_headers_are_set_exactly_once(self) -> None:
         open_response = self.client.get(
             f"/api/atlas/artifacts/{self.artifact_id}/versions/1/open",

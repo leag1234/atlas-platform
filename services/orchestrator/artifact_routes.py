@@ -165,13 +165,31 @@ _EMBEDDED_RASTER = re.compile(
 _RASTER_SUFFIX = {".png": "png", ".jpg": "jpeg", ".jpeg": "jpeg", ".webp": "webp"}
 
 
+def _converted(raster: bytes, wanted: str) -> bytes:
+    import io
+
+    from PIL import Image
+
+    with Image.open(io.BytesIO(raster)) as source:
+        image = source.convert("RGB") if wanted == "jpeg" else source.copy()
+    buffer = io.BytesIO()
+    image.save(buffer, format=wanted.upper())
+    return buffer.getvalue()
+
+
 def _download_content(content: bytes, filename: str) -> bytes:
     suffix = os.path.splitext(filename.lower())[1]
     if suffix in _RASTER_SUFFIX and is_drawing(content.decode("utf-8", "replace")):
         # The file is the raster picture itself, never the HTML page around it.
         found = _EMBEDDED_RASTER.findall(drawing_source(content.decode("utf-8")))
-        if len(found) == 1 and found[0][0].lower() == _RASTER_SUFFIX[suffix]:
-            return base64.b64decode(re.sub(r"\s", "", found[0][1]))
+        if len(found) == 1:
+            raster = base64.b64decode(re.sub(r"\s", "", found[0][1]))
+            wanted = _RASTER_SUFFIX[suffix]
+            if found[0][0].lower() == wanted:
+                return raster
+            # The picture is stored in another raster format (a JPEG inside a
+            # file named .png, staging -211): convert it, never serve the page.
+            return _converted(raster, wanted)
         return content
     if filename.lower().endswith(".svg") and is_drawing(
         content.decode("utf-8", "replace")
