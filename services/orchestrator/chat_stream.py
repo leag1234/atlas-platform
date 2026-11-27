@@ -1074,6 +1074,27 @@ def response(
             except ProjectError as exc:
                 from services.orchestrator.project_transcript import failure_location
 
+                if (
+                    payload.project_action == "work"
+                    and (exc.status == 404 or exc.body["error"] == "not_found")
+                    and not item.work_failure
+                ):
+                    from services.orchestrator.code_mode import (
+                        mark_project_gone,
+                        work_failure_reply,
+                    )
+
+                    mark_project_gone(item)
+                    item.reponse = work_failure_reply(item, language) or ""
+                    await queue.put(
+                        {
+                            "delta": {"content": item.reponse},
+                            "atlas": {"turn": turn, "phase": "work_failed"},
+                        }
+                    )
+                    await queue.put({"finish": True})
+                    await queue.put(None)
+                    return
                 logging.getLogger(__name__).warning(
                     "project_stream_failed code=%s status=%s at=%s",
                     exc.body["error"],

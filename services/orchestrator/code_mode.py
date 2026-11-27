@@ -208,6 +208,7 @@ WORK_FAILURE = {
         "other": "the work stopped before finishing",
         "provider": "the AI model service returned an error{detail}; the request is fine and can be sent again as it is for another try",
         "limit": "a usage limit of the AI model service was reached{detail}; this is a limit, not an outage, and the work can be tried again later",
+        "project_gone": "the project or conversation this work was in was removed during the turn; nothing was delivered, and sending the request again starts it over",
     },
     "fr": {
         "template": "Le travail n'a pas abouti : {reason}.",
@@ -223,6 +224,7 @@ WORK_FAILURE = {
         "other": "le travail s'est arrêté avant la fin",
         "provider": "le service de modèles d'IA a renvoyé une erreur{detail} ; la demande n'est pas en cause et peut être renvoyée telle quelle pour un nouvel essai",
         "limit": "une limite d'utilisation du service de modèles d'IA a été atteinte{detail} ; c'est une limite, pas une panne, et le travail pourra être relancé plus tard",
+        "project_gone": "le projet ou la conversation dans lequel ce travail se trouvait a été supprimé pendant le tour ; rien n'a été livré, et renvoyer la demande la relance",
     },
     "de": {
         "template": "Die Arbeit wurde nicht abgeschlossen: {reason}.",
@@ -238,6 +240,7 @@ WORK_FAILURE = {
         "other": "die Arbeit wurde vor dem Abschluss beendet",
         "provider": "der KI-Modelldienst hat einen Fehler zurückgegeben{detail}; an der Anfrage liegt es nicht, sie kann unverändert erneut gesendet werden",
         "limit": "ein Nutzungslimit des KI-Modelldienstes wurde erreicht{detail}; das ist ein Limit, keine Störung, und die Arbeit kann später erneut versucht werden",
+        "project_gone": "das Projekt oder die Unterhaltung, in dem diese Arbeit lief, wurde während des Durchgangs entfernt; nichts wurde geliefert, und erneutes Senden startet sie neu",
     },
     "es": {
         "template": "El trabajo no se completó: {reason}.",
@@ -253,6 +256,7 @@ WORK_FAILURE = {
         "other": "el trabajo se detuvo antes de terminar",
         "provider": "el servicio de modelos de IA devolvió un error{detail}; la solicitud no es la causa y se puede enviar de nuevo tal cual para otro intento",
         "limit": "se alcanzó un límite de uso del servicio de modelos de IA{detail}; es un límite, no una avería, y el trabajo se puede intentar de nuevo más tarde",
+        "project_gone": "el proyecto o la conversación en la que estaba este trabajo se eliminó durante el turno; no se entregó nada, y reenviar la solicitud la inicia de nuevo",
     },
     "it": {
         "template": "Il lavoro non è stato completato: {reason}.",
@@ -268,8 +272,19 @@ WORK_FAILURE = {
         "other": "il lavoro si è interrotto prima della fine",
         "provider": "il servizio dei modelli di IA ha restituito un errore{detail}; la richiesta non è la causa e può essere inviata di nuovo così com'è per un altro tentativo",
         "limit": "è stato raggiunto un limite di utilizzo del servizio dei modelli di IA{detail}; è un limite, non un guasto, e il lavoro potrà essere ritentato più tardi",
+        "project_gone": "il progetto o la conversazione in cui si trovava questo lavoro è stato rimosso durante il turno; non è stato consegnato nulla e inviare di nuovo la richiesta la riavvia",
     },
 }
+
+PROJECT_GONE = "project_gone"
+
+
+def mark_project_gone(item: Interaction) -> None:
+    item.state = "failed"
+    item.work_failure = dict(category=PROJECT_GONE, answer="", question="")
+    item.erreurs.append(PROJECT_GONE)
+
+
 # A Work turn the model service stopped is said as such, with what failed
 # (D5: a usage limit is a limit, never an outage). On staging -187 a stopped
 # run fell back to the chat alone, which answered that it had no tools to
@@ -971,13 +986,19 @@ async def process_work(
 
     dispatch = work_dispatch.get()
     broker = ExecutionBroker(subject, str(UUID(org_id)), str(UUID(project_id)))
-    status, session = await broker.public(
-        "GET", "work-sessions/" + str(UUID(session_id))
-    )
-    if status != 200:
-        raise ProjectError(status, str(session.get("error", "not_found")))
-    if session["conversation_id"] != request.conversation_id:
-        raise ProjectError(404, "not_found")
+    try:
+        status, session = await broker.public(
+            "GET", "work-sessions/" + str(UUID(session_id))
+        )
+        if status != 200:
+            raise ProjectError(status, str(session.get("error", "not_found")))
+        if session["conversation_id"] != request.conversation_id:
+            raise ProjectError(404, "not_found")
+    except ProjectError as exc:
+        if exc.status == 404 or exc.body["error"] == "not_found":
+            mark_project_gone(item)
+            return
+        raise
     limits = settings()
     run_id = str(UUID(turn_request_id or item.request_id.removeprefix("chatcmpl-")))
     acquired = await broker.call(
@@ -1647,6 +1668,10 @@ async def process_work(
     except asyncio.CancelledError:
         terminal = "cancelled"
         raise
+    except ProjectError as exc:
+        if exc.status == 404 or exc.body["error"] == "not_found":
+            mark_project_gone(item)
+        raise
     finally:
         item.verification = tools.verification.status().model_dump()
         renewal.cancel()
@@ -1667,6 +1692,8 @@ async def process_work(
                 except ProjectError as recovery_error:
                     if recovery_error.status not in {403, 404, 409}:
                         raise
+                    if recovery_error.status == 404:
+                        mark_project_gone(item)
                     import logging
 
                     logging.getLogger(__name__).warning(
