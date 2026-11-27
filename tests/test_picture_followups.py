@@ -481,7 +481,9 @@ class FollowUpTests(Base):
             prompt,
         )
 
-    async def test_a_raster_picture_with_svg_asked_is_exported_as_png(self) -> None:
+    async def test_a_raster_picture_with_svg_asked_is_redrawn_as_a_vector(self) -> None:
+        # A vector file was asked: the raster picture is not exported as PNG
+        # but drawn again by code, and the answer says the drawing was redone.
         gateway = DialogueGateway(follow_reply("file"))
         server = FakeServer()
         first, _ = await self.start(gateway, server)
@@ -495,24 +497,11 @@ class FollowUpTests(Base):
         self.assertTrue(done)
         self.assertRegex(
             item.reponse.lower(),
-            r"raster image|image matricielle|mapa de bits",
+            r"redrawn as a vector|redessinée en vectoriel|vektorgrafik|vectorial|vettoriale",
         )
-        self.assertIn("**windmill.png**", item.reponse)
-        self.assertIn("/download", item.reponse)
+        self.assertNotIn(".png", item.reponse)
         after = self.picture_set(first)
         self.assertEqual(after.artifact_version, picture_set.artifact_version)
-        from services.orchestrator import artifact_store
-
-        export_id = re.search(r"/artifacts/([^/]+)/versions/", item.reponse)
-        assert export_id is not None
-        self.assertNotEqual(export_id.group(1), picture_set.artifact_id)
-
-        exported = artifact_store.read(export_id.group(1), "owner@example.test", 1)
-        self.assertEqual(exported.filename, "windmill.png")
-        self.assertEqual(
-            exported.content,
-            store.image_bytes(store.current_image_key(picture_set)),
-        )
 
     async def test_a_raster_picture_is_exported_in_the_requested_format(self) -> None:
         for extension, expected_format in (("jpg", "JPEG"), ("webp", "WEBP")):

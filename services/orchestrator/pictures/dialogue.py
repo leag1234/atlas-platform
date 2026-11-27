@@ -614,13 +614,67 @@ async def follow_up(
         item.latence_ms["picture_review"] = (time.monotonic() - started) * 1000
         return True
     if understood.kind == "file":
-        from services.orchestrator.pictures.turn import export_picture
+        from services.orchestrator.pictures.turn import (
+            export_picture,
+            picture_extension,
+        )
 
+        requested_svg = bool(re.search(r"(?i)\bsvg\b", str(request.user_text)))
+        if requested_svg and picture_extension(picture_set) == "png":
+            # The current picture is raster and the person asks for SVG:
+            # redraw it by code from its description instead of delivering
+            # a PNG (the request is not met by a raster file).
+            language = answer_language(picture_set.language, request.lang)
+            from services.orchestrator.pictures.turn import process_picture_turn
+            from services.orchestrator.request_router import (
+                DECISION_KEY,
+                Decision,
+            )
+
+            from services.orchestrator.chat_schema import ChatMessage
+
+            # The same request (owner, conversation, limits), its last message
+            # replaced by the picture's own description: a real request, not a
+            # stand-in that misses the fields the picture turn reads.
+            description = picture_set.request or request.user_text
+            if hasattr(request, "model_copy"):
+                redraw = request.model_copy(
+                    update={
+                        "messages": [
+                            *request.messages[:-1],
+                            ChatMessage(role="user", content=description),
+                        ]
+                    }
+                )
+            else:
+                import copy
+
+                redraw = copy.copy(request)
+                redraw.user_text = description
+            redraw.__dict__.update(
+                {k: v for k, v in request.__dict__.items() if k not in redraw.__dict__}
+            )
+            from services.orchestrator.pictures.turn import WANTS_SVG_KEY
+
+            redraw.__dict__[WANTS_SVG_KEY] = True
+            redraw.__dict__[DECISION_KEY] = Decision(
+                kind="drawing", file_format="svg", follow_up=False
+            )
+            await process_picture_turn(
+                redraw,
+                item,
+                cost_limit=cost_limit,
+                wall_clock_limit=wall_clock_limit,
+                complete=complete,
+            )
+            item.task_type = "drawing"
+            item.reponse = text(language, "svg_redrawn") + "\n\n" + item.reponse
+            return True
         answer = export_picture(
             request,
             item,
             picture_set,
-            requested_svg=bool(re.search(r"(?i)\bsvg\b", str(request.user_text))),
+            requested_svg=requested_svg,
         )
         item.task_type = "drawing"
         item.cout_eur = float(spend.total)
