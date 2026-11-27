@@ -70,6 +70,7 @@ def subpart_deck(missing: bool = False) -> Content:
                     ],
                     "continued": True,
                     "level": 2,
+                    "subheading": "Field note",
                 }
             )
     return Content.model_validate({"title": "Lantern walk", "sections": sections})

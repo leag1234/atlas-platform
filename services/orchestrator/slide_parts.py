@@ -34,32 +34,15 @@ TITLE_WORD = re.compile(
     r"|rubrique|rubriek)(?![\w-])",
     re.I,
 )
-SUBHEADING_WORD = re.compile(
-    r"(?<![\w-])(?:subheading|sub-heading|subheadings|sub-headings"
-    r"|box|boxed section|case|example|practical case"
-    r"|sous-titre|encadr\w*|cas pratique|exemple"
-    r"|zwischenüberschrift\w*|unterüberschrift\w*|praxisfall\w*"
-    r"|fallbeispiel|beispiel|kasten"
-    r"|subt[ií]tulo|encabezado secundario|caso práctico|caso practico"
-    r"|ejemplo|recuadro"
-    r"|sottotitolo|caso pratico|esempio|riquadro)(?![\w-])",
-    re.I,
-)
-PER_SLIDE_WORD = re.compile(
-    r"(?<![\w-])(?:each slide|every slide|per slide|on each slide"
-    r"|chaque diapositive|par diapositive|sur chaque diapositive"
-    r"|pro folie|auf jeder folie|jede folie|je folie"
-    r"|cada diapositiva|por diapositiva|en cada diapositiva"
-    r"|ogni diapositiva|per diapositiva)(?![\w-])",
-    re.I,
-)
 MIN_TEXT_WORDS = 3
+MIN_LABEL_WORDS = 1
+LABEL_SEPARATORS = (":", "–", "—", "-")
 
 
 @dataclass(frozen=True)
 class Part:
     text: str
-    role: str  # "title", "subheading" or "text"
+    role: str  # "title" or "text"
 
 
 def requested(requests: list[str]) -> list[Part]:
@@ -74,14 +57,8 @@ def requested(requests: list[str]) -> list[Part]:
             before = request[max(0, match.start() - 60) : match.start()]
             # Only what precedes the quote in its own sentence names its role.
             before = re.split(r"[.!?\n]", before)[-1]
-            role = (
-                "title"
-                if TITLE_WORD.search(before)
-                else "subheading"
-                if SUBHEADING_WORD.search(before) and PER_SLIDE_WORD.search(request)
-                else "text"
-            )
-            if words < (1 if role in ("title", "subheading") else MIN_TEXT_WORDS):
+            role = "title" if TITLE_WORD.search(before) else "text"
+            if words < (MIN_LABEL_WORDS if role == "text" else 1):
                 continue
             if all(part.text != text for part in found):
                 found.append(Part(text, role))
@@ -116,6 +93,7 @@ def placed(content: Any, parts: list[Part]) -> Any:
         return content
     data = content.model_dump(mode="json")
     sections: list[dict[str, Any]] = data["sections"]
+    _labelled_bullets(sections, parts)
     for part in parts:
         folded = _fold(part.text)
         if not folded:
@@ -143,14 +121,10 @@ def placed(content: Any, parts: list[Part]) -> Any:
                     at,
                     dict(
                         _empty(section),
-                        heading=(
-                            part.text
-                            if part.role == "subheading"
-                            else section["heading"]
-                        ),
+                        heading=section["heading"],
                         paragraphs=[part.text],
                         continued=True,
-                        level=2 if part.role == "subheading" else section["level"],
+                        level=section["level"],
                     ),
                 )
             else:
@@ -159,6 +133,45 @@ def placed(content: Any, parts: list[Part]) -> Any:
     from packages.doc_render.schema import Content
 
     return Content.model_validate(data)
+
+
+def _labelled_bullets(sections: list[dict[str, Any]], parts: list[Part]) -> None:
+    """A quoted label at the start of a bullet names a sub-part, not a point."""
+    labels = [part.text for part in parts if part.role == "text"]
+    if not labels:
+        return
+    for section in reversed(sections):
+        bullets = section.get("bullets", [])
+        for index in reversed(range(len(bullets))):
+            label, separator, text = _split_label(bullets[index])
+            if separator is None:
+                continue
+            named = next((text for text in labels if _fold(text) == _fold(label)), None)
+            if named is None:
+                continue
+            sentence = text.strip()
+            if not sentence:
+                continue
+            del bullets[index]
+            sections.insert(
+                sections.index(section) + 1,
+                dict(
+                    _empty(section),
+                    heading=named,
+                    paragraphs=[sentence],
+                    continued=True,
+                    level=2,
+                    subheading=named,
+                ),
+            )
+
+
+def _split_label(bullet: str) -> tuple[str, str | None, str]:
+    for separator in LABEL_SEPARATORS:
+        label, found, text = bullet.partition(separator)
+        if found:
+            return label, found, text
+    return bullet, None, ""
 
 
 def _empty(section: dict[str, Any]) -> dict[str, Any]:
