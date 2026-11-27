@@ -13,6 +13,7 @@ from services.orchestrator.chat_schema import ChatRequest
 from services.orchestrator.chat_stream import response
 from services.orchestrator.code_mode import work_failure_category, work_failure_reply
 from services.orchestrator.interactions import Interaction
+from services.retrieval.project_identity import ProjectError
 from services.orchestrator.loop import Limits, Query, Reservation, Turn, run
 from services.orchestrator.model import GatewayError
 from services.orchestrator.project_transcript import process_scoped_project
@@ -22,6 +23,7 @@ PROJECT = "d31e498c-7095-4fd2-9aef-355d6d93f788"
 QUESTIONS = {
     "fr": "Corrige l'analyseur du projet, s'il te plaît.",
     "en": "Please fix the parser of the project.",
+    "de": "Bitte korrigiere den Parser des Projekts.",
 }
 RAW = "old_string not found in /srv/internal/secret_path.py"
 
@@ -427,6 +429,55 @@ class StreamTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn("temporairement indisponible", wire)
                 self.assertNotIn("temporarily unavailable", wire)
                 self.assertNotIn("tests_not_verified", visible(events))
+
+    async def test_vanished_project_streams_localized_explanation(self) -> None:
+        expected = {
+            "fr": (
+                "Le travail n'a pas abouti : le projet ou la conversation dans "
+                "lequel ce travail se trouvait a été supprimé pendant le tour ; "
+                "rien n'a été livré, et renvoyer la demande la relance."
+            ),
+            "en": (
+                "The work did not complete: the project or conversation this work "
+                "was in was removed during the turn; nothing was delivered, and "
+                "sending the request again starts it over."
+            ),
+            "de": (
+                "Die Arbeit wurde nicht abgeschlossen: das Projekt oder die "
+                "Unterhaltung, in dem diese Arbeit lief, wurde während des "
+                "Durchgangs entfernt; nichts wurde geliefert, und erneutes "
+                "Senden startet sie neu."
+            ),
+        }
+        for locale, message in expected.items():
+            with self.subTest(locale=locale):
+
+                async def process(
+                    payload: ChatRequest, item: Interaction, lang: str = locale
+                ) -> None:
+                    raise ProjectError(404, "not_found")
+
+                wire, events = await wire_events(work_request(locale), process)
+                self.assertFalse(any("error" in e for e in events))
+                self.assertEqual(visible(events), message)
+                last = events[-1]
+                assert isinstance(last, dict)
+                choices = last["choices"]
+                assert isinstance(choices, list) and isinstance(choices[0], dict)
+                self.assertEqual(choices[0]["finish_reason"], "stop")
+                self.assertNotIn("temporairement indisponible", wire)
+                self.assertNotIn("temporarily unavailable", wire)
+
+    async def test_ordinary_work_success_is_unchanged(self) -> None:
+        async def process(payload: ChatRequest, item: Interaction) -> None:
+            item.state = "done"
+            item.reponse = "I edited parser.py."
+
+        wire, events = await wire_events(work_request("fr"), process)
+        self.assertFalse(any("error" in e for e in events))
+        self.assertEqual(visible(events), "I edited parser.py.")
+        self.assertEqual(events[-1]["choices"][0]["finish_reason"], "stop")  # type: ignore[index]
+        self.assertNotIn("Le travail n'a pas abouti", wire)
 
     async def test_unexpected_exception_keeps_outage_wording(self) -> None:
         async def broken(payload: ChatRequest, item: Interaction) -> None:
