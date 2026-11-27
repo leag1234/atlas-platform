@@ -36,6 +36,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from harness_rules import check as check_harness_rules
+from harness_rules import lowered as lowered_harness_rules
 
 ROOT = Path(__file__).resolve().parents[1]
 CSS = Path("services/orchestrator/chat-ui.css")
@@ -422,6 +423,15 @@ def check_harness_rules_baseline() -> Result:
     label = "harness rules"
     passed, failures = check_harness_rules()
     if passed:
+        below = lowered_harness_rules()
+        if below:
+            return Result(
+                label,
+                "WARN",
+                "fewer lexical rules than the baseline: lock the lower value with "
+                "python3 tools/harness_rules.py --update",
+                below,
+            )
         return Result(label, "PASS")
     return Result(
         label,

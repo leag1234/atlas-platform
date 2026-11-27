@@ -163,6 +163,17 @@ def check(baseline_path: Path = BASELINE, root: Path = ROOT) -> tuple[bool, list
     return not failures, failures + grown
 
 
+def lowered(baseline_path: Path = BASELINE, root: Path = ROOT) -> list[str]:
+    """The totals now below the baseline: the lower value should be locked."""
+    baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
+    recorded = baseline.get("totals", {})
+    return [
+        f"{kind} {recorded.get(kind, 0)} -> {value}"
+        for kind, value in totals(count_tree(root)).items()
+        if value < int(recorded.get(kind, 0))
+    ]
+
+
 def update(
     reason: str | None, baseline_path: Path = BASELINE, root: Path = ROOT
 ) -> int:

@@ -20,7 +20,7 @@ accepted changes are:
 - `regex`: calls to the standard `re` module or the third-party `regex` module
   and their aliases, for the compile, search, match, fullmatch, find, replace
   and split operations;
-- `word_tables`: module-level or class-level assignments to collection
+- `word_tables`: assignments, at any level, to collection
   literals, or calls that build such collections, containing at least three
   string literals;
 - `language_tables`: dictionary literals with at least two language-code keys.
@@ -29,4 +29,5 @@ The command prints totals and the ten largest files per kind. `--check`
 compares the totals with `tools/harness_rules.json` and fails when a total is
 above it, naming the files that grew. `--update` rewrites the baseline; a rise
 requires `--reason` and is recorded in the baseline's `raised` list. A decrease
-needs no reason. `tools/prepush.py` runs the same check before every push.
+needs no reason. `tools/prepush.py` runs the same check before every push. A total below
+the baseline is a warning that asks to lock the lower value with `--update`.

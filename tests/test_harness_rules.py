@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from tools.harness_rules import check, count_source, update
+from tools.harness_rules import check, count_source, lowered, update
 
 
 class HarnessRulesTests(unittest.TestCase):
@@ -60,8 +60,10 @@ class HarnessRulesTests(unittest.TestCase):
             )
             update(None, baseline, root)
             source.write_text("import re\n", encoding="utf-8")
+            self.assertEqual(lowered(baseline, root), ["regex 1 -> 0"])
             update(None, baseline, root)
             data = json.loads(baseline.read_text(encoding="utf-8"))
+            self.assertEqual(lowered(baseline, root), [])
             self.assertEqual(data["totals"]["regex"], 0)
             self.assertEqual(data["raised"], [])
 
