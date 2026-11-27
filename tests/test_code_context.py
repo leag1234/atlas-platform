@@ -11,6 +11,11 @@ BARE = (
     "print('MAX:', max(poids))"
 )
 FENCED = "Voici une version :\n\n```python\nx = 3\nprint(x * 2)\n```\n\nFin."
+ONE_LINE = "Kannst du diesen Python-Code ausführen? boxes = [4, 9, 2]; print(boxes[0]); print(sum(boxes))"
+WHOLE_MESSAGE = (
+    "Peux-tu exécuter ce code ? prix = [3, 8]; total = sum(prix); print(total)"
+)
+DELIVERED = "I created boxes.py and ran it. The output is:\n\n```\n4\n15\n```"
 
 
 class CodeContextTests(unittest.TestCase):
@@ -96,6 +101,68 @@ class CodeContextTests(unittest.TestCase):
         )
         self.assertIn("print('MAX:', max(poids))", hint)
         self.assertIn("Do not ask for it again", hint)
+
+    def test_an_unfenced_one_line_snippet_is_not_reconstructed(self) -> None:
+        hint = code_hint([("user", ONE_LINE)], "Run the code unchanged again.")
+        self.assertIn("boxes = [4, 9, 2]", hint)
+        self.assertIn("print(boxes[0])", hint)
+        self.assertIn("print(sum(boxes))", hint)
+        self.assertIn("Kannst du diesen Python-Code ausführen?", hint)
+
+    def test_an_unfenced_multiline_snippet_hands_the_whole_message(self) -> None:
+        message = (
+            "¿Puedes ejecutar esto? valores = [1, 2]\n"
+            "print(valores[0])\n"
+            "print(sum(valores))"
+        )
+        hint = code_hint([("user", message)], "Ejecútalo otra vez.")
+        self.assertIn("¿Puedes ejecutar esto?", hint)
+        self.assertIn("valores = [1, 2]", hint)
+        self.assertIn("print(sum(valores))", hint)
+
+    def test_a_delivered_code_file_is_named_first(self) -> None:
+        hint = code_hint(
+            [("user", ONE_LINE), ("assistant", DELIVERED)],
+            "Run the code unchanged again in the Python tool.",
+        )
+        self.assertIn("boxes.py", hint)
+        self.assertNotIn("boxes = [4, 9, 2]", hint)
+
+    def test_only_a_recent_code_file_of_yours_is_named(self) -> None:
+        from services.orchestrator.code_context import code_hint
+
+        # A file the person names, or a non-code file of yours, is not the code.
+        person = [
+            ("user", "Mon fichier notes.txt et rapport.docx sont prêts."),
+            ("assistant", "Voici rapport.docx et l'image sur atlas.eu.com."),
+        ]
+        self.assertNotIn("notes.txt", code_hint(person, "relance-le"))
+        self.assertNotIn("rapport.docx", code_hint(person, "relance-le"))
+        # New code from the person after a delivered file is what "run it" means.
+        newer = [
+            (
+                "assistant",
+                "J'ai exécuté [Télécharger lanterne.py](/api/x/deliverables/1/download).",
+            ),
+            ("user", "Et celui-ci ?\n```python\nprint(3 * 7)\n```"),
+        ]
+        hint = code_hint(newer, "lance-le")
+        self.assertNotIn("lanterne.py", hint)
+        self.assertIn("print(3 * 7)", hint)
+        # Your own delivered code file, after the person's code, is named.
+        older = [
+            *newer,
+            (
+                "assistant",
+                "Fait : [Herunterladen rechner.js](/api/x/deliverables/2/download).",
+            ),
+        ]
+        self.assertIn("rechner.js", code_hint(older, "nochmal ausführen"))
+
+    def test_a_fenced_hint_is_unchanged(self) -> None:
+        hint = code_hint([("user", FENCED)], "Run it again.")
+        self.assertIn("x = 3\nprint(x * 2)", hint)
+        self.assertNotIn("Voici une version", hint)
 
     def test_a_request_with_its_own_code_gets_no_hint(self) -> None:
         self.assertEqual(code_hint([("user", BARE)], FENCED), "")
