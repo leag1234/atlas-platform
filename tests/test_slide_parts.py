@@ -55,6 +55,22 @@ class RequestedTests(unittest.TestCase):
                 (part,) = slide_parts.requested([request])
                 self.assertEqual(part.role, role)
 
+    def test_a_named_part_on_each_slide_is_a_subheading(self) -> None:
+        cases = (
+            "Five slides, each slide with three bullets and a subheading "
+            "“Field note text” followed by one sentence.",
+            "Cinq diapositives, chaque diapositive avec trois puces et un "
+            "encadré «Carnet de terrain utile» suivi d'une phrase.",
+            "Fünf Folien, pro Folie drei Aufzählungspunkte und eine "
+            "Zwischenüberschrift „Feldnotiz heute“ mit einem klaren Satz.",
+            "Cinco diapositivas, cada diapositiva con tres viñetas y un "
+            "recuadro «Nota de campo útil» con una frase.",
+        )
+        for request in cases:
+            with self.subTest(request=request):
+                parts = slide_parts.requested([request])
+                self.assertIn("subheading", [part.role for part in parts])
+
 
 class PlacedTests(unittest.TestCase):
     def test_text_held_only_by_notes_goes_on_the_slide(self) -> None:
@@ -114,6 +130,33 @@ class PlacedTests(unittest.TestCase):
         parts = slide_parts.requested([REQUEST])
         content = deck([dict(heading="Autumn", paragraphs=["Feed the colony."])])
         self.assertEqual(slide_parts.placed(content, parts).sections, content.sections)
+
+    def test_a_named_part_is_a_subheading_not_a_fourth_bullet(self) -> None:
+        request = (
+            "Five slides, each slide with exactly three bullets and a "
+            "subheading “Field note text” followed by one sentence."
+        )
+        parts = slide_parts.requested([request])
+        self.assertEqual([part.role for part in parts], ["subheading"])
+        content = deck(
+            [
+                dict(
+                    heading="Morning",
+                    bullets=["Pack", "Count", "Leave"],
+                    notes=["Field note text: the river group walks at dusk."],
+                )
+            ]
+        )
+        repaired = slide_parts.placed(content, parts)
+        self.assertEqual(repaired.sections[0].bullets, ("Pack", "Count", "Leave"))
+        self.assertEqual(repaired.sections[1].heading, "Field note text")
+        self.assertEqual(repaired.sections[1].paragraphs[0], "Field note text")
+        self.assertTrue(repaired.sections[1].continued)
+        self.assertEqual(repaired.sections[1].level, 2)
+        shown, _ = slides_text(repaired)
+        self.assertEqual(len(shown), 1)
+        self.assertIn("Field note text", shown[0])
+        self.assertIn("Field note text", shown[0])
 
 
 class MissingTests(unittest.TestCase):

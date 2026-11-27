@@ -194,6 +194,7 @@ def file_view(path: str | Path) -> View | None:
 # role; readback.py reads it the same way.
 ROLE = "atlas:"
 TITLE_ROLES = frozenset({"title", "deck-title"})
+SUBHEADING_ROLES = frozenset({"subheading"})
 FOOTER_ROLES = frozenset({"footer", "number"})
 SKIPPED_ROLES = frozenset({"decor", "chart-title"})
 # A card, a column or a step of a themed slide: a text of its own, not a
@@ -294,6 +295,9 @@ def _deck(path: Path) -> View:
                 continue
             if role in TITLE_ROLES:
                 view.add("heading", frame.text, number)
+                continue
+            if role in SUBHEADING_ROLES:
+                view.add("heading", frame.text, number, "subheading")
                 continue
             if role in FOOTER_ROLES or placeholder in {
                 PP_PLACEHOLDER.FOOTER,

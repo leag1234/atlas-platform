@@ -34,13 +34,32 @@ TITLE_WORD = re.compile(
     r"|rubrique|rubriek)(?![\w-])",
     re.I,
 )
+SUBHEADING_WORD = re.compile(
+    r"(?<![\w-])(?:subheading|sub-heading|subheadings|sub-headings"
+    r"|box|boxed section|case|example|practical case"
+    r"|sous-titre|encadr\w*|cas pratique|exemple"
+    r"|zwischenüberschrift\w*|unterüberschrift\w*|praxisfall\w*"
+    r"|fallbeispiel|beispiel|kasten"
+    r"|subt[ií]tulo|encabezado secundario|caso práctico|caso practico"
+    r"|ejemplo|recuadro"
+    r"|sottotitolo|caso pratico|esempio|riquadro)(?![\w-])",
+    re.I,
+)
+PER_SLIDE_WORD = re.compile(
+    r"(?<![\w-])(?:each slide|every slide|per slide|on each slide"
+    r"|chaque diapositive|par diapositive|sur chaque diapositive"
+    r"|pro folie|auf jeder folie|jede folie|je folie"
+    r"|cada diapositiva|por diapositiva|en cada diapositiva"
+    r"|ogni diapositiva|per diapositiva)(?![\w-])",
+    re.I,
+)
 MIN_TEXT_WORDS = 3
 
 
 @dataclass(frozen=True)
 class Part:
     text: str
-    role: str  # "title" or "text"
+    role: str  # "title", "subheading" or "text"
 
 
 def requested(requests: list[str]) -> list[Part]:
@@ -55,8 +74,14 @@ def requested(requests: list[str]) -> list[Part]:
             before = request[max(0, match.start() - 60) : match.start()]
             # Only what precedes the quote in its own sentence names its role.
             before = re.split(r"[.!?\n]", before)[-1]
-            role = "title" if TITLE_WORD.search(before) else "text"
-            if words < (1 if role == "title" else MIN_TEXT_WORDS):
+            role = (
+                "title"
+                if TITLE_WORD.search(before)
+                else "subheading"
+                if SUBHEADING_WORD.search(before) and PER_SLIDE_WORD.search(request)
+                else "text"
+            )
+            if words < (1 if role in ("title", "subheading") else MIN_TEXT_WORDS):
                 continue
             if all(part.text != text for part in found):
                 found.append(Part(text, role))
@@ -111,15 +136,21 @@ def placed(content: Any, parts: list[Part]) -> Any:
                 section["paragraphs"] = [part.text, *section["paragraphs"]]
             elif section["bullets"]:
                 # A sentence beside a list goes under it (a continued section,
-                # which the deck draws on the same slide).
+                # which the deck draws on the same slide). A named part keeps
+                # its own subheading instead of becoming another list item.
                 at = sections.index(section) + 1
                 sections.insert(
                     at,
                     dict(
                         _empty(section),
-                        heading=section["heading"],
+                        heading=(
+                            part.text
+                            if part.role == "subheading"
+                            else section["heading"]
+                        ),
                         paragraphs=[part.text],
                         continued=True,
+                        level=2 if part.role == "subheading" else section["level"],
                     ),
                 )
             else:
