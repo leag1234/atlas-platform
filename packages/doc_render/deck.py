@@ -979,34 +979,14 @@ def content_slide(
     part: dict[str, Any],
 ) -> None:
     subheading = section.subheading
-    chrome(
-        slide,
-        theme,
-        section.heading,
-        deck,
-        number,
-    )
+    chrome(slide, theme, section.heading, deck, number)
     area = Rect(SIDE, BODY_TOP, W - 2 * SIDE, BODY_BOTTOM - BODY_TOP)
     items: list[tuple[str, bool]] = part["items"]
-    if subheading:
-        subheading = frame(
-            slide,
-            area.x,
-            area.y,
-            area.w,
-            28,
-            MSO_ANCHOR.BOTTOM,
-            role="subheading",
-        )
-        write(
-            subheading,
-            [section.subheading or ""],
-            18,
-            theme.primary,
-            bold=True,
-            gap=0,
-        )
-        area = Rect(area.x, area.y + 36, area.w, area.h - 36)
+    if subheading and all(text != subheading for text, _ in items):
+        # The named part reads under the bullets, its label right above its
+        # sentence: a line of its own, never one of the bullets.
+        at = next((i for i, (_, bullet) in enumerate(items) if not bullet), len(items))
+        items = [*items[:at], (subheading, False), *items[at:]]
     if callouts(section) and part["metrics"]:
         alone = not (items or part.get("visual"))
         height = 170.0 if alone else 150.0

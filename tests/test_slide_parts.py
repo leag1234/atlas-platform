@@ -148,14 +148,14 @@ class PlacedTests(unittest.TestCase):
         for slide, subpart in zip(repaired.sections[::2], repaired.sections[1::2]):
             self.assertEqual(len(slide.bullets), 3)
             self.assertEqual(subpart.heading, "Field note")
-            self.assertTrue(subpart.paragraphs[0].startswith("the river group"))
+            self.assertTrue(subpart.paragraphs[0].startswith("The river group"))
             self.assertTrue(subpart.continued)
             self.assertEqual(subpart.level, 2)
         shown, _ = slides_text(repaired)
         self.assertEqual(len(shown), 5)
         for text in shown:
             self.assertIn("Field note", text)
-            self.assertIn("the river group walks", text)
+            self.assertIn("The river group walks", text)
 
     def test_a_label_mentioned_in_the_middle_stays_a_bullet(self) -> None:
         parts = slide_parts.requested(

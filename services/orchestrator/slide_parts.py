@@ -96,6 +96,10 @@ def placed(content: Any, parts: list[Part]) -> Any:
     _labelled_bullets(sections, parts)
     for part in parts:
         folded = _fold(part.text)
+        # A short quoted label only names a sub-part (_labelled_bullets); only
+        # a text of a few words is inserted when it is missing.
+        if part.role == "text" and len(part.text.split()) < MIN_TEXT_WORDS:
+            continue
         if not folded:
             continue
         if part.role == "title":
@@ -152,6 +156,8 @@ def _labelled_bullets(sections: list[dict[str, Any]], parts: list[Part]) -> None
             sentence = text.strip()
             if not sentence:
                 continue
+            # Its own sentence now, no longer the end of a list item.
+            sentence = sentence[0].upper() + sentence[1:]
             del bullets[index]
             sections.insert(
                 sections.index(section) + 1,
