@@ -887,7 +887,10 @@ def _settle(text: str, routed: Decision | None) -> tuple[Decision | None, str]:
         from packages.work_intent import named_office_format
 
         named = named_office_format(text)
-        if named is not None:
+        # A format named for later ("propose two outlines, then I choose before
+        # you create the PowerPoint") is not a file to make now: the model's
+        # answer stands (staging -216, the deck was built before the choice).
+        if named is not None and not creation_deferred(text):
             return (
                 routed.model_copy(
                     update={

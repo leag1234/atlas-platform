@@ -156,6 +156,30 @@ class ParseTests(unittest.TestCase):
                 self.assertEqual(settled.kind, "app")
                 self.assertEqual(rule, "")
 
+    def test_a_format_named_for_later_keeps_the_answer(self) -> None:
+        # The model answered in the chat; the named format is for after the
+        # choice, so the named_file rule must not turn it into a file now.
+        deferred = (
+            "Avant de faire la présentation PowerPoint, propose-moi deux plans pour "
+            "un atelier sur la reliure, puis attends mon choix avant de créer le fichier.",
+            "Before you make the Word document, suggest two outlines and wait for my pick.",
+            "Bevor du die Excel-Tabelle erstellst, schlag mir zwei Varianten vor und warte.",
+            "Antes de hacer el PDF, propónme dos esquemas y espera a que elija.",
+        )
+        for text in deferred:
+            with self.subTest(text=text):
+                settled, rule = request_router._settle(text, Decision(kind="answer"))
+                assert settled is not None
+                self.assertEqual(settled.kind, "answer")
+                self.assertNotEqual(rule, "named_file")
+        # A document asked now is still delivered as that file.
+        settled, rule = request_router._settle(
+            "Écris-moi un court rapport Word d'une page sur les marées.",
+            Decision(kind="answer"),
+        )
+        assert settled is not None
+        self.assertEqual((settled.kind, rule), ("file", "named_file"))
+
     def test_prompt_orders_deliverables_before_later_proposals(self) -> None:
         self.assertIn("The ORDER decides", request_router.SYSTEM)
         self.assertIn(
