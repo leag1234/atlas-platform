@@ -45,6 +45,7 @@ import signal
 import sys
 import time
 import uuid
+from datetime import datetime, timezone
 from collections import OrderedDict
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -65,6 +66,9 @@ ASSERT_SECONDS = 7.0
 ASSERT_BUDGET_MS = 6000
 # A check that cannot have this much time is not started.
 MINIMUM_SECONDS = 6.0
+# The container's own hard limit: the longest check, plus a margin for the
+# browser's start and the worker's final report.
+CONTAINER_SECONDS = CHECK_SECONDS + ASSERT_SECONDS + MINIMUM_SECONDS
 LOAD_MS = 6000
 SETTLE_MS = 800
 CLICKS = 3
@@ -211,6 +215,10 @@ def _command(name: str, source: str, config: str) -> list[str]:
         "--security-opt",
         "no-new-privileges",
         image(),
+        "timeout",
+        "-s",
+        "KILL",
+        str(int(CONTAINER_SECONDS)),
         "python",
         "-I",
         "-c",
@@ -232,6 +240,57 @@ async def _remove(name: str) -> None:
         await asyncio.wait_for(process.wait(), 10)
     except (OSError, TimeoutError):
         log.warning("app_render_cleanup_failed name=%s", name)
+
+
+async def reap_orphans() -> None:
+    """Remove every orphaned render container, and only those."""
+    try:
+        process = await asyncio.create_subprocess_exec(
+            "docker",
+            "ps",
+            "--filter",
+            "label=atlas.purpose=app-render",
+            "--format",
+            "{{.ID}} {{.CreatedAt}}",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        try:
+            stdout, _ = await asyncio.wait_for(process.communicate(), 10)
+        except TimeoutError:
+            process.kill()
+            await process.wait()
+            return
+        if process.returncode != 0:
+            return
+        for line in stdout.decode("utf-8", "replace").splitlines():
+            identifier, _, created = line.partition(" ")
+            if not identifier:
+                continue
+            # Docker prints "2026-11-27 10:09:17 +0000 UTC": the zone name
+            # after the offset is not parsed.
+            try:
+                created_at = datetime.strptime(
+                    " ".join(created.split()[:3]), "%Y-%m-%d %H:%M:%S %z"
+                )
+            except ValueError:
+                continue
+            age = (datetime.now(timezone.utc) - created_at).total_seconds()
+            if age <= CONTAINER_SECONDS:
+                continue
+            log.warning("app_render_orphan_removed name=%s age=%s", identifier, age)
+            await _remove(identifier)
+    except OSError:
+        log.warning("app_render_reaper_unavailable")
+
+
+REAP_SECONDS = 300.0
+
+
+async def reap_periodically() -> None:
+    while True:
+        await reap_orphans()
+        await asyncio.sleep(REAP_SECONDS)
 
 
 async def _run(
@@ -283,12 +342,14 @@ async def _run(
             except ProcessLookupError:
                 pass
         else:
-            await _remove(name)
             try:
                 process.kill()
             except ProcessLookupError:
                 pass
         await process.wait()
+    finally:
+        if not local:
+            await _remove(name)
     return stages, result
 
 
@@ -367,8 +428,10 @@ async def check(
     try:
         left = seconds - (time.monotonic() - started)
         stages, result = await _run(body, left, config)
-    except OSError as error:
+    except (OSError, asyncio.CancelledError) as error:
         log.warning("app_render_unavailable error=%s", type(error).__name__)
+        if isinstance(error, asyncio.CancelledError):
+            raise
         return RenderReport("unavailable", reason="runtime", ms=_ms(started))
     finally:
         _gate().release()

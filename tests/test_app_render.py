@@ -9,10 +9,12 @@ otherwise. The app-turn tests script the check.
 """
 
 import os
+import asyncio
 import shutil
 import subprocess
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, patch
 
 from packages.user_errors import app_render_failure
@@ -235,6 +237,63 @@ class CheckTests(unittest.IsolatedAsyncioTestCase):
             "no-new-privileges",
         ):
             self.assertIn(flag, joined)
+
+    async def test_a_cancelled_check_removes_its_container(self) -> None:
+        remove = AsyncMock()
+        process = AsyncMock()
+        process.wait = AsyncMock()
+        with (
+            patch.dict(os.environ, {"ATLAS_APP_RENDER": "docker"}),
+            patch.object(app_render, "_remove", remove),
+            patch(
+                "services.orchestrator.app_render.asyncio.create_subprocess_exec",
+                AsyncMock(return_value=process),
+            ),
+            patch(
+                "services.orchestrator.app_render.asyncio.wait_for",
+                AsyncMock(side_effect=asyncio.CancelledError()),
+            ),
+        ):
+            with self.assertRaises(asyncio.CancelledError):
+                await app_render._run(GOOD.encode(), 1, {})
+        remove.assert_awaited_once()
+
+    async def test_the_reaper_removes_only_old_labelled_containers(self) -> None:
+        now = datetime.now(timezone.utc)
+        old = now - timedelta(seconds=app_render.CONTAINER_SECONDS + 60)
+        young = now - timedelta(seconds=app_render.CONTAINER_SECONDS - 60)
+        plain = now - timedelta(seconds=app_render.CONTAINER_SECONDS + 120)
+
+        class Process:
+            returncode = 0
+
+            async def communicate(self) -> tuple[bytes, bytes]:
+                # Docker's own format: offset then zone name.
+                return (
+                    (
+                        f"old {old.strftime('%Y-%m-%d %H:%M:%S %z')} UTC\n"
+                        f"young {young.strftime('%Y-%m-%d %H:%M:%S %z')} UTC\n"
+                        f"plain {plain.strftime('%Y-%m-%d %H:%M:%S %z')} UTC\n"
+                    ).encode("utf-8"),
+                    b"",
+                )
+
+            async def wait(self) -> int:
+                return 0
+
+        remove = AsyncMock()
+        with (
+            patch.object(app_render, "_remove", remove),
+            patch(
+                "services.orchestrator.app_render.asyncio.create_subprocess_exec",
+                AsyncMock(return_value=Process()),
+            ),
+        ):
+            await app_render.reap_orphans()
+        self.assertEqual(
+            [call.args for call in remove.await_args_list],
+            [("old",), ("plain",)],
+        )
 
     def test_problems_are_ordered_and_deduplicated(self) -> None:
         found = app_render.problems(

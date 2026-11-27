@@ -262,12 +262,14 @@ async def loop() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     from services.orchestrator.work_orphan_sweep import sweep_at_startup
+    from services.orchestrator.app_render import reap_orphans, reap_periodically
 
     # A restart during a Work turn can leave engine, proxy or worker
     # containers running with no session behind them: sweep them once at start.
     if os.environ.get("ATLAS_PROJECT_MODE") == "1":
         try:
             await sweep_at_startup()
+            await reap_orphans()
         except Exception:
             logging.getLogger(__name__).warning(
                 "work_orphan_sweep_startup_failed", exc_info=True
@@ -278,9 +280,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         and os.environ.get("ATLAS_SCHEDULED_TASKS") == "1"
         else None
     )
+    reaper = (
+        asyncio.create_task(reap_periodically())
+        if os.environ.get("ATLAS_PROJECT_MODE") == "1"
+        else None
+    )
     try:
         yield
     finally:
+        if reaper is not None:
+            reaper.cancel()
+            with suppress(asyncio.CancelledError):
+                await reaper
         if worker is not None:
             worker.cancel()
             with suppress(asyncio.CancelledError):
