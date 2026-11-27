@@ -99,8 +99,10 @@ class TargetTests(unittest.TestCase):
                 content, "Output held. " * 360, ".pdf", raw, {"pages"}, 30
             )
         )
-        self.assertGreater(measures["pages"] or 0, 1)
-        self.assertGreater(measures["words_per_page"] or 0, 100)
+        pages, words = measures["pages"], measures["words_per_page"]
+        assert isinstance(pages, int) and isinstance(words, int)
+        self.assertGreater(pages, 1)
+        self.assertGreater(words, 100)
 
     def test_the_report_spacing_is_tighter_with_the_same_type(self) -> None:
         content = Content.model_validate(
