@@ -275,6 +275,99 @@ class OnTheBuiltFile(unittest.TestCase):
         self.assertEqual(tally["wrong"], [])
 
 
+class PerUnitCounts(unittest.TestCase):
+    def test_page_counts_are_checked_per_page_and_totals_whole(self) -> None:
+        pages = []
+        for heading in ("North", "East", "West"):
+            pages.append(
+                {
+                    "heading": heading,
+                    "bullets": [
+                        "[ ] Check the tide",
+                        "[ ] Close the gate",
+                        "[ ] Log the time",
+                        "[ ] Call the harbour",
+                    ],
+                    "page_break": True,
+                }
+            )
+        content = Content.model_validate({"title": "Harbour checks", "sections": pages})
+        _, view = built(content, ".pdf")
+        per_page = requirement(
+            "R1",
+            {
+                "method": "code",
+                "part": "layout",
+                "rule": "items",
+                "count": 4,
+                "where": "each",
+            },
+        )
+        total = requirement(
+            "R2",
+            {
+                "method": "code",
+                "part": "layout",
+                "rule": "items",
+                "count": 12,
+            },
+        )
+        self.assertTrue(expectations.layout_result(per_page, view).passed)
+        self.assertTrue(expectations.layout_result(total, view).passed)
+        self.assertEqual(
+            expectations.layout_part_scoped([per_page, total]),
+            set(),
+        )
+
+    def test_a_short_page_names_its_own_count(self) -> None:
+        content = Content.model_validate(
+            {
+                "title": "Garden rota",
+                "sections": [
+                    {
+                        "heading": "Morning",
+                        "bullets": ["[ ] Water", "[ ] Weed"],
+                        "page_break": True,
+                    },
+                    {
+                        "heading": "Evening",
+                        "bullets": ["[ ] Water", "[ ] Weed", "[ ] Cover"],
+                        "page_break": True,
+                    },
+                ],
+            }
+        )
+        _, view = built(content, ".pdf")
+        four = requirement(
+            "R1",
+            {
+                "method": "code",
+                "part": "layout",
+                "rule": "items",
+                "count": 4,
+                "where": "each",
+            },
+        )
+        result = expectations.layout_result(four, view)
+        self.assertIs(result.passed, False)
+        self.assertIn("page 1: 2 item(s)", result.how)
+
+    def test_slide_counts_use_their_units(self) -> None:
+        deck_content = deck(True, False)
+        _, deck_view = built(deck_content, ".pptx")
+        bullets = requirement(
+            "R1",
+            {
+                "method": "code",
+                "part": "layout",
+                "rule": "items",
+                "count": 3,
+                "where": "each",
+            },
+        )
+        self.assertTrue(expectations.layout_result(bullets, deck_view).passed)
+
+
 class InTheLedger(unittest.TestCase):
     def test_check_document_reads_the_view_and_judges_the_undecided(self) -> None:
         raw, _ = built(deck(False, True), ".pptx")

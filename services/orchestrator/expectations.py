@@ -606,12 +606,24 @@ def layout_part_scoped(items: Sequence[Requirement]) -> set[str]:
         and item.check.get("part") == "layout"
         and item.check.get("rule") in {"items", "paragraphs"}
     ]
-    scoped = {item.id for item in counted if part_of(item.statement) == "one"}
-    groups: dict[tuple[str, str], list[Requirement]] = {}
+    scoped = {
+        item.id
+        for item in counted
+        if part_of(item.statement) == "one"
+        and not _layout_unit(item.check.get("where"))
+    }
+    groups: dict[tuple[str, str, str], list[Requirement]] = {}
     for item in counted:
         if str(item.check.get("relation") or "exact") != "exact":
             continue
-        key = (str(item.check.get("rule")), str(item.check.get("where") or ""))
+        where = str(item.check.get("where") or "")
+        key = (
+            str(item.check.get("rule")),
+            where,
+            "unit"
+            if _layout_unit(where) and not _layout_total(item.statement)
+            else "whole",
+        )
         groups.setdefault(key, []).append(item)
     for group in groups.values():
         counts = {item.check.get("count") for item in group}
@@ -619,6 +631,24 @@ def layout_part_scoped(items: Sequence[Requirement]) -> set[str]:
         if len(group) > 1 and (len(counts) > 1 or len(statements) > 1):
             scoped |= {item.id for item in group}
     return scoped
+
+
+def _layout_unit(where: Any) -> bool:
+    """Whether a layout check names a unit code can measure."""
+    return isinstance(where, str) and bool(
+        re.fullmatch(r"each|(?:page|slide):?\d{1,3}", where.strip().casefold())
+    )
+
+
+def _layout_total(statement: str) -> bool:
+    """Whether a count is asked for the whole file, not one of its units."""
+    return bool(
+        re.search(
+            r"\b(?:in all|in total|en tout|au total|insgesamt|en total)\b",
+            statement,
+            re.IGNORECASE,
+        )
+    )
 
 
 def layout_result(item: Requirement, view: Any) -> Result:

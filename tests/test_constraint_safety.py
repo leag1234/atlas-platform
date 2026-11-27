@@ -709,7 +709,52 @@ class LayoutParts(unittest.TestCase):
                 layout("R5", "two points on slide 2", 2, "slide:2"),
             ]
         )
-        self.assertEqual(scoped, {"R1", "R2", "R3", "R4"})
+        self.assertEqual(scoped, {"R3", "R4"})
+
+    def test_multilingual_unit_and_total_counts_stay_separate(self) -> None:
+        from services.orchestrator.expectations import Requirement, layout_part_scoped
+
+        def layout(rid: str, statement: str, count: int, where: str) -> Any:
+            return Requirement(
+                rid,
+                statement,
+                1,
+                method="code",
+                check={
+                    "part": "layout",
+                    "rule": "items",
+                    "count": count,
+                    "where": where,
+                },
+            )
+
+        self.assertEqual(
+            layout_part_scoped(
+                [
+                    layout("R1", "quatre cases par page", 4, "each"),
+                    layout("R2", "douze cases au total", 12, "each"),
+                ]
+            ),
+            set(),
+        )
+        self.assertEqual(
+            layout_part_scoped(
+                [
+                    layout("R3", "vier Punkte pro Folie", 4, "each"),
+                    layout("R4", "zwölf Punkte insgesamt", 12, "each"),
+                ]
+            ),
+            set(),
+        )
+        self.assertEqual(
+            layout_part_scoped(
+                [
+                    layout("R5", "cuatro filas por tabla", 4, "each"),
+                    layout("R6", "doce filas en total", 12, "each"),
+                ]
+            ),
+            set(),
+        )
 
 
 class PartsView(unittest.TestCase):
