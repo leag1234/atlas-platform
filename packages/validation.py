@@ -33,10 +33,15 @@ def describe_validation(error: ValidationError) -> str:
             if name in {"max_length", "min_length", "gt", "ge", "lt", "le"}
             and type(number) in (int, float)
         )
+        path = ".".join(str(part) for part in failure["loc"])
+        # The field is named with its measure: "measured length 18780; max_length
+        # 16000" alone did not tell an API client what to shorten (17 refusals in
+        # production, 2026-11-27).
+        where = f" of {path[:200]}" if path else ""
         if bounds and isinstance(value, (str, list, dict, bytes)):
-            measured = f"measured length {len(value)}"
+            measured = f"measured length {len(value)}{where}"
         elif bounds and type(value) in (int, float):
-            measured = f"measured value {value}"
+            measured = f"measured value {value}{where}"
         elif kind in {"extra_forbidden", "missing"}:
             # Field names are client keys, not values: naming them tells the client what to
             # remove or add (a Work turn died on an unnamed missing field, staging 2026-11-10).
@@ -44,10 +49,14 @@ def describe_validation(error: ValidationError) -> str:
             measured = (
                 "unknown field " if kind == "extra_forbidden" else "field "
             ) + path[:200]
+        elif not path and kind == "value_error":
+            # A rule on the whole request: its own reason is the only useful
+            # word ("invalid field; value_error" said nothing, 2026-11-27).
+            reason = str(failure.get("msg", "")).removeprefix("Value error, ")
+            measured = "invalid request: " + reason[:200]
         else:
             # Field names are client keys, not values (a coding run died on an
             # unnamed "invalid field; value_error", 2026-11-09).
-            path = ".".join(str(part) for part in failure["loc"])
             measured = "invalid field " + path[:200] if path else "invalid field"
         descriptions.append(f"Request validation: {measured}; {bounds or kind}")
     message = "; ".join(descriptions)
