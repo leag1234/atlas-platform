@@ -300,6 +300,31 @@ for (const name of ['localStorage', 'sessionStorage']) {
             b'<path d="M0 0"/></svg>',
         )
 
+    def test_a_raster_picture_downloads_as_its_own_image_bytes(self) -> None:
+        import base64
+
+        raster = base64.b64encode(b"\x89PNG\r\n\x1a\nlantern").decode("ascii")
+        artifact = artifact_store.create(
+            "owner@example.test",
+            "Lantern",
+            "lantern.png",
+            (
+                '<!DOCTYPE html><html><head><meta charset="utf-8">'
+                '<meta name="atlas-kind" content="drawing"><title>Lantern</title>'
+                '</head><body><svg viewBox="0 0 8 8"><image href="data:image/png;base64,'
+                + raster
+                + '" width="8" height="8"/></svg></body></html>'
+            ).encode("utf-8"),
+            "request-raster",
+        )
+        response = self.client.get(
+            f"/api/atlas/artifacts/{artifact['id']}/versions/1/download",
+            headers=self.owner(),
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["content-type"], "image/png")
+        self.assertEqual(response.content, b"\x89PNG\r\n\x1a\nlantern")
+
     def test_isolation_headers_are_set_exactly_once(self) -> None:
         open_response = self.client.get(
             f"/api/atlas/artifacts/{self.artifact_id}/versions/1/open",

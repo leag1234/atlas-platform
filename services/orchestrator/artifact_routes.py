@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import os
 import re
 import mimetypes
@@ -156,7 +157,22 @@ def _download_response(content: bytes, filename: str) -> Response:
     )
 
 
+# A picture from the image model is a raster image wrapped in the drawing's SVG.
+_EMBEDDED_RASTER = re.compile(
+    r"""<image\b[^>]*\bhref=["']data:image/(png|jpeg|webp);base64,([A-Za-z0-9+/=\s]+)["']""",
+    re.I,
+)
+_RASTER_SUFFIX = {".png": "png", ".jpg": "jpeg", ".jpeg": "jpeg", ".webp": "webp"}
+
+
 def _download_content(content: bytes, filename: str) -> bytes:
+    suffix = os.path.splitext(filename.lower())[1]
+    if suffix in _RASTER_SUFFIX and is_drawing(content.decode("utf-8", "replace")):
+        # The file is the raster picture itself, never the HTML page around it.
+        found = _EMBEDDED_RASTER.findall(drawing_source(content.decode("utf-8")))
+        if len(found) == 1 and found[0][0].lower() == _RASTER_SUFFIX[suffix]:
+            return base64.b64decode(re.sub(r"\s", "", found[0][1]))
+        return content
     if filename.lower().endswith(".svg") and is_drawing(
         content.decode("utf-8", "replace")
     ):

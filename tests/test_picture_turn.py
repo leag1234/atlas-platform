@@ -406,6 +406,17 @@ class TurnTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn(f"**{stem}.svg**", item.reponse)
                 self.assertNotIn(f"**{asked}**", item.reponse)
 
+    def test_a_picture_file_is_named_after_its_real_format(self) -> None:
+        cases = (("code", False, "svg"), ("cpu", False, "png"), ("cpu", True, "svg"))
+        for engine, by_code, expected in cases:
+            with self.subTest(engine=engine, by_code=by_code):
+                picture_set = store.PictureSet(
+                    set_id="s", owner="o", language="en", title="Lantern", candidates=[]
+                )
+                picture_set.engine = engine
+                picture_set.by_code = by_code
+                self.assertEqual(turn.picture_extension(picture_set), expected)
+
     async def test_an_ordinary_picture_answer_does_not_name_a_file(self) -> None:
         gateway = FakeGateway("banc")
         item = await self.run_turn(gateway)

@@ -628,6 +628,13 @@ def _export_name(request_text: str, title: str, extension: str) -> str:
     return f"{_slug(title, 'picture')}.{extension}"
 
 
+def picture_extension(picture_set: store.PictureSet) -> str:
+    """The real format of a picture's file: SVG for a drawing made by code, PNG
+    for a picture from the image model (its SVG only wraps the raster image,
+    staging -210: offered as ".svg" while the export said it was a raster)."""
+    return "svg" if picture_set.engine == "code" or picture_set.by_code else "png"
+
+
 def _standalone_svg(content: bytes) -> bytes:
     from packages.artifact_source import drawing_source
 
@@ -659,7 +666,7 @@ def export_picture(
     except ArtifactError as error:
         item.erreurs.append("picture_export_" + error.code)
         return None
-    if picture_set.engine == "code" or picture_set.by_code:
+    if picture_extension(picture_set) == "svg":
         extension = "svg"
         content = _standalone_svg(current.content)
     else:
@@ -1065,7 +1072,7 @@ async def process_picture_turn(
         if prepared.problems:
             item.erreurs.append("picture_artifact_invalid")
         else:
-            filename = _export_name(request_text, title, "svg")
+            filename = _export_name(request_text, title, picture_extension(picture_set))
             try:
                 stored = artifact_store.create(
                     owner,
