@@ -82,7 +82,8 @@ class ExecutionGuard:
         """The final answer, with the not-executed notice when nothing ran."""
         if self.executed and only_code_blocks(text):
             lead = EXECUTED_LEAD.get(lang, EXECUTED_LEAD["en"])
-            return f"{lead}\n\n{text}", True
+            # Something ran: the flag (unexecuted) stays False.
+            return f"{lead}\n\n{text}", False
         if not self.unexecuted:
             return text, False
         notice = NOT_EXECUTED.get(lang, NOT_EXECUTED["en"])

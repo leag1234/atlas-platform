@@ -60,8 +60,9 @@ class GuardTests(unittest.TestCase):
         for lang in ("en", "fr", "de", "es"):
             guard = ExecutionGuard(True)
             guard.record(["run_command"])
-            text, changed = guard.answer("```\n6\n7\n```", lang)
-            self.assertTrue(changed)
+            text, unexecuted = guard.answer("```\n6\n7\n```", lang)
+            # The code ran: no "not executed" honesty event for this answer.
+            self.assertFalse(unexecuted)
             self.assertTrue(text.startswith(EXECUTED_LEAD[lang]))
             self.assertTrue(text.endswith("```\n6\n7\n```"))
 
