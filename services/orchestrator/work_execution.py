@@ -8,6 +8,7 @@ run the code and report the real output. If the agent still answers without
 running anything, the answer says plainly that nothing was executed.
 """
 
+import re
 from collections.abc import Iterable
 
 # Tools that execute code or a command: the loop's sandbox command, a command
@@ -20,6 +21,14 @@ NOT_EXECUTED = {
     "de": "Nicht ausgeführt: In diesem Durchgang wurde weder Code noch ein Befehl ausgeführt, nichts in dieser Antwort ist also die Ausgabe einer Ausführung.",
     "es": "No ejecutado: en este turno no se ejecutó ningún código ni comando, así que nada en esta respuesta es la salida de una ejecución.",
     "it": "Non eseguito: in questo turno non è stato eseguito alcun codice né comando, quindi nulla in questa risposta è l'output di un'esecuzione.",
+}
+
+EXECUTED_LEAD = {
+    "en": "Executed: the code ran in this turn; the block below is its real output.",
+    "fr": "Exécuté : le code a tourné à ce tour ; le bloc ci-dessous est sa sortie réelle.",
+    "de": "Ausgeführt: Der Code lief in diesem Durchgang; der folgende Block ist seine echte Ausgabe.",
+    "es": "Ejecutado: el código se ejecutó en este turno; el bloque siguiente es su salida real.",
+    "it": "Eseguito: il codice è stato eseguito in questo turno; il blocco seguente è il suo output reale.",
 }
 
 
@@ -71,9 +80,17 @@ class ExecutionGuard:
 
     def answer(self, text: str, lang: str) -> tuple[str, bool]:
         """The final answer, with the not-executed notice when nothing ran."""
+        if self.executed and only_code_blocks(text):
+            lead = EXECUTED_LEAD.get(lang, EXECUTED_LEAD["en"])
+            # Something ran: the flag (unexecuted) stays False.
+            return f"{lead}\n\n{text}", False
         if not self.unexecuted:
             return text, False
         notice = NOT_EXECUTED.get(lang, NOT_EXECUTED["en"])
         if notice in text:
             return text, False
         return "\n\n".join(p for p in (notice, text.strip()) if p), True
+
+
+def only_code_blocks(text: str) -> bool:
+    return not re.sub(r"```.*?```", "", text, flags=re.DOTALL).strip()

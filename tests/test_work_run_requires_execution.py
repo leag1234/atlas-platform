@@ -14,6 +14,7 @@ from aiohttp.test_utils import TestServer
 from services.orchestrator import work_opencode_turn as turn_module
 from services.orchestrator.loop import Call, Limits, Query, Reservation, Turn, run
 from services.orchestrator.work_execution import (
+    EXECUTED_LEAD,
     NOT_EXECUTED,
     ExecutionGuard,
     run_requested,
@@ -54,6 +55,37 @@ class GuardTests(unittest.TestCase):
         guard = ExecutionGuard(True)
         guard.record(["remote_run"])
         self.assertFalse(guard.unexecuted)
+
+    def test_an_executed_code_only_answer_says_the_run_was_real(self) -> None:
+        for lang in ("en", "fr", "de", "es"):
+            guard = ExecutionGuard(True)
+            guard.record(["run_command"])
+            text, unexecuted = guard.answer("```\n6\n7\n```", lang)
+            # The code ran: no "not executed" honesty event for this answer.
+            self.assertFalse(unexecuted)
+            self.assertTrue(text.startswith(EXECUTED_LEAD[lang]))
+            self.assertTrue(text.endswith("```\n6\n7\n```"))
+
+    def test_an_executed_answer_with_prose_is_unchanged(self) -> None:
+        guard = ExecutionGuard(True)
+        guard.record(["bash"])
+        self.assertEqual(
+            guard.answer("It printed:\n```\n6\n```", "de"),
+            ("It printed:\n```\n6\n```", False),
+        )
+
+    def test_a_code_only_answer_without_a_run_never_claims_execution(self) -> None:
+        guard = ExecutionGuard(True)
+        text, changed = guard.answer("```\n6\n```", "es")
+        self.assertTrue(changed)
+        self.assertTrue(text.startswith(NOT_EXECUTED["es"]))
+        self.assertNotIn(EXECUTED_LEAD["es"], text)
+
+    def test_an_executed_code_only_answer_falls_back_to_english(self) -> None:
+        guard = ExecutionGuard(True)
+        guard.record(["remote_run"])
+        text, _ = guard.answer("```\n6\n```", "pt")
+        self.assertTrue(text.startswith(EXECUTED_LEAD["en"]))
 
     def test_other_requests_are_never_held(self) -> None:
         guard = ExecutionGuard(False)
