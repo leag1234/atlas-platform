@@ -28,10 +28,16 @@ _CODE_LINE = re.compile(
     r")|\s{2,}+\S.*+"
     r")\s*$"
 )
+_CODE_IN_SENTENCE = re.compile(
+    r"[A-Za-z_][\w.\[\]]*+\s*+(?:[-+*/%|&]?=|:=)\s*+\S"
+    r"|[A-Za-z_][\w.]*+\([^()\n]*+\)"
+    r"|\b(?:const|let|var|function|echo)\b\s+\S"
+)
 
 
 _LIST = re.compile(r"^\s*(?:[-*+•>]|\d+[.)])\s")
 _PUNCTUATION = re.compile(r"[=()\[\]{}:;]")
+_FILE_NAME = re.compile(r"\b[A-Za-z0-9_][A-Za-z0-9_.-]*\.[A-Za-z0-9]{1,8}\b")
 
 
 def _bare_block(text: str) -> str:
@@ -51,11 +57,19 @@ def _bare_block(text: str) -> str:
     return "\n".join(runs[-1]).strip() if runs else ""
 
 
+def _one_line_code(text: str) -> str:
+    """A whole one-line message that both asks and contains code."""
+    return text.strip() if "\n" not in text and _CODE_IN_SENTENCE.search(text) else ""
+
+
 def code_of(text: str) -> str:
     """The last code of a message: its last fenced block, else bare code lines."""
     fenced = _FENCED.findall(text)
     if fenced:
         return str(fenced[-1][2]).strip()
+    one_line = _one_line_code(text)
+    if one_line:
+        return one_line
     return _bare_block(text)
 
 
@@ -76,6 +90,17 @@ def last_code(messages: Sequence[tuple[str, str]]) -> tuple[str, str, int] | Non
     return None
 
 
+def _delivered_code_file(messages: Sequence[tuple[str, str]]) -> str:
+    """The code file named in the latest assistant answer that delivered one."""
+    for _, text in reversed(messages):
+        if _assistant_code_of(text):
+            continue
+        names = _FILE_NAME.findall(text)
+        if names:
+            return str(names[-1])
+    return ""
+
+
 def code_hint(messages: Sequence[tuple[str, str]], current: str) -> str:
     """The note that hands the conversation's latest code to the Work step.
 
@@ -84,11 +109,29 @@ def code_hint(messages: Sequence[tuple[str, str]], current: str) -> str:
     """
     if code_of(current):
         return ""
+    file_name = _delivered_code_file(messages)
     found = last_code(messages)
+    if file_name:
+        return (
+            f"\n\n(The code was written to the file {file_name} earlier in this "
+            "conversation and that file was run. A request to run it, or to run "
+            "it with a value changed, means that file: change what was asked, "
+            "run the file, and name the code used if the conversation holds "
+            "several. Do not ask for it again.)"
+        )
     if found is None:
         return ""
     role, code, _ = found
     owner = "the person's" if role == "user" else "your own"
+    if role == "user" and not _FENCED.search(messages[-(found[2])][1]):
+        source = messages[-(found[2])][1][:MAX_CHARACTERS]
+        return (
+            f"\n\n(The code is inside {owner} earlier message below, exactly as "
+            "it was written. A request to run it, or to run it with a value "
+            "changed, means that code: read the whole message, change what was "
+            "asked, and run the code. Do not ask for it again.)\n"
+            f"{source}"
+        )
     return (
         f"\n\n(The latest code of this conversation, from {owner} earlier message, "
         "is below. A request to run it, or to run it with a value changed, means "
