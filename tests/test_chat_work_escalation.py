@@ -10,6 +10,7 @@ from uuid import UUID
 from packages.work_intent import needs_work
 from services.orchestrator.chat_schema import ChatRequest
 from services.orchestrator.chat_work import chat_work_enabled, should_escalate
+from services.orchestrator.request_router import DECISION_KEY, Decision
 
 
 def request(text: str, **kwargs: object) -> ChatRequest:
@@ -181,6 +182,66 @@ class RoutingTests(unittest.TestCase):
                     )
                 )
                 self.assertFalse(should_escalate(request("What is a tuple?")))
+
+    def test_a_deferred_deliverable_stays_in_the_chat(self) -> None:
+        deferred = (
+            "Avant de créer le fichier PowerPoint, proposez-moi deux plans "
+            "et attendez que je choisisse.",
+            "Before you make the document, propose two outlines and wait for my choice.",
+            "Bevor Sie die Präsentation erstellen, schlagen Sie zwei Pläne vor "
+            "und warten Sie auf meine Auswahl.",
+            "Antes de crear el documento, muéstrame dos opciones y espera a que elija.",
+            "Prima di creare la presentazione, proponimi due piani e aspetta che io scelga.",
+        )
+        with (
+            patch.dict(os.environ, {"ATLAS_CHAT_WORK": "1", "ATLAS_MODEL_ROUTER": "1"}),
+            patch("services.orchestrator.chat_work.work_gate_open", return_value=True),
+        ):
+            for text in deferred:
+                request_ = request(text)
+                request_.__dict__[DECISION_KEY] = Decision(
+                    kind="file", file_format="pptx"
+                )
+                with self.subTest(text=text):
+                    self.assertFalse(should_escalate(request_))
+
+    def test_a_deferred_deliverable_stays_in_the_chat_without_the_router(self) -> None:
+        deferred = (
+            "Avant de créer le fichier PowerPoint, proposez-moi deux plans "
+            "et attendez que je choisisse.",
+            "Before you make the document, propose two outlines and wait for my choice.",
+            "Bevor Sie die Präsentation erstellen, schlagen Sie zwei Pläne vor "
+            "und warten Sie auf meine Auswahl.",
+            "Antes de crear el documento, muéstrame dos opciones y espera a que elija.",
+            "Prima di creare la presentazione, proponimi due piani e aspetta che io scelga.",
+        )
+        with (
+            patch.dict(os.environ, {"ATLAS_CHAT_WORK": "1"}),
+            patch("services.orchestrator.chat_work.work_gate_open", return_value=True),
+        ):
+            for text in deferred:
+                with self.subTest(text=text):
+                    self.assertFalse(should_escalate(request(text)))
+
+    def test_a_deliverable_made_now_still_reaches_work(self) -> None:
+        made_now = (
+            "Crée le fichier PowerPoint maintenant, puis propose des variantes.",
+            "Make the document now, then propose variants.",
+            "Erstelle die Präsentation jetzt und schlage dann Varianten vor.",
+            "Crea el documento ahora y luego propone variantes.",
+            "Crea la presentazione adesso e poi proponi varianti.",
+        )
+        with (
+            patch.dict(os.environ, {"ATLAS_CHAT_WORK": "1", "ATLAS_MODEL_ROUTER": "1"}),
+            patch("services.orchestrator.chat_work.work_gate_open", return_value=True),
+        ):
+            for text in made_now:
+                request_ = request(text)
+                request_.__dict__[DECISION_KEY] = Decision(
+                    kind="file", file_format="pptx"
+                )
+                with self.subTest(text=text):
+                    self.assertTrue(should_escalate(request_))
 
 
 class AttachedDocumentTests(unittest.IsolatedAsyncioTestCase):

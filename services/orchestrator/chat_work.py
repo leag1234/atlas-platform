@@ -102,10 +102,15 @@ def should_escalate(request: ChatRequest) -> bool:
     """Routing decision for a first turn: the request itself needs Work."""
     if not eligible(request):
         return False
-    from services.orchestrator.request_router import decision
+    from services.orchestrator.request_router import decision, settle
 
     if (routed := decision(request)) is not None:
-        return routed.work
+        settled = settle(request.user_text, routed)
+        return settled is not None and settled.work
+    from packages.deferred_intent import creation_deferred
+
+    if creation_deferred(request.user_text):
+        return False
     history = [
         {"role": message.role, "content": message.text}
         for message in request.messages[:-1]

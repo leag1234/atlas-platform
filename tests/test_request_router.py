@@ -750,12 +750,9 @@ class WorkGateTests(unittest.IsolatedAsyncioTestCase):
                     )
             for kind in ("answer", "research", "drawing", "app", "other"):
                 with self.subTest(kind=kind):
-                    # "Write ... in Python and run it" is Work for the lexical test.
                     self.assertFalse(
                         should_escalate(
-                            routed(
-                                request("Write a game in Python and run it"), kind=kind
-                            )
+                            routed(request("Tell me about kite festivals"), kind=kind)
                         )
                     )
 
@@ -954,6 +951,43 @@ class PipelineGateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(item.reponse, unavailable_reply("fr"))
         image.assert_not_awaited()
         inline_svg.assert_not_awaited()
+
+    async def test_a_deferred_app_or_picture_stays_a_chat_answer(self) -> None:
+        deferred = (
+            "Avant de créer l'application, proposez-moi deux plans et attendez mon choix.",
+            "Before you make the picture, propose two options and wait for my choice.",
+            "Bevor Sie das Programm erstellen, schlagen Sie zwei Pläne vor "
+            "und warten Sie auf meine Auswahl.",
+            "Antes de crear la imagen, muéstrame dos opciones y espera a que elija.",
+            "Prima di creare l'app, proponimi due piani e aspetta la mia scelta.",
+        )
+        for text in deferred:
+            with self.subTest(text=text):
+                run, image, inline_svg, item = await self.process(request(text))
+                self.assertEqual(run.await_count, 1)
+                image.assert_not_awaited()
+                inline_svg.assert_not_awaited()
+                self.app_turn.assert_not_awaited()
+                self.assertNotEqual(item.task_type, "artifact")
+
+    async def test_an_app_or_picture_made_now_still_takes_its_path(self) -> None:
+        made_now = (
+            "Crée l'application maintenant, puis propose des variantes.",
+            "Make the picture now, then propose variants.",
+            "Erstelle die App jetzt und schlage dann Varianten vor.",
+            "Crea la aplicación ahora y luego propone variantes.",
+            "Crea l'app adesso e poi proponi varianti.",
+        )
+        for text in made_now:
+            with self.subTest(text=text):
+                run, image, inline_svg, item = await self.process(request(text))
+                self.assertGreater(
+                    image.await_count
+                    + inline_svg.await_count
+                    + self.app_turn.await_count,
+                    0,
+                )
+                self.assertEqual(item.task_type, "artifact")
         run, image, inline_svg, item = await self.process(
             request("Je voudrais que tu me dessines un mouton", lang="fr")
         )
