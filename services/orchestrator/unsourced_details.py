@@ -128,6 +128,14 @@ from services.orchestrator.grounding import (
 
 LOGGER = logging.getLogger(__name__)
 MODES = frozenset({"off", "mark", "revise", "revise_mark"})
+
+
+def _distinctive(token: str) -> bool:
+    return any(character.isdigit() for character in token) or any(
+        character.isupper() for character in token
+    )
+
+
 # One revision call: its ceiling and its time (the answer is held meanwhile).
 CALL_BUDGET_EUR = Decimal("0.02")
 DEADLINE_SECONDS = float(os.environ.get("ATLAS_UNSOURCED_DETAILS_SECONDS", "12"))
@@ -625,6 +633,10 @@ class Detail:
     value: DateValue | None = None
     event: str = ""
 
+    # A name whose first word opens its sentence or line: that word is
+    # capitalised by its position, so it never makes the name distinctive.
+    sentence_start: bool = False
+
     @property
     def key(self) -> str:
         return self.kind + ":" + normalized(self.text)
@@ -826,12 +838,21 @@ def extract(answer: str) -> list[Detail]:
             span: tuple[int, int],
             value: DateValue | None = None,
             event: str = "",
+            opens: bool = False,
         ) -> None:
             if kind != "name":
                 taken[span[0] : span[1]] = b"\x01" * (span[1] - span[0])
             if len(found) >= MAX_DETAILS:
                 return
-            detail = Detail(kind, text.strip(), start, end, value, event)
+            detail = Detail(
+                kind,
+                text.strip(),
+                start,
+                end,
+                value,
+                event,
+                opens,
+            )
             if normalized(detail.text):
                 found.setdefault(detail.key, detail)
 
@@ -944,12 +965,22 @@ def extract(answer: str) -> list[Detail]:
                 or (single and CONTRACTION.fullmatch(word) is not None)
                 or (single and sentence_start and not name_like)
                 or (
+                    sentence_start
+                    and not single
+                    and not any(_distinctive(token) for token in text.split()[1:])
+                )
+                or (
                     single
                     and german
                     and _german_noun(plain, words, index, sentence_start)
                 )
             ):
-                add("name", text, (words[index].start(), words[last].end()))
+                add(
+                    "name",
+                    text,
+                    (words[index].start(), words[last].end()),
+                    opens=sentence_start,
+                )
             index = following
         if len(found) >= MAX_DETAILS:
             break
@@ -1082,14 +1113,26 @@ def supported(detail: Detail, evidence: Evidence, own: Evidence) -> bool:
         )
     if detail.kind == "name":
         # "Brelune's": the possessive ending is no part of the name.
+        sentence_start = detail.sentence_start
+        distinctive = [
+            token
+            for token, raw in zip(phrase.split(), detail.text.split())
+            if token not in TITLES and len(token) > 1 and _distinctive(raw)
+        ]
+        if sentence_start:
+            distinctive = distinctive[1:]
+        if not distinctive:
+            distinctive = [
+                token
+                for token in phrase.split()
+                if token not in TITLES and len(token) > 1
+            ]
         tokens = [
             token
-            for token in phrase.split()
-            if token not in STOP and token not in TITLES and len(token) > 1
+            for token in distinctive
+            if token.casefold() in evidence.words or token.casefold() in own.words
         ]
-        return bool(tokens) and all(
-            token in evidence.words or token in own.words for token in tokens
-        )
+        return bool(distinctive) and len(tokens) == len(distinctive)
     if detail.kind in {"number", "year"}:
         parsed = _number_value(detail.text)
         if parsed is None:
@@ -1158,7 +1201,16 @@ def unsupported(
     found = [d for d in _unsupported(answer, evidence, own) if d.kind not in skip]
     if computed is None:
         return found
-    return [detail for detail in found if not computed.holds(detail, answer)]
+    return [
+        detail
+        for detail in found
+        if not (
+            detail.kind == "name"
+            and supported(detail, evidence, own)
+            and not common_word(detail, evidence, frozenset())
+        )
+        and not computed.holds(detail, answer)
+    ]
 
 
 def _unsupported(answer: str, evidence: Evidence, own: Evidence) -> list[Detail]:
@@ -1319,6 +1371,59 @@ def _within(values: list[float], value: float, unit: float) -> bool:
     return index < len(values) and values[index] <= value + reach
 
 
+def _structural_sums(answer: str, supported_values: set[float]) -> set[float]:
+    """Sums of two or more numbers immediately before a number in one list or
+    table column. The answer's structure says what belongs together; no word
+    announces the result."""
+    columns: list[list[float]] = [[]]
+    for line in answer.splitlines():
+        if line.lstrip().startswith("|"):
+            cells = line.strip().strip("|").split("|")
+            separator_cells = [
+                cell.strip()
+                for cell in cells
+                if cell.strip() and set(cell.strip()) <= {":", "-"}
+            ]
+            if len(cells) < 2 or (
+                len(separator_cells) == len(cells)
+                and all("-" in cell for cell in separator_cells)
+            ):
+                continue
+            while len(columns) < len(cells):
+                columns.append([])
+            for index, cell in enumerate(cells):
+                match = NUMBER.search(cell)
+                if match:
+                    parsed = _number_value(match[0])
+                    if parsed is not None:
+                        columns[index].append(parsed[0])
+            continue
+        match = NUMBER.search(line)
+        parsed = _number_value(match[0]) if match else None
+        if parsed is not None:
+            columns[-1].append(parsed[0])
+        elif columns[-1]:
+            columns.append([])
+    supported = sorted(supported_values)
+    found: set[float] = set()
+    for values in columns:
+        running: list[float] = []
+        for value in values:
+            for start in range(len(running)):
+                candidates = running[start:]
+                if len(candidates) < 2:
+                    continue
+                if abs(value - sum(candidates)) <= 1e-9:
+                    found.add(value)
+                    supported = sorted({*supported, value})
+                    break
+            if _within(supported, value, 1e-9):
+                running.append(value)
+            else:
+                running = []
+    return found
+
+
 @dataclass
 class Computed:
     """Values the turn computed: tool results, arithmetic on the person's numbers,
@@ -1406,6 +1511,15 @@ class Computed:
             for value in (parsed[0],)
             if _within(self.exact, value, parsed[1] or 1.0)
         ]
+        structural = _structural_sums(body, {*self.exact, *self.base, *held})
+        for _ in range(len(body)):
+            following = _structural_sums(
+                body, {*self.exact, *self.base, *held, *structural}
+            )
+            if following == structural:
+                break
+            structural = following
+        extra |= structural
         held = list(dict.fromkeys([*extra, *held]))[:BASE_VALUES]
         extra |= {
             value
