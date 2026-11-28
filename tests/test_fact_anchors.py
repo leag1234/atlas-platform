@@ -12,13 +12,14 @@ import json
 import os
 import time
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from services.orchestrator import grounding
 from services.orchestrator import unsourced_details as details
 from services.orchestrator.chat_pipeline import process
 from services.orchestrator.chat_schema import ChatRequest
 from services.orchestrator.interactions import Interaction
+from services.orchestrator.request_router import Decision
 from services.orchestrator.stream_client import sink_context
 from services.orchestrator.unsourced_details import Evidence
 
@@ -455,6 +456,62 @@ class StreamedAnswerTests(unittest.IsolatedAsyncioTestCase):
         item, sent, _ = await self.turn(question, answer, "", ui=True)
         self.assertEqual(item.reponse, answer)
         self.assertFalse(any(s.get("phase") == "anchor_check" for s in item.steps))
+
+    async def test_a_writing_decision_gets_no_anchor_note(self) -> None:
+        question, answer, note = STREAMED["fr"]
+        request = ChatRequest.model_validate(
+            {"messages": [{"role": "user", "content": question}], "atlas_ui": True}
+        )
+        request.__dict__["model_route"] = Decision(kind="answer", states_facts=False)
+        item = Interaction()
+        sent: list[str] = []
+
+        async def sink(event: dict[str, object]) -> None:
+            delta = event.get("delta")
+            if isinstance(delta, dict) and isinstance(delta.get("content"), str):
+                sent.append(delta["content"])
+
+        async def generate(scoped: ChatRequest, interaction: Interaction) -> None:
+            upstream = sink_context.get()
+            assert upstream is not None
+            collector = details.anchors.get()
+            assert collector is not None
+            collector.collect({"results": [{"snippet": SOURCES["fr"]}]})
+            await upstream({"delta": {"content": answer}})
+            interaction.reponse = answer
+            interaction.state = "done"
+
+        token = sink_context.set(sink)
+        try:
+            with (
+                patch.dict(
+                    os.environ,
+                    {
+                        "ATLAS_GROUNDING": "on",
+                        "ATLAS_MODEL_ROUTER": "1",
+                        "ATLAS_UNSOURCED_DETAILS": "revise_mark",
+                    },
+                ),
+                patch(
+                    "services.orchestrator.chat_pipeline._process_request",
+                    side_effect=generate,
+                ),
+                patch.object(grounding, "needs_grounding", return_value=False),
+                patch.object(details, "wants_review", return_value=False),
+                patch.object(
+                    details,
+                    "streamed_check",
+                    MagicMock(return_value=("", details.Report())),
+                ) as check,
+            ):
+                await process(request, item)
+        finally:
+            sink_context.reset(token)
+        self.assertEqual("".join(sent), answer)
+        self.assertEqual(item.reponse, answer)
+        self.assertNotIn(note, item.reponse)
+        self.assertFalse(any(s.get("phase") == "anchor_check" for s in item.steps))
+        check.assert_not_called()
 
 
 class StreamedNoteTests(unittest.TestCase):

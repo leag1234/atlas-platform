@@ -16,10 +16,11 @@ import os
 import unittest
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from services.orchestrator import chat_pipeline, deliverable_check, document_quotes
 from services.orchestrator import unsourced_details as details
+from services.orchestrator.request_router import Decision
 from services.orchestrator.unsourced_details import Evidence
 
 # One cover note per language: the note is dated the 30th and records the
@@ -405,6 +406,63 @@ class DocumentTurnTest(unittest.TestCase):
         patcher = patch.dict(os.environ, {"ATLAS_UNSOURCED_DETAILS": "revise_mark"})
         patcher.start()
         self.addCleanup(patcher.stop)
+
+    def test_a_writing_decision_skips_the_streamed_note(self) -> None:
+        request, item, sources = turn(WRONG_RECEIPT["fr"], NOTES["fr"])
+        request.__dict__["model_route"] = Decision(kind="answer", states_facts=False)
+        with (
+            patch.dict(os.environ, {"ATLAS_MODEL_ROUTER": "1"}),
+            patch.object(
+                details,
+                "streamed_check",
+                MagicMock(return_value=("", details.Report())),
+            ) as check,
+        ):
+            note = asyncio.run(
+                chat_pipeline._document_details(
+                    request, item, sources, [None], True, "fr"
+                )
+            )
+        self.assertEqual(note, "")
+        check.assert_not_called()
+
+    def test_a_fact_decision_keeps_the_streamed_note(self) -> None:
+        request, item, sources = turn(WRONG_RECEIPT["fr"], NOTES["fr"])
+        request.__dict__["model_route"] = Decision(kind="answer", states_facts=True)
+        with (
+            patch.dict(os.environ, {"ATLAS_MODEL_ROUTER": "1"}),
+            patch.object(
+                details,
+                "streamed_check",
+                MagicMock(return_value=("", details.Report())),
+            ) as check,
+        ):
+            note = asyncio.run(
+                chat_pipeline._document_details(
+                    request, item, sources, [None], True, "fr"
+                )
+            )
+        self.assertEqual(note, "")
+        check.assert_called_once()
+
+    def test_a_writing_decision_skips_the_held_review(self) -> None:
+        request, item, sources = turn(WRONG_RECEIPT["fr"], NOTES["fr"])
+        request.__dict__["model_route"] = Decision(kind="answer", states_facts=False)
+        with (
+            patch.dict(os.environ, {"ATLAS_MODEL_ROUTER": "1"}),
+            patch.object(
+                details,
+                "review",
+                AsyncMock(return_value=("", details.Report())),
+            ) as review,
+        ):
+            note = asyncio.run(
+                chat_pipeline._document_details(
+                    request, item, sources, [None], False, "fr"
+                )
+            )
+        self.assertEqual(note, "")
+        review.assert_not_awaited()
 
     def test_a_streamed_answer_gets_a_closing_note(self) -> None:
         request, item, sources = turn(WRONG_RECEIPT["fr"], NOTES["fr"])

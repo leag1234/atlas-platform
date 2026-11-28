@@ -1008,6 +1008,11 @@ async def _document_details(
     A held answer is revised in place by the one bounded call; a streamed one
     returns its closing note ("" when every detail is found).
     """
+    from services.orchestrator import request_router
+
+    routed = request_router.decision(request)
+    if routed is not None and not routed.states_facts:
+        return ""
     found = [collector for collector in collectors if collector is not None]
     passages = [
         *unsourced_details.turn_passages(quotes),
@@ -1430,10 +1435,14 @@ async def process(request: ChatRequest, item: Interaction) -> None:
     # (unsourced_details): a held answer gets the bounded revision, a streamed
     # one a closing note.
     detail_note = ""
+    from services.orchestrator import request_router
+
+    routed = request_router.decision(request)
     if (
         provided is not None
         and quotes is not None
         and unsourced_details.mode() != "off"
+        and (routed is None or routed.states_facts)
     ):
         detail_note = await _document_details(
             request,
@@ -1490,6 +1499,7 @@ async def process(request: ChatRequest, item: Interaction) -> None:
         and not request.has_attachments
         and not request.project_id
         and provided is None
+        and (routed is None or routed.states_facts)
     ):
         # Precise details no retrieved text holds: looked up in the subject's
         # encyclopedia article, then corrected or removed by one bounded call
@@ -1557,6 +1567,7 @@ async def process(request: ChatRequest, item: Interaction) -> None:
         and provided is None
         and item.state == "done"
         and item.task_type not in SERVICE_WRITTEN | {"work", "nearby", "artifact"}
+        and (routed is None or routed.states_facts)
         and (
             passages := anchors.evidence
             + [str(chunk.get("text", "")) for chunk in item.chunks_recuperes]
