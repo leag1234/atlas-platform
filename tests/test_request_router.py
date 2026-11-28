@@ -101,6 +101,15 @@ class ParseTests(unittest.TestCase):
             request_router.parse('{"kind": "app", "follow_up": true}').changes_delivered
         )
 
+    def test_the_model_decides_whether_the_reply_states_facts(self) -> None:
+        self.assertTrue(request_router.parse('{"kind": "answer"}').states_facts)
+        self.assertFalse(
+            request_router.parse(
+                '{"kind": "answer", "states_facts": false}'
+            ).states_facts
+        )
+        self.assertIn("states_facts", request_router.SYSTEM)
+
     def test_a_broken_delivery_complaint_is_a_fix_request(self) -> None:
         cases = (
             "The seed-trader app shows nothing.",
