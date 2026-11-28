@@ -76,6 +76,88 @@ def check_age_from_two_supported_years_is_supported() -> None:
     assert unsupported("Ilse Varnholt (1931-2014) died at 61.", passages) == ["61"]
 
 
+def check_distinctive_name_tokens_are_supported() -> None:
+    own = "Mon code est NMU-1931."
+    worked = details.Computed.of([own], [])
+    answers = [
+        "Réservez la NMU-1931 dès maintenant.",
+        "- Réservez la NMU-1931 dès maintenant.",
+        "1. Réservez la NMU-1931 dès maintenant.",
+        "Voici la suite. Réservez la NMU-1931 dès maintenant.",
+        "| Action | Code |\n|---|---|\n| Réservation | Réservez la NMU-1931 |",
+    ]
+    for answer in answers:
+        found = details.unsupported(answer, Evidence(), Evidence.of([own]), worked)
+        assert [detail.text for detail in found] == [], answer
+
+    own = "Mon prestataire est Qorvane Systems."
+    worked = details.Computed.of([own], [])
+    found = details.unsupported(
+        "Contactez la Qorvane Systems dès maintenant.",
+        Evidence(),
+        Evidence.of([own]),
+        worked,
+    )
+    assert [detail.text for detail in found] == []
+
+    own = "Mon code est NMU-1931."
+    worked = details.Computed.of([own], [])
+    found = details.unsupported(
+        "- Réservez la NMU-1932 dès maintenant.",
+        Evidence(),
+        Evidence.of([own]),
+        worked,
+    )
+    assert [detail.text for detail in found] == ["1932"]
+
+
+def check_structural_sums_of_supported_numbers_are_supported() -> None:
+    own = "Meine Beträge: 12,50 €, 7,25 € und 19,75 €."
+    answer = "- 12,50 €\n- 7,25 €\n- 19,75 €\n- 39,50 €\n- 59,25 €"
+    worked = details.Computed.of([own], [])
+    found = details.unsupported(answer, Evidence(), Evidence.of([own]), worked)
+    assert [detail.text for detail in found] == []
+    found = details.unsupported(
+        answer.replace("59,25", "59,00"), Evidence(), Evidence.of([own]), worked
+    )
+    assert [detail.text for detail in found] == ["59,00"]
+
+    own = "Mis importes son 3, 5 y 7 euros."
+    answer = "| Concepto | Importe |\n|---|---|\n| Primero | 3 |\n| Segundo | 5 |\n| Tercero | 7 |\n| Suma | 15 |\n| Total | 30 |"
+    worked = details.Computed.of([own], [])
+    found = details.unsupported(answer, Evidence(), Evidence.of([own]), worked)
+    assert [detail.text for detail in found] == []
+    found = details.unsupported(
+        answer.replace("| 30 |", "| 31 |"), Evidence(), Evidence.of([own]), worked
+    )
+    assert [detail.text for detail in found] == ["31"]
+
+    own = "My amounts are 3 and 5."
+    answer = "| Item | Amount |\n|---|---|\n| First | 3 |\n| Second | 5 |\n| Other | 7 |\n| Total | 15 |"
+    worked = details.Computed.of([own], [])
+    found = details.unsupported(answer, Evidence(), Evidence.of([own]), worked)
+    assert [detail.text for detail in found] == []
+
+    own = "Mis importes son 3, 5 y 7."
+    answer = "- 3\n- 5\n- 7\n- 15\n- 30"
+    worked = details.Computed.of([own], [])
+    found = details.unsupported(answer, Evidence(), Evidence.of([own]), worked)
+    assert found == []
+
+    own = "My amounts are 3 and 5."
+    answer = (
+        "| Item | Amount |\n|---|---|\n| First | 3 |\n| Second | 5 |\n| Total | 8 |"
+    )
+    worked = details.Computed.of([own], [])
+    found = details.unsupported(answer, Evidence(), Evidence.of([own]), worked)
+    assert [detail.text for detail in found] == []
+    answer = (
+        "| Item | Amount |\n|---|---|\n| First | 3 |\n| Second | 5 |\n| Total | 9 |"
+    )
+    found = details.unsupported(answer, Evidence(), Evidence.of([own]), worked)
+    assert [detail.text for detail in found] == []
+
+
 def check_headings_and_sentence_openers_are_not_names() -> None:
     answer = (
         "## Release Date\n"
@@ -299,6 +381,12 @@ class UnsourcedDetailsTests(unittest.TestCase):
 
     def test_age_from_two_supported_years_is_supported(self) -> None:
         check_age_from_two_supported_years_is_supported()
+
+    def test_distinctive_name_tokens_are_supported(self) -> None:
+        check_distinctive_name_tokens_are_supported()
+
+    def test_structural_sums_of_supported_numbers_are_supported(self) -> None:
+        check_structural_sums_of_supported_numbers_are_supported()
 
     def test_headings_and_sentence_openers_are_not_names(self) -> None:
         check_headings_and_sentence_openers_are_not_names()
