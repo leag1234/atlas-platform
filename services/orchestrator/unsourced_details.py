@@ -633,12 +633,9 @@ class Detail:
     value: DateValue | None = None
     event: str = ""
 
-    # The first word of the sentence or line that holds the detail.
-    opener: str = ""
-
-    @property
-    def sentence_start(self) -> bool:
-        return bool(self.opener) and self.text.startswith(self.opener)
+    # A name whose first word opens its sentence or line: that word is
+    # capitalised by its position, so it never makes the name distinctive.
+    sentence_start: bool = False
 
     @property
     def key(self) -> str:
@@ -841,6 +838,7 @@ def extract(answer: str) -> list[Detail]:
             span: tuple[int, int],
             value: DateValue | None = None,
             event: str = "",
+            opens: bool = False,
         ) -> None:
             if kind != "name":
                 taken[span[0] : span[1]] = b"\x01" * (span[1] - span[0])
@@ -853,7 +851,7 @@ def extract(answer: str) -> list[Detail]:
                 end,
                 value,
                 event,
-                plain.lstrip()[:1].upper(),
+                opens,
             )
             if normalized(detail.text):
                 found.setdefault(detail.key, detail)
@@ -977,7 +975,12 @@ def extract(answer: str) -> list[Detail]:
                     and _german_noun(plain, words, index, sentence_start)
                 )
             ):
-                add("name", text, (words[index].start(), words[last].end()))
+                add(
+                    "name",
+                    text,
+                    (words[index].start(), words[last].end()),
+                    opens=sentence_start,
+                )
             index = following
         if len(found) >= MAX_DETAILS:
             break
